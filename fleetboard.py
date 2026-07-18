@@ -2,10 +2,15 @@
 """fleetboard — local mission control for parallel Claude Code agents.
 
 Watches your git worktrees, your Claude Code home directories (multi-account
-setups included), and live `claude` processes, then serves a dashboard showing
-which agent is working, which one needs you, and what every branch is up to.
+setups included), and live `claude` processes; serves three views on
+http://127.0.0.1:4242 — the board (who's working / who needs you / which
+worktree is free), the map (real git topology of every branch), and limits
+(per-account usage via cclimits) — plus a click-only control plane: chat with
+any agent, resume a limit-stuck one when its session limit resets, and
+dispatch new tmux-hosted agents into free worktrees.
 
-Read-only observer: it never touches your sessions, worktrees, or accounts.
+Watching is read-only and touches nothing. Acting (chat/resume/dispatch)
+happens only on an explicit request, and dispatch spends account usage.
 Zero dependencies — python3 stdlib only.
 
     python3 fleetboard.py --root ~/code
