@@ -383,11 +383,14 @@ def parse_session_tail(fp):
     main = [e for e in entries if isinstance(e, dict) and not e.get("isSidechain")]
 
     out = {"cwd": None, "branch": None, "model": None, "pending_tools": [],
-           "last_assistant": None, "last_user": None}
+           "last_assistant": None, "last_user": None, "pending_workflows": 0}
     pending = {}  # tool_use id -> tool name
     for e in main:
         out["cwd"] = e.get("cwd") or out["cwd"]
         out["branch"] = e.get("gitBranch") or out["branch"]
+        if e.get("type") == "system" and e.get("subtype") == "turn_duration":
+            # a turn that ended still awaiting workflows is NOT the user's turn
+            out["pending_workflows"] = e.get("pendingWorkflowCount") or 0
         msg = e.get("message")
         if not isinstance(msg, dict):
             continue
@@ -481,6 +484,7 @@ def scan_sessions(worktrees, procs, now):
                     "branch": tail["branch"],
                     "model": (tail["model"] or "").replace("claude-", ""),
                     "pending_tools": tail["pending_tools"],
+                    "pending_workflows": tail["pending_workflows"],
                     "topic": session_topic(fp),
                     "last_assistant": tail["last_assistant"],
                     "last_user": tail["last_user"] or find_last_user(fp),
@@ -506,6 +510,8 @@ def scan_sessions(worktrees, procs, now):
                 status = "working"
             elif alive and "AskUserQuestion" in pend:
                 status = "needs_input"
+            elif alive and s["pending_workflows"]:
+                status = "working"   # delegated — waiting on its own workflows
             elif alive and pend:
                 status = "blocked"
             elif alive:
