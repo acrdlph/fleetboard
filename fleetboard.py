@@ -226,9 +226,15 @@ def _clean(text, limit=240):
     return text[: limit - 1] + "…" if len(text) > limit else text
 
 
+_MACHINE_TEXT = re.compile(
+    r"<local-command-stdout>|<command-message>|<system-reminder>|"
+    r"task-notification|\btoolu_[A-Za-z0-9]|\[SYSTEM NOTIFICATION")
+
+
 def _real_prompt(text):
-    """A user text that describes the session (not a slash-command stub/caveat)."""
-    if "<local-command-stdout>" in text or "<command-message>" in text:
+    """A user text that describes the session (not a slash-command stub,
+    caveat, or harness-injected machine noise)."""
+    if _MACHINE_TEXT.search(text):
         return None
     t = _clean(text, 140)
     if not t or t.startswith("/") or t.startswith("Caveat:"):
@@ -257,6 +263,27 @@ def session_topic(fp):
     return None
 
 
+def find_last_user(fp, size=1024 * 1024):
+    """Deeper backward search for the latest real user prompt (fallback when
+    the standard tail window is all tool traffic)."""
+    for line in reversed(_read_chunk(fp, size, from_end=True).splitlines()):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("isSidechain") or e.get("type") != "user" or e.get("isMeta"):
+            continue
+        c = e.get("message", {}).get("content")
+        texts = [c] if isinstance(c, str) else [
+            b.get("text", "") for b in c
+            if isinstance(b, dict) and b.get("type") == "text"] if isinstance(c, list) else []
+        for t in texts:
+            p = _real_prompt(t)
+            if p:
+                return p
+    return None
+
+
 def parse_session_tail(fp):
     """Tail-parse a transcript: last activity, pending tools, last assistant text."""
     entries = []
@@ -268,7 +295,7 @@ def parse_session_tail(fp):
     main = [e for e in entries if isinstance(e, dict) and not e.get("isSidechain")]
 
     out = {"cwd": None, "branch": None, "model": None, "pending_tools": [],
-           "last_assistant": None}
+           "last_assistant": None, "last_user": None}
     pending = {}  # tool_use id -> tool name
     for e in main:
         out["cwd"] = e.get("cwd") or out["cwd"]
@@ -277,6 +304,14 @@ def parse_session_tail(fp):
         if not isinstance(msg, dict):
             continue
         content = msg.get("content")
+        if e.get("type") == "user" and not e.get("isMeta"):
+            texts = [content] if isinstance(content, str) else [
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"] if isinstance(content, list) else []
+            for t in texts:
+                prompt = _real_prompt(t)
+                if prompt:
+                    out["last_user"] = prompt
         if e.get("type") == "assistant":
             model = msg.get("model")
             if model and model != "<synthetic>":
@@ -324,7 +359,19 @@ def scan_sessions(worktrees, procs, now):
                     mtime = fp.stat().st_mtime
                 except OSError:
                     continue
-                age = now - mtime
+                # Workflows/subagents write to <session-id>/**/*.jsonl while the
+                # main transcript sits untouched — count them toward activity.
+                sub_mtime = 0.0
+                sub_dir = fp.with_suffix("")
+                if sub_dir.is_dir():
+                    for sf in sub_dir.rglob("*.jsonl"):
+                        try:
+                            m = sf.stat().st_mtime
+                        except OSError:
+                            continue
+                        if m > sub_mtime:
+                            sub_mtime = m
+                age = now - max(mtime, sub_mtime)
                 if age > window_s:
                     continue
                 tail = parse_session_tail(fp)
@@ -340,22 +387,37 @@ def scan_sessions(worktrees, procs, now):
                     "pending_tools": tail["pending_tools"],
                     "topic": session_topic(fp),
                     "last_assistant": tail["last_assistant"],
+                    "last_user": tail["last_user"] or find_last_user(fp),
+                    "subagents_active": bool(sub_mtime and now - sub_mtime < CFG["working_s"]),
                 })
-
-    # A live process proves at most ONE session per cwd is really attended.
-    # Hand each proc slot to the freshest sessions in its cwd; the rest are ended.
-    budget = {}
-    for p in procs:
-        if p.get("cwd"):
-            budget[p["cwd"]] = budget.get(p["cwd"], 0) + 1
 
     rank = {"needs_input": 0, "blocked": 1, "working": 2, "waiting": 3, "ended": 4}
     for wt, sessions in by_wt.items():
         sessions.sort(key=lambda s: s["age_s"])
+        # A live process proves at most ONE session is really attended.
+        # Pass 1: exact-cwd match, freshest first. Pass 2: procs whose cwd
+        # matched no session (e.g. the session recorded a subdir cwd) vouch
+        # for the freshest still-unmatched sessions in this worktree.
+        wt_proc_cwds = [p["cwd"] for p in procs if p.get("cwd") and
+                        (p["cwd"] == wt or p["cwd"].startswith(wt + "/"))]
+        budget = {}
+        for c in wt_proc_cwds:
+            budget[c] = budget.get(c, 0) + 1
+        slots_left = len(wt_proc_cwds)
         for s in sessions:
-            alive = budget.get(s["cwd"], 0) > 0
-            if alive:
+            s["_alive"] = False
+            if budget.get(s["cwd"], 0) > 0:
                 budget[s["cwd"]] -= 1
+                slots_left -= 1
+                s["_alive"] = True
+        for s in sessions:
+            if slots_left <= 0:
+                break
+            if not s["_alive"]:
+                s["_alive"] = True
+                slots_left -= 1
+        for s in sessions:
+            alive = s.pop("_alive")
             pend = s["pending_tools"]
             if s["age_s"] < CFG["working_s"]:
                 status = "working"

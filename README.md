@@ -92,7 +92,13 @@ repositories; a `<dir>/repo` checkout layout is also recognized.
 - **Sessions** — tail-parses the last 128 KB of each
   `<claude-home>/projects/<munged-cwd>/*.jsonl` transcript, skipping subagent
   sidechains. The topic is the compaction summary or the first real user
-  prompt; slash-command stubs and ANSI noise are filtered out.
+  prompt; slash-command stubs and ANSI noise are filtered out. Each card shows
+  both the latest prompt (`→` what the agent was told to do) and the agent's
+  last reply (`⏎`).
+- **Subagents & workflows** — a session running a Workflow or subagents writes
+  to `<session-id>/**/*.jsonl` while its main transcript sits untouched;
+  fleetboard counts that activity toward liveness and shows
+  "⚙ subagents running" instead of misreporting the session as idle.
 - **Liveness** — `ps` for `claude` processes, then their cwds via one `lsof`
   call (macOS/BSD) or `/proc/<pid>/cwd` (Linux). A live process vouches for at
   most one session per directory (freshest first), so stale transcripts don't
