@@ -86,7 +86,21 @@ header {
 .badge.attention { color:var(--accent); border-color:var(--accent); background:var(--accent-glow);
   animation:pulse 1.6s var(--ease) infinite; }
 @keyframes pulse { 50% { box-shadow:0 0 10px var(--accent-glow); } }
-.card-head .procs { margin-left:auto; color:var(--muted); font-size:11.5px; white-space:nowrap; }
+.card-head .procs { margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+.card-head .noproc { color:var(--muted-2); font-size:11.5px; }
+.pidbtn {
+  font:inherit; font-size:10.5px; color:var(--muted); background:var(--bg-2);
+  border:1px solid var(--border-2); border-radius:5px; padding:2.5px 8px; cursor:pointer;
+  transition:border-color .15s var(--ease), color .15s var(--ease); white-space:nowrap;
+}
+.pidbtn:hover { color:var(--fg); border-color:var(--accent); }
+.pidbtn .tt { color:var(--cyan); }
+#toast {
+  position:fixed; right:18px; bottom:18px; z-index:50; max-width:440px;
+  background:var(--surface-2); border:1px solid var(--accent); border-radius:9px;
+  padding:10px 14px; font-size:12.5px; color:var(--fg); display:none;
+  box-shadow:0 10px 30px rgba(0,0,0,.5);
+}
 
 .gitline { padding:9px 14px 0; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:baseline; font-size:12.5px; }
 .gitline .branch { color:var(--cyan); font-weight:600; }
@@ -127,6 +141,9 @@ header {
   display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
 .you::before { content:"→ "; color:var(--muted-2); }
 .subag { color:var(--green); font-size:11px; }
+.wsaid { color:var(--muted); margin-top:3px; font-size:11.5px; line-height:1.45;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.wsaid::before { content:"⚙ "; color:var(--green); }
 .pending { color:var(--yellow); font-size:11px; margin-top:3px; }
 .none { color:var(--muted-2); font-size:12px; padding:2px 6px 6px; }
 
@@ -153,6 +170,7 @@ header {
   </div>
   <div class="other" id="other"></div>
 </div>
+<div id="toast"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -232,6 +250,7 @@ function render(st) {
         ${s.topic ? `<div class="topic">${esc(s.topic)}</div>` : ""}
         ${s.last_user && s.last_user !== s.topic ? `<div class="you">${esc(s.last_user)}</div>` : ""}
         ${s.last_assistant ? `<div class="said">${esc(s.last_assistant)}</div>` : ""}
+        ${s.subagent_said ? `<div class="wsaid" title="latest subagent report">${esc(s.subagent_said)}</div>` : ""}
         ${pend}
       </div>`;
     }).join("");
@@ -239,7 +258,9 @@ function render(st) {
       <div class="card-head">
         <span class="badge ${w.availability}">${AVAIL[w.availability]}</span>
         <span class="name">${esc(w.name)}</span>
-        <span class="procs">${w.live_procs.length ? w.live_procs.length + " proc · " + w.live_procs.map(p=>p.pid).join(",") : "no live proc"}</span>
+        <span class="procs">${w.live_procs.length
+          ? w.live_procs.map(p => `<button class="pidbtn" onclick="focusPid(${p.pid})" title="jump to this terminal">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button>`).join("")
+          : `<span class="noproc">no live proc</span>`}</span>
       </div>
       <div class="gitline"><span class="branch">${esc(g.branch || "?")}</span>${dirty}${sync}</div>
       <div class="commit" title="${esc(g.commit ? g.commit.subject : "")}">${commit}</div>
@@ -249,8 +270,25 @@ function render(st) {
 
   $("other").innerHTML = st.other_procs.length
     ? `<h3>other live agents (outside watched worktrees)</h3>` +
-      st.other_procs.map(p => `<div>⌁ pid ${p.pid} · ${p.cpu.toFixed(1)}% cpu · up ${esc(p.etime)} · ${esc(p.cwd || "?")}</div>`).join("")
+      st.other_procs.map(p => `<div>⌁ <button class="pidbtn" onclick="focusPid(${p.pid})">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button> ${p.cpu.toFixed(1)}% cpu · up ${esc(p.etime)} · ${esc(p.cwd || "?")}</div>`).join("")
     : "";
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = "none"; }, 6000);
+}
+async function focusPid(pid) {
+  toast(`⌖ locating pid ${pid}…`);
+  try {
+    const r = await fetch(`/api/focus?pid=${pid}`);
+    const res = await r.json();
+    toast((res.ok ? "" : "✗ ") + res.message);
+  } catch (e) { toast("✗ focus request failed"); }
 }
 
 let lastState = null;

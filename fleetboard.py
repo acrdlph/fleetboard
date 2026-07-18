@@ -162,20 +162,51 @@ def _pid_cwds(pids):
     return cwds
 
 
+_HOST_APPS = [("Terminal.app", "Terminal"), ("iTerm", "iTerm2"), ("Cursor", "Cursor"),
+              ("Code Helper", "VS Code"), ("Visual Studio Code", "VS Code"),
+              ("Alacritty", "Alacritty"), ("kitty", "kitty"), ("WezTerm", "WezTerm"),
+              ("Ghostty", "Ghostty")]
+
+
+def _host_of(pid, table):
+    """Walk a process's ancestry to find what hosts its terminal."""
+    seen = set()
+    p = table.get(pid, (None,))[0]  # start from parent
+    while p and p != 1 and p not in seen:
+        seen.add(p)
+        ent = table.get(p)
+        if not ent:
+            break
+        ppid, _tty, cmd = ent
+        head = cmd.split(" ")[0]
+        if head == "tmux" or head.endswith("/tmux"):
+            m = re.search(r"-L\s+(\S+)", cmd)
+            return "tmux", ("tmux -L " + m.group(1) if m else "tmux")
+        for pat, label in _HOST_APPS:
+            if pat in cmd:
+                return "app", label
+        p = ppid
+    return None, None
+
+
 def claude_processes():
-    """Live `claude` CLI processes with their cwd."""
-    rc, out = run(["ps", "-axo", "pid=,pcpu=,etime=,command="])
-    procs = []
+    """Live `claude` CLI processes with cwd, tty, and hosting terminal app."""
+    rc, out = run(["ps", "-axo", "pid=,ppid=,tty=,pcpu=,etime=,command="])
+    table, procs = {}, []
     for line in out.splitlines():
-        m = re.match(r"\s*(\d+)\s+([\d.]+)\s+(\S+)\s+(.*)", line)
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\S+)\s+(.*)", line)
         if not m:
             continue
-        pid, cpu, etime, cmd = m.groups()
+        pid, ppid, tty, cpu, etime, cmd = m.groups()
+        table[int(pid)] = (int(ppid), tty, cmd)
         if cmd == "claude" or cmd.startswith("claude "):
-            procs.append({"pid": int(pid), "cpu": float(cpu), "etime": etime, "cmd": cmd})
+            procs.append({"pid": int(pid), "cpu": float(cpu), "etime": etime,
+                          "cmd": cmd, "tty": None if tty in ("??", "-") else tty})
     cwds = _pid_cwds([p["pid"] for p in procs])
     for p in procs:
         p["cwd"] = cwds.get(p["pid"])
+        kind, label = _host_of(p["pid"], table)
+        p["host_kind"], p["host"] = kind, label
     return procs
 
 
@@ -261,6 +292,25 @@ def session_topic(fp):
                 if topic:
                     return topic
     return None
+
+
+def last_assistant_text(fp, size=TAIL_BYTES):
+    """Last assistant text in a transcript, no sidechain filter (for subagent
+    files, whose entries are all sidechain from the parent's perspective)."""
+    last = None
+    for line in _read_chunk(fp, size, from_end=True).splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") != "assistant":
+            continue
+        c = (e.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                    last = _clean(b["text"])
+    return last
 
 
 def find_last_user(fp, size=1024 * 1024):
@@ -361,16 +411,23 @@ def scan_sessions(worktrees, procs, now):
                     continue
                 # Workflows/subagents write to <session-id>/**/*.jsonl while the
                 # main transcript sits untouched — count them toward activity.
-                sub_mtime = 0.0
+                sub_files = []
                 sub_dir = fp.with_suffix("")
                 if sub_dir.is_dir():
                     for sf in sub_dir.rglob("*.jsonl"):
                         try:
-                            m = sf.stat().st_mtime
+                            sub_files.append((sf.stat().st_mtime, sf))
                         except OSError:
                             continue
-                        if m > sub_mtime:
-                            sub_mtime = m
+                sub_mtime = max((m for m, _ in sub_files), default=0.0)
+                # The newest thing the session "said" may be a subagent's
+                # report (Claude Code shows those in the terminal too).
+                subagent_said = None
+                if sub_mtime > mtime:
+                    for _, sf in sorted(sub_files, reverse=True)[:2]:
+                        subagent_said = last_assistant_text(sf)
+                        if subagent_said:
+                            break
                 age = now - max(mtime, sub_mtime)
                 if age > window_s:
                     continue
@@ -388,6 +445,7 @@ def scan_sessions(worktrees, procs, now):
                     "topic": session_topic(fp),
                     "last_assistant": tail["last_assistant"],
                     "last_user": tail["last_user"] or find_last_user(fp),
+                    "subagent_said": subagent_said,
                     "subagents_active": bool(sub_mtime and now - sub_mtime < CFG["working_s"]),
                 })
 
@@ -451,6 +509,7 @@ def collect_state():
             "git": git_info(w["git"]),
             "sessions": ss,
             "live_procs": [{"pid": p["pid"], "cpu": p["cpu"], "etime": p["etime"],
+                            "tty": p["tty"], "host": p["host"],
                             "subdir": os.path.relpath(p["cwd"], w["path"])
                             if p["cwd"] != w["path"] else None} for p in live],
         })
@@ -489,6 +548,7 @@ def collect_state():
         "free_worktrees": [c["name"] for c in cards if c["availability"] == "free"],
         "worktrees": cards,
         "other_procs": [{"pid": p["pid"], "cpu": p["cpu"], "etime": p["etime"],
+                         "tty": p["tty"], "host": p["host"],
                          "cwd": p.get("cwd")} for p in other],
     }
 
@@ -555,12 +615,89 @@ def cached_state():
     return _cache["state"]
 
 
+# --------------------------------------------------------------- focus jump
+
+_FOCUS_TERMINAL = '''
+tell application "Terminal"
+  set found to false
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if (tty of t) is "%s" then
+          set selected tab of w to t
+          set index of w to 1
+          set found to true
+        end if
+      end try
+    end repeat
+  end repeat
+  if found then activate
+  return found
+end tell'''
+
+_FOCUS_ITERM = '''
+tell application "iTerm2"
+  set found to false
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if (tty of s) is "%s" then
+            tell s to select
+            tell t to select
+            select w
+            set found to true
+          end if
+        end try
+      end repeat
+    end repeat
+  end repeat
+  if found then activate
+  return found
+end tell'''
+
+
+def focus_process(pid):
+    """Best-effort: bring the terminal window hosting `pid` to the front."""
+    proc = next((p for p in claude_processes() if p["pid"] == pid), None)
+    if not proc:
+        return {"ok": False, "message": f"pid {pid} is gone"}
+    tty, host, kind = proc["tty"], proc["host"], proc["host_kind"]
+    where = f"pid {pid}" + (f" · {tty}" if tty else "")
+    if kind == "tmux":
+        return {"ok": True, "message": f"{where} runs inside tmux — attach with:  {host} attach"}
+    if host in ("Terminal", "iTerm2") and tty:
+        script = (_FOCUS_TERMINAL if host == "Terminal" else _FOCUS_ITERM) % f"/dev/{tty}"
+        rc, out = run(["osascript", "-e", script], timeout=8)
+        if rc == 0 and out.strip() == "true":
+            return {"ok": True, "message": f"focused {host} window ({tty})"}
+        if rc != 0:
+            return {"ok": False, "message":
+                    f"couldn't script {host} — grant Automation permission "
+                    f"(System Settings → Privacy → Automation), or find {tty} manually"}
+        return {"ok": False, "message": f"no {host} tab with {tty} found"}
+    if host in ("Cursor", "VS Code"):
+        app = "Cursor" if host == "Cursor" else "Visual Studio Code"
+        run(["open", "-a", app])
+        return {"ok": True, "message":
+                f"{where} lives in an embedded terminal inside {host} — "
+                f"activated it, check its terminal panel"}
+    if host:
+        return {"ok": True, "message": f"{where} runs in {host} — look for {tty}"}
+    return {"ok": False, "message": f"unknown host for {where}"}
+
+
 # ------------------------------------------------------------------- server
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/state"):
             body = json.dumps(cached_state()).encode()
+            ctype = "application/json"
+        elif self.path.startswith("/api/focus"):
+            m = re.search(r"pid=(\d+)", self.path)
+            result = focus_process(int(m.group(1))) if m else {"ok": False, "message": "missing pid"}
+            body = json.dumps(result).encode()
             ctype = "application/json"
         elif self.path == "/" or self.path.startswith("/index"):
             body = (HERE / "index.html").read_bytes()

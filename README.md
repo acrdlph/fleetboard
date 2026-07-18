@@ -56,6 +56,13 @@ The page auto-refreshes every 5 s (collectors are cached at 4 s so the browser
 can't hammer git/lsof), flags the tab title with `(N!)` when agents need you,
 and can optionally ring a terminal bell.
 
+**Lost the window an agent runs in?** Every process chip shows its tty and
+hosting app (`⌖ 38627 ttys024 Terminal`) — click it to bring that window to
+the front. Works via AppleScript for Terminal.app and iTerm2 on macOS (grant
+the Automation permission when asked); editor-embedded terminals (VS Code,
+Cursor) get the app activated with a pointer to the right tty; tmux-hosted
+agents get the attach command.
+
 The board itself (`--demo` data):
 
 ![the fleetboard dashboard](docs/screenshot.png)
