@@ -126,47 +126,61 @@ h1 { font-size:92px; font-weight:800; letter-spacing:-0.03em; line-height:1; }
     </div>
 
     <div class="mapcard">
-      <svg width="548" height="228" viewBox="0 0 548 228">
+      <svg width="560" height="244" viewBox="0 0 560 244">
         <!-- trunk -->
-        <line x1="18" y1="168" x2="512" y2="168" stroke="#8a8784" stroke-width="2.5" stroke-linecap="round" opacity=".85"/>
+        <line x1="16" y1="200" x2="544" y2="200" stroke="#8a8784" stroke-width="2.5" stroke-linecap="round" opacity=".85"/>
         <g fill="#6a6764">
-          <circle cx="120" cy="168" r="2"/><circle cx="205" cy="168" r="2"/>
-          <circle cx="330" cy="168" r="2"/><circle cx="415" cy="168" r="2"/>
+          <circle cx="90" cy="200" r="2"/><circle cx="160" cy="200" r="2"/><circle cx="250" cy="200" r="2"/>
+          <circle cx="330" cy="200" r="2"/><circle cx="405" cy="200" r="2"/>
         </g>
-        <circle cx="500" cy="168" r="4" fill="#e8e6e3" stroke="#0d0d0d" stroke-width="1.5"/>
-        <text x="512" y="152" font-size="11" font-weight="700" text-anchor="end" fill="#7fb3c8">origin/main</text>
+        <circle cx="530" cy="200" r="4" fill="#e8e6e3" stroke="#0d0d0d" stroke-width="1.5"/>
+        <text x="544" y="186" font-size="10.5" font-weight="700" text-anchor="end" fill="#7fb3c8">origin/main</text>
 
-        <!-- branch: needs you (orange) -->
-        <path d="M 56 168 C 56 118, 56 62, 96 62 L 372 62" fill="none" stroke="#d97757" stroke-width="2.2" stroke-opacity=".65" stroke-linecap="round"/>
-        <circle cx="56" cy="168" r="3" fill="#0d0d0d" stroke="#d97757" stroke-width="1.5"/>
+        <!-- orbital-api: needs you (orange) -->
+        <path d="M 44 200 C 44 140, 44 48, 84 48 L 350 48" fill="none" stroke="#d97757" stroke-width="2.2" stroke-opacity=".65" stroke-linecap="round"/>
+        <circle cx="44" cy="200" r="3" fill="#0d0d0d" stroke="#d97757" stroke-width="1.5"/>
         <g fill="#d97757" opacity=".8">
-          <circle cx="150" cy="62" r="2.2"/><circle cx="215" cy="62" r="2.2"/><circle cx="290" cy="62" r="2.2"/>
+          <circle cx="120" cy="48" r="2.2"/><circle cx="165" cy="48" r="2.2"/><circle cx="212" cy="48" r="2.2"/>
+          <circle cx="266" cy="48" r="2.2"/><circle cx="312" cy="48" r="2.2"/>
         </g>
-        <circle cx="372" cy="62" r="6.5" fill="#0d0d0d" stroke="#d97757" stroke-width="2.5"/>
-        <circle cx="372" cy="62" r="2.6" fill="#d97757"/>
-        <text x="388" y="66" font-size="11" font-weight="800" fill="#d97757">▲</text>
+        <circle cx="350" cy="48" r="10" fill="none" stroke="#d97757" stroke-width="1" opacity=".3"/>
+        <circle cx="350" cy="48" r="6.5" fill="#0d0d0d" stroke="#d97757" stroke-width="2.5"/>
+        <circle cx="350" cy="48" r="2.6" fill="#d97757"/>
+        <text x="366" y="44" font-size="11.5" font-weight="800" fill="#e8e6e3">orbital-api</text>
+        <text x="366" y="58" font-size="10" font-weight="800" fill="#d97757">▲ needs you · <tspan fill="#7fb3c8">[work]</tspan></text>
 
-        <!-- branch: working (green, at "now") -->
-        <path d="M 170 168 C 170 140, 170 116, 206 116 L 500 116" fill="none" stroke="#87b386" stroke-width="2.2" stroke-opacity=".7" stroke-linecap="round"/>
-        <circle cx="170" cy="168" r="3" fill="#0d0d0d" stroke="#87b386" stroke-width="1.5"/>
-        <g fill="#87b386" opacity=".85">
-          <circle cx="260" cy="116" r="2.2"/><circle cx="330" cy="116" r="2.2"/>
-          <circle cx="400" cy="116" r="2.2"/><circle cx="455" cy="116" r="2.2"/>
+        <!-- voyager-etl: limit hit, stopped mid-map (yellow) -->
+        <path d="M 112 200 C 112 160, 112 108, 150 108 L 258 108" fill="none" stroke="#d4b06a" stroke-width="2.2" stroke-opacity=".6" stroke-linecap="round"/>
+        <circle cx="112" cy="200" r="3" fill="#0d0d0d" stroke="#d4b06a" stroke-width="1.5"/>
+        <g fill="#d4b06a" opacity=".8">
+          <circle cx="188" cy="108" r="2.2"/><circle cx="226" cy="108" r="2.2"/>
         </g>
-        <circle cx="500" cy="116" r="15" fill="none" stroke="#87b386" stroke-width="1" opacity=".25"/>
-        <circle cx="500" cy="116" r="10.5" fill="none" stroke="#87b386" stroke-width="1.3" opacity=".5"/>
-        <circle cx="500" cy="116" r="6.5" fill="#0d0d0d" stroke="#87b386" stroke-width="2.5"/>
-        <circle cx="500" cy="116" r="2.6" fill="#87b386"/>
-        <text x="478" y="99" font-size="11" font-weight="800" fill="#87b386">●</text>
+        <circle cx="258" cy="108" r="6.5" fill="#0d0d0d" stroke="#d4b06a" stroke-width="2.5"/>
+        <text x="258" y="112.5" font-size="9" text-anchor="middle" fill="#d4b06a">⛔</text>
+        <text x="274" y="104" font-size="11.5" font-weight="800" fill="#e8e6e3">voyager-etl</text>
+        <text x="274" y="118" font-size="10" font-weight="800" fill="#d4b06a">⛔ limit · resets 2h · <tspan fill="#7fb3c8">[spare]</tspan></text>
+
+        <!-- kepler-worker: working at "now" (green) -->
+        <path d="M 205 200 C 205 178, 205 156, 240 156 L 528 156" fill="none" stroke="#87b386" stroke-width="2.2" stroke-opacity=".7" stroke-linecap="round"/>
+        <circle cx="205" cy="200" r="3" fill="#0d0d0d" stroke="#87b386" stroke-width="1.5"/>
+        <g fill="#87b386" opacity=".85">
+          <circle cx="285" cy="156" r="2.2"/><circle cx="340" cy="156" r="2.2"/><circle cx="392" cy="156" r="2.2"/>
+          <circle cx="448" cy="156" r="2.2"/><circle cx="492" cy="156" r="2.2"/>
+        </g>
+        <circle cx="528" cy="156" r="16" fill="none" stroke="#87b386" stroke-width="1" opacity=".22"/>
+        <circle cx="528" cy="156" r="11" fill="none" stroke="#87b386" stroke-width="1.3" opacity=".45"/>
+        <circle cx="528" cy="156" r="6.5" fill="#0d0d0d" stroke="#87b386" stroke-width="2.5"/>
+        <circle cx="528" cy="156" r="2.6" fill="#87b386"/>
+        <text x="508" y="138" font-size="11.5" font-weight="800" text-anchor="end" fill="#e8e6e3">kepler-worker</text>
+        <text x="508" y="152" font-size="10" font-weight="800" text-anchor="end" fill="#87b386">● working · <tspan fill="#7fb3c8">[personal]</tspan></text>
 
         <!-- rider: free worktree on the trunk (cyan) -->
-        <circle cx="447" cy="168" r="5.5" fill="#0d0d0d" stroke="#7fb3c8" stroke-width="2.2"/>
-        <circle cx="447" cy="168" r="2" fill="#7fb3c8"/>
-        <text x="447" y="192" font-size="11" font-weight="800" text-anchor="middle" fill="#7fb3c8">◇</text>
+        <circle cx="462" cy="200" r="5.5" fill="#0d0d0d" stroke="#7fb3c8" stroke-width="2.2"/>
+        <circle cx="462" cy="200" r="2" fill="#7fb3c8"/>
+        <text x="462" y="222" font-size="10" font-weight="800" text-anchor="middle" fill="#7fb3c8">◇ free</text>
 
         <!-- time hint -->
-        <text x="512" y="215" font-size="10" text-anchor="end" fill="#6a6764">→ now</text>
-        <text x="18" y="215" font-size="10" fill="#6a6764">the map: where every branch really is</text>
+        <text x="544" y="222" font-size="10" text-anchor="end" fill="#6a6764">→ now</text>
       </svg>
     </div>
   </div>
