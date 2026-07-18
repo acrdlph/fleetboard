@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>fleetboard social card</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --bg:#0d0d0d; --bg-2:#111111; --surface:#161616; --surface-2:#1c1c1c;
+  --border:#2a2a2a; --border-2:#3a3a3a;
+  --fg:#e8e6e3; --muted:#8a8784; --muted-2:#6a6764;
+  --accent:#d97757; --accent-2:#e8a87c; --green:#87b386; --cyan:#7fb3c8; --yellow:#d4b06a;
+  --accent-glow:rgba(217,119,87,.25); --green-glow:rgba(135,179,134,.18);
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html,body { width:1280px; height:640px; overflow:hidden; }
+body {
+  font-family:"JetBrains Mono", ui-monospace, Menlo, monospace;
+  color:var(--fg);
+  background:
+    radial-gradient(900px 500px at 88% -10%, rgba(217,119,87,.13), transparent 62%),
+    radial-gradient(700px 400px at -5% 110%, rgba(127,179,200,.07), transparent 60%),
+    var(--bg);
+  position:relative;
+}
+/* faint dot grid for texture */
+body::before {
+  content:""; position:absolute; inset:0;
+  background-image:radial-gradient(rgba(232,230,227,.05) 1px, transparent 1px);
+  background-size:26px 26px;
+  mask-image:linear-gradient(115deg, transparent 38%, black 75%);
+  -webkit-mask-image:linear-gradient(115deg, transparent 38%, black 75%);
+}
+.frame {
+  position:absolute; inset:0; padding:64px 72px;
+  display:flex; align-items:center; gap:56px;
+}
+
+/* ---------- left: wordmark ---------- */
+.left { flex:1.12; position:relative; z-index:2; }
+.promptline { font-size:20px; color:var(--muted); margin-bottom:26px; font-weight:500; }
+.promptline .u { color:var(--accent); font-weight:700; }
+.promptline .p { color:var(--cyan); }
+.promptline .c { color:var(--fg); }
+.cursor { display:inline-block; width:11px; height:22px; background:var(--accent); vertical-align:-3px; margin-left:3px; }
+.mark { color:var(--accent); font-size:44px; font-weight:800; margin-bottom:14px;
+  text-shadow:0 0 22px var(--accent-glow); }
+h1 { font-size:96px; font-weight:800; letter-spacing:-0.03em; line-height:1; }
+.tag { font-size:25px; color:var(--fg); margin-top:26px; line-height:1.45; font-weight:500; max-width:560px; }
+.tag b { color:var(--accent-2); font-weight:700; }
+.legend { display:flex; gap:14px; margin-top:38px; flex-wrap:wrap; }
+.chip {
+  font-size:15.5px; font-weight:800; letter-spacing:.07em;
+  border:1.5px solid; border-radius:7px; padding:7px 13px; background:var(--bg-2);
+}
+.chip.w { color:var(--green); border-color:var(--green); }
+.chip.n { color:var(--accent); border-color:var(--accent); box-shadow:0 0 16px var(--accent-glow); }
+.chip.t { color:var(--accent-2); border-color:var(--accent-2); }
+.chip.f { color:var(--cyan); border-color:var(--cyan); }
+.foot { margin-top:40px; font-size:17px; color:var(--muted-2); font-weight:500; }
+.foot .sep { margin:0 10px; }
+.foot .gh { color:var(--muted); }
+
+/* ---------- right: mini board ---------- */
+.right { flex:1; position:relative; z-index:2; display:flex; flex-direction:column; gap:14px; }
+.card {
+  background:var(--surface); border:1.5px solid var(--border); border-radius:13px;
+  overflow:hidden; font-size:15px;
+  box-shadow:0 18px 40px rgba(0,0,0,.45);
+}
+.card.attn { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent-glow), 0 18px 40px rgba(0,0,0,.45), 0 0 30px var(--accent-glow); }
+.chead { display:flex; align-items:center; gap:11px; padding:10px 15px; background:var(--surface-2); border-bottom:1px solid var(--border); }
+.badge { font-size:11.5px; font-weight:800; letter-spacing:.1em; padding:3.5px 9px; border-radius:5px; border:1.5px solid; }
+.badge.needs { color:var(--accent); border-color:var(--accent); background:var(--accent-glow); }
+.badge.busy { color:var(--cyan); border-color:var(--cyan); background:rgba(127,179,200,.12); }
+.badge.free { color:var(--green); border-color:var(--green); background:var(--green-glow); }
+.chead .nm { font-weight:800; font-size:16.5px; }
+.chead .pr { margin-left:auto; color:var(--muted-2); font-size:12px; }
+.cbody { padding:10px 15px 13px; }
+.branch { color:var(--cyan); font-weight:600; font-size:14px; }
+.branch::before { content:" "; color:var(--muted-2); }
+.delta { color:var(--yellow); font-size:13px; margin-left:10px; }
+.sess { margin-top:10px; border:1px solid var(--border); border-left:3.5px solid; border-radius:8px; padding:8px 11px; background:var(--bg-2); }
+.sess.g { border-left-color:var(--green); }
+.sess.o { border-left-color:var(--accent); }
+.srow { display:flex; gap:10px; align-items:baseline; font-size:12px; }
+.st { font-weight:800; letter-spacing:.06em; font-size:11.5px; }
+.st.g { color:var(--green); } .st.o { color:var(--accent); }
+.acct { color:var(--cyan); } .mdl { color:var(--muted-2); }
+.say { color:var(--muted); font-size:12.5px; margin-top:4px; line-height:1.4; }
+.say::before { content:"⏎ "; color:var(--muted-2); }
+.qq { color:var(--yellow); font-size:12px; margin-top:4px; }
+.nosess { color:var(--muted-2); font-size:12.5px; margin-top:9px; }
+</style>
+</head>
+<body>
+<div class="frame">
+  <div class="left">
+    <div class="promptline"><span class="u">you@fleet</span><span class="p">:~</span><span class="u">$</span> <span class="c">./fleetboard --watch</span><span class="cursor"></span></div>
+    <div class="mark">⌁⌁⌁</div>
+    <h1>fleetboard</h1>
+    <div class="tag">mission control for <b>parallel Claude Code agents</b> — every worktree, every account, one board</div>
+    <div class="legend">
+      <span class="chip w">● WORKING</span>
+      <span class="chip n">▲ NEEDS YOU</span>
+      <span class="chip t">◆ YOUR TURN</span>
+      <span class="chip f">◇ FREE</span>
+    </div>
+    <div class="foot"><span class="gh">github.com/acrdlph/fleetboard</span><span class="sep">·</span>python3<span class="sep">·</span>zero deps</div>
+  </div>
+
+  <div class="right">
+    <div class="card attn">
+      <div class="chead"><span class="badge needs">NEEDS YOU</span><span class="nm">orbital-api</span><span class="pr">1 proc · 41234</span></div>
+      <div class="cbody">
+        <span class="branch">feat/webhook-retries</span><span class="delta">Δ12 uncommitted</span>
+        <div class="sess o">
+          <div class="srow"><span class="st o">▲ NEEDS ANSWER</span><span class="acct">[work]</span><span class="mdl">fable-5 · 5m ago</span></div>
+          <div class="say">Should failed deliveries go to the dead-letter queue? I've laid out both options.</div>
+          <div class="qq">⧗ waiting on: AskUserQuestion</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="chead"><span class="badge busy">BUSY</span><span class="nm">kepler-worker</span><span class="pr">1 proc · 42901</span></div>
+      <div class="cbody">
+        <span class="branch">perf/batch-inserts</span><span class="delta">Δ7 uncommitted</span>
+        <div class="sess g">
+          <div class="srow"><span class="st g">● WORKING</span><span class="acct">[personal]</span><span class="mdl">opus-4-8 · 15s ago</span></div>
+          <div class="say">Running the benchmark suite against the staging database now.</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="chead"><span class="badge free">FREE</span><span class="nm">voyager-cli</span><span class="pr">no live proc</span></div>
+      <div class="cbody">
+        <span class="branch">main</span>
+        <div class="nosess">no live agents — safe target for the next feature</div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
