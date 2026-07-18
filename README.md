@@ -84,6 +84,20 @@ is a branch that stopped moving. A long flat arc that forked far left and is
 status color from the fleet state (a working agent's tip pulses). Hover any
 line for details; click a node to jump to that agent's terminal.
 
+## Fleet orchestration — handoffs across accounts
+
+The pattern that makes a multi-account fleet work: an agent burns its account
+down, writes a handoff doc (drop to a cheaper model for that), and an agent
+on a **different account** picks the branch up and keeps going.
+
+![one branch, three accounts, zero downtime](docs/orchestration.png)
+
+fleetboard understands this succession. A limit-hit session whose worktree
+has a fresher live session is annotated **"↳ work continued by [account] —
+this terminal can be closed"**, drops out of the need-you counts, and stops
+speaking for the branch on the map — the successor's status takes over. Only
+a stranded agent with *no* successor keeps demanding your attention.
+
 ## Limits — is the agent stuck, or out of juice?
 
 An agent parked at the prompt on an exhausted account isn't "your turn" — it's
