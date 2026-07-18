@@ -67,6 +67,23 @@ The board itself (`--demo` data):
 
 ![the fleetboard dashboard](docs/screenshot.png)
 
+## The map — where your branches really are
+
+`/map` draws the fleet's actual git topology: one trunk per repo
+(`origin/main`), and every worktree placed where it truly is — branches leave
+the trunk at their real merge-base and run to their tip; worktrees whose HEAD
+sits on main appear as riders on the trunk itself, at the exact commit they're
+parked on.
+
+![the branch map](docs/map.png)
+
+Reading it: **time runs log-scaled into "now"** at the right edge, so the last
+hour gets room and last month compresses. A tip that stops short of the edge
+is a branch that stopped moving. A long flat arc that forked far left and is
+`↓137` behind is drift you should rebase. Dots are commits; tips take the live
+status color from the fleet state (a working agent's tip pulses). Hover any
+line for details; click a node to jump to that agent's terminal.
+
 ## Usage
 
 ```bash

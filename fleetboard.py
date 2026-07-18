@@ -553,6 +553,118 @@ def collect_state():
     }
 
 
+# ----------------------------------------------------------- branch topology
+
+TOPO_TTL_S = 30.0
+_topo = {"t": 0.0, "data": None}
+
+
+def _base_ref(git_root):
+    """The trunk ref this repo's branches are measured against."""
+    rc, out = run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=git_root)
+    if rc == 0 and out.startswith("refs/remotes/"):
+        return out[len("refs/remotes/"):]
+    for cand in ("origin/main", "origin/master", "main", "master"):
+        rc, _ = run(["git", "rev-parse", "-q", "--verify", cand], cwd=git_root)
+        if rc == 0:
+            return cand
+    return None
+
+
+def branch_topology():
+    """Where every branch really is: fork point from trunk, tip, drift."""
+    now = time.time()
+    groups = {}
+    for w in discover_worktrees():
+        g = w["git"]
+        rc, origin = run(["git", "remote", "get-url", "origin"], cwd=g)
+        key = origin if rc == 0 and origin else "local:" + w["path"]
+        base = _base_ref(g)
+        if not base:
+            continue
+        rc, mb = run(["git", "merge-base", "HEAD", base], cwd=g)
+        if rc != 0 or not mb:
+            continue
+
+        def ts(ref):
+            rc2, out2 = run(["git", "show", "-s", "--format=%ct", ref], cwd=g)
+            try:
+                return int(out2.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                return None
+
+        fork_ts, tip_ts, base_ts = ts(mb), ts("HEAD"), ts(base)
+        if not (fork_ts and tip_ts):
+            continue
+        _, ah = run(["git", "rev-list", "--count", f"{mb}..HEAD"], cwd=g)
+        _, bh = run(["git", "rev-list", "--count", f"{mb}..{base}"], cwd=g)
+        _, cts = run(["git", "log", "--format=%ct", "-40", f"{mb}..HEAD"], cwd=g)
+        _, last = run(["git", "log", "-1", "--format=%h%x00%s"], cwd=g)
+        h, subj = (last.split("\x00") + ["", ""])[:2]
+        _, br = run(["git", "branch", "--show-current"], cwd=g)
+        _, dirty = run(["git", "status", "--porcelain"], cwd=g)
+        grp = groups.setdefault(key, {
+            "repo": re.sub(r"\.git$", "", key.rsplit("/", 1)[-1]),
+            "base": base, "trunk_ts": 0, "trunk_commits": [], "_root": g,
+            "branches": []})
+        if base_ts and base_ts > grp["trunk_ts"]:
+            # separate clones fetch at different times — the freshest
+            # origin/<main> wins as this repo's trunk tip
+            grp["trunk_ts"], grp["_root"] = base_ts, g
+        grp["branches"].append({
+            "worktree": w["name"], "branch": br or "?",
+            "fork_ts": min(fork_ts, tip_ts), "tip_ts": tip_ts,
+            "ahead": int(ah or 0), "behind": int(bh or 0),
+            "dirty": len([l for l in dirty.splitlines() if l.strip()]),
+            "hash": h, "subject": subj,
+            "commits": [int(x) for x in cts.split()][:40] if cts else [],
+        })
+    for grp in groups.values():
+        _, tct = run(["git", "log", "--format=%ct", "-40", grp["base"]],
+                     cwd=grp.pop("_root"))
+        grp["trunk_commits"] = [int(x) for x in tct.split()][:40] if tct else []
+    return {"generated_at": now, "groups": list(groups.values())}
+
+
+def demo_topology():
+    now = time.time()
+    H = 3600
+
+    def spread(t0, t1, n):
+        return [int(t0 + (t1 - t0) * i / max(1, n - 1)) for i in range(n)]
+
+    def br(wt, branch, fork_h, tip_h, ahead, behind, dirty, subj):
+        return {"worktree": wt, "branch": branch, "fork_ts": int(now - fork_h * H),
+                "tip_ts": int(now - tip_h * H), "ahead": ahead, "behind": behind,
+                "dirty": dirty, "hash": "a1b2c3d", "subject": subj,
+                "commits": spread(now - fork_h * H + 600, now - tip_h * H, min(ahead, 20))}
+
+    return {"generated_at": now, "groups": [{
+        "repo": "orbital", "base": "origin/main", "trunk_ts": int(now - 0.4 * H),
+        "trunk_commits": spread(now - 70 * H, now - 0.4 * H, 24),
+        "branches": [
+            br("orbital-api", "feat/webhook-retries", 68, 0.35, 14, 6, 12,
+               "feat(webhooks): exponential backoff with jitter"),
+            br("orbital-web", "fix/checkout-race", 34, 0.6, 6, 2, 3,
+               "fix(cart): serialize checkout mutations"),
+            br("kepler-worker", "perf/batch-inserts", 9, 0.05, 9, 0, 7,
+               "perf(db): batch event inserts"),
+            br("lander-docs", "docs/quickstart", 46, 26, 3, 11, 2,
+               "docs: rewrite quickstart around the new init flow"),
+            br("voyager-cli", "main", 48, 48, 0, 9, 0, "chore: release v0.4.1"),
+        ]}]}
+
+
+def cached_topology():
+    if DEMO:
+        return demo_topology()
+    now = time.time()
+    if _topo["data"] is None or now - _topo["t"] > TOPO_TTL_S:
+        _topo["data"] = branch_topology()
+        _topo["t"] = now
+    return _topo["data"]
+
+
 # --------------------------------------------------------------- demo state
 
 def demo_state():
@@ -699,8 +811,14 @@ class Handler(BaseHTTPRequestHandler):
             result = focus_process(int(m.group(1))) if m else {"ok": False, "message": "missing pid"}
             body = json.dumps(result).encode()
             ctype = "application/json"
+        elif self.path.startswith("/api/topology"):
+            body = json.dumps(cached_topology()).encode()
+            ctype = "application/json"
         elif self.path == "/" or self.path.startswith("/index"):
             body = (HERE / "index.html").read_bytes()
+            ctype = "text/html; charset=utf-8"
+        elif self.path.startswith("/map"):
+            body = (HERE / "map.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         else:
             self.send_error(404)

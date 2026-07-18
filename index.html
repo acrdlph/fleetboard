@@ -45,6 +45,11 @@ header {
 .brand .cursor { display:inline-block; width:8px; height:15px; background:var(--accent);
   vertical-align:-2px; margin-left:2px; animation:blink 1.1s steps(1) infinite; }
 @keyframes blink { 50% { opacity:0; } }
+.navr { display:flex; align-items:center; gap:10px; }
+.maplink { color:var(--muted); text-decoration:none; padding:6px 11px; border-radius:6px;
+  font-size:13px; transition:color .2s var(--ease), background .2s var(--ease); }
+.maplink::before { content:"~/"; color:var(--muted-2); }
+.maplink:hover { color:var(--fg); background:var(--surface); }
 .sync { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; white-space:nowrap; }
 .sync .dot { width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 8px var(--green-glow); }
 .sync.err .dot { background:var(--accent); }
@@ -158,7 +163,8 @@ header {
 <body>
 <header><div class="wrap nav">
   <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> <span class="cmd">./fleetboard --watch</span><span class="cursor"></span></div>
-  <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div>
+  <div class="navr"><a class="maplink" href="/map">map</a>
+  <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div></div>
 </div></header>
 
 <div class="wrap">
