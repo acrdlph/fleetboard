@@ -7,7 +7,7 @@ several accounts. Which agent is working? Which one is stuck waiting for an
 answer? Which worktree is free for the next feature? fleetboard puts it on one
 board.
 
-![fleetboard](docs/social-preview.png)
+![fleetboard](docs/social-preview-v2.png)
 
 It's a **read-only observer**: it never launches, wraps, or touches your
 sessions. Point it at your existing chaos and it reports. Zero dependencies —
