@@ -20,9 +20,11 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -190,6 +192,20 @@ def _host_of(pid, table):
     return None, None
 
 
+def _tmux_pane_map(sock_flag):
+    """pane shell pid -> 'session:win.pane' for one tmux server."""
+    cmd = ["tmux"] + (["-L", sock_flag] if sock_flag else []) + \
+          ["list-panes", "-a", "-F", "#{pane_pid}|#{session_name}:#{window_index}.#{pane_index}"]
+    rc, out = run(cmd)
+    panes = {}
+    if rc == 0:
+        for line in out.splitlines():
+            pid, _, target = line.partition("|")
+            if pid.isdigit():
+                panes[int(pid)] = target
+    return panes
+
+
 def claude_processes():
     """Live `claude` CLI processes with cwd, tty, and hosting terminal app."""
     rc, out = run(["ps", "-axo", "pid=,ppid=,tty=,pcpu=,etime=,command="])
@@ -204,10 +220,26 @@ def claude_processes():
             procs.append({"pid": int(pid), "cpu": float(cpu), "etime": etime,
                           "cmd": cmd, "tty": None if tty in ("??", "-") else tty})
     cwds = _pid_cwds([p["pid"] for p in procs])
+    pane_maps = {}
     for p in procs:
         p["cwd"] = cwds.get(p["pid"])
         kind, label = _host_of(p["pid"], table)
         p["host_kind"], p["host"] = kind, label
+        p["tmux_sock"] = p["tmux_target"] = None
+        if kind == "tmux":
+            m = re.search(r"-L\s+(\S+)", label or "")
+            sock = m.group(1) if m else None
+            if sock not in pane_maps:
+                pane_maps[sock] = _tmux_pane_map(sock)
+            panes = pane_maps[sock]
+            anc = p["pid"]
+            for _ in range(8):  # claude's ancestor chain reaches the pane shell
+                if anc in panes:
+                    p["tmux_sock"], p["tmux_target"] = sock, panes[anc]
+                    break
+                anc = table.get(anc, (None,))[0]
+                if not anc or anc == 1:
+                    break
     return procs
 
 
@@ -436,6 +468,7 @@ def scan_sessions(worktrees, procs, now):
                 cwd = tail["cwd"] or wt
                 by_wt[wt].append({
                     "id": fp.stem[:8],
+                    "sid": fp.stem,
                     "account": acct,
                     "age_s": int(age),
                     "cwd": cwd,
@@ -499,12 +532,13 @@ def collect_state():
             al = acct_limits.get(s["account"])
             if al and al["exhausted"]:
                 s["status"] = "limit"
-                s["limit"] = {"worst": al["worst"], "resets_in": al["resets_in"]}
+                s["limit"] = {"worst": al["worst"], "group": al["group"],
+                              "resets_in": al["resets_in"], "resets_at": al["resets_at"]}
             elif limit_re.search(s["last_assistant"] or ""):
                 # the CLI wrote its limit notice into the transcript —
                 # trust it even when the cclimits cache is cold/stale
                 s["status"] = "limit"
-                s["limit"] = {"worst": None, "resets_in": None}
+                s["limit"] = {"worst": None, "group": None, "resets_in": None, "resets_at": None}
 
     # Handoff awareness: a limit-hit session whose worktree has a FRESHER live
     # session (typically another account continuing from a handoff doc) is no
@@ -534,6 +568,9 @@ def collect_state():
             "sessions": ss,
             "live_procs": [{"pid": p["pid"], "cpu": p["cpu"], "etime": p["etime"],
                             "tty": p["tty"], "host": p["host"],
+                            "tmux": p.get("tmux_target"),
+                            "reachable": bool(p.get("tmux_target") or
+                                              (p["host"] in ("Terminal", "iTerm2") and p["tty"])),
                             "subdir": os.path.relpath(p["cwd"], w["path"])
                             if p["cwd"] != w["path"] else None} for p in live],
         })
@@ -812,11 +849,15 @@ def limits_by_account():
         label = account_label(Path(acc["config_dir"]))
         exhausted = [l for l in acc.get("limits", []) if l.get("exhausted_now")]
         worst = min(exhausted, key=lambda l: l.get("resets_in_seconds") or 0) if exhausted else None
+        resets_in = worst.get("resets_in_seconds") if worst else None
+        fetched = (data.get("fetched_at") or time.time())
         out[label] = {
             "headroom": acc.get("headroom_percent"),
             "exhausted": bool(exhausted),
             "worst": worst["label"] if worst else None,
-            "resets_in": worst.get("resets_in_seconds") if worst else None,
+            "group": worst.get("group") if worst else None,
+            "resets_in": resets_in,
+            "resets_at": fetched + resets_in if resets_in else None,
         }
     return out
 
@@ -913,6 +954,219 @@ def focus_process(pid):
     return {"ok": False, "message": f"unknown host for {where}"}
 
 
+# ----------------------------------------------------- talk to agents (send)
+
+_SEND_TERMINAL = '''
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if (tty of t) is "%s" then
+          do script "%s" in t
+          return true
+        end if
+      end try
+    end repeat
+  end repeat
+  return false
+end tell'''
+
+_SEND_ITERM = '''
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if (tty of s) is "%s" then
+            tell s to write text "%s"
+            return true
+          end if
+        end try
+      end repeat
+    end repeat
+  end repeat
+  return false
+end tell'''
+
+
+def _osa_escape(text):
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def send_to_process(pid, text):
+    """Type `text` + Enter into the terminal hosting a claude process."""
+    if DEMO:
+        return {"ok": False, "message": "demo mode — no live agents to talk to"}
+    text = re.sub(r"\s*\n\s*", " ", text).strip()
+    if not text:
+        return {"ok": False, "message": "empty message"}
+    proc = next((p for p in claude_processes() if p["pid"] == pid), None)
+    if not proc:
+        return {"ok": False, "message": f"pid {pid} is gone"}
+    if proc.get("tmux_target"):
+        sock = ["-L", proc["tmux_sock"]] if proc["tmux_sock"] else []
+        rc1, _ = run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "-l", text])
+        rc2, _ = run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "Enter"])
+        ok = rc1 == 0 and rc2 == 0
+        return {"ok": ok, "message": "sent via tmux" if ok else "tmux send-keys failed"}
+    if proc["host"] in ("Terminal", "iTerm2") and proc["tty"]:
+        script = (_SEND_TERMINAL if proc["host"] == "Terminal" else _SEND_ITERM) % (
+            f"/dev/{proc['tty']}", _osa_escape(text))
+        rc, out = run(["osascript", "-e", script], timeout=10)
+        if rc == 0 and out.strip() == "true":
+            return {"ok": True, "message": f"typed into {proc['host']} ({proc['tty']})"}
+        return {"ok": False, "message":
+                f"couldn't reach {proc['host']} — Automation permission? ({proc['tty']})"}
+    return {"ok": False, "message":
+            f"{proc['host'] or 'unknown host'} terminals can't be scripted — focus it instead"}
+
+
+# ------------------------------------------------------------- chat reader
+
+def read_chat(account, sid, limit=40):
+    """Last conversation turns of a session, from its transcript."""
+    home = next((h for h in claude_homes() if account_label(h) == account), None)
+    if not home:
+        return {"ok": False, "error": f"unknown account {account}"}
+    fp = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
+    if not fp:
+        return {"ok": False, "error": "transcript not found"}
+    msgs = []
+    for line in _read_chunk(fp, 512 * 1024, from_end=True).splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("isSidechain") or e.get("isMeta"):
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        c = msg.get("content")
+        if e.get("type") == "user":
+            texts = [c] if isinstance(c, str) else [
+                b.get("text", "") for b in c
+                if isinstance(b, dict) and b.get("type") == "text"] if isinstance(c, list) else []
+            for t in texts:
+                if _real_prompt(t):
+                    msgs.append({"role": "you", "text": _clean(t, 900), "ts": e.get("timestamp")})
+        elif e.get("type") == "assistant" and isinstance(c, list):
+            parts = [b["text"] for b in c
+                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
+            if parts:
+                msgs.append({"role": "agent", "text": _clean(" ".join(parts), 900),
+                             "ts": e.get("timestamp")})
+    return {"ok": True, "messages": msgs[-limit:]}
+
+
+# --------------------------------------------------------------- dispatch
+
+FLEET_SOCK = "fleet"
+
+
+def _pick_defaults(mission):
+    state = cached_state()
+    limits = limits_by_account()
+    free = [w for w in state["worktrees"] if w["availability"] == "free"]
+    free.sort(key=lambda w: (w["git"]["dirty"] or 0))
+    wt = free[0]["name"] if free else None
+    accounts = [(a, d) for a, d in limits.items() if not d["exhausted"]]
+    accounts.sort(key=lambda x: -(x[1]["headroom"] or 0))
+    acct = accounts[0][0] if accounts else None
+    return wt, acct
+
+
+def _route_with_claude(mission):
+    """One-shot routing call: haiku picks worktree/account and writes the brief."""
+    state = cached_state()
+    limits = limits_by_account()
+    fleet = {
+        "worktrees": [{"name": w["name"], "branch": w["git"]["branch"],
+                       "dirty": w["git"]["dirty"], "availability": w["availability"]}
+                      for w in state["worktrees"]],
+        "accounts": [{"label": a, "headroom_pct": d["headroom"], "exhausted": d["exhausted"]}
+                     for a, d in limits.items()],
+    }
+    router_home = None
+    ok_accounts = sorted((d["headroom"] or 0, a) for a, d in limits.items() if not d["exhausted"])
+    if ok_accounts:
+        router_home = next((h for h in claude_homes()
+                            if account_label(h) == ok_accounts[-1][1]), None)
+    prompt = (
+        "You route work across git worktrees and Claude accounts. Fleet state:\n"
+        + json.dumps(fleet) + "\n\nMission from the user:\n" + mission +
+        "\n\nPick a FREE worktree (prefer clean ones and a thematic fit with its "
+        "branch) and a non-exhausted account with the most headroom. Write a "
+        "kickoff brief for the agent: restate the mission precisely, tell it to "
+        "check out an appropriately named new branch from latest origin/main "
+        "unless the worktree's current branch is clearly the right home, and to "
+        "commit as it goes. Reply with ONLY this JSON, no fences:\n"
+        '{"worktree": "...", "account": "...", "kickoff": "..."}')
+    env = dict(os.environ)
+    if router_home:
+        env["CLAUDE_CONFIG_DIR"] = str(router_home)
+    try:
+        p = subprocess.run(["claude", "-p", "--model", "haiku", prompt],
+                           capture_output=True, text=True, timeout=120, env=env)
+        m = re.search(r"\{.*\}", p.stdout, re.S)
+        d = json.loads(m.group(0))
+        if d.get("worktree") and d.get("account") and d.get("kickoff"):
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def dispatch(mission, worktree=None, account=None, use_router=False):
+    if DEMO:
+        return {"ok": False, "message": "demo mode — dispatch disabled"}
+    mission = (mission or "").strip()
+    if not mission:
+        return {"ok": False, "message": "empty mission"}
+    kickoff = mission
+    routed = None
+    if use_router and not (worktree and account):
+        routed = _route_with_claude(mission)
+    if routed:
+        worktree = worktree or routed["worktree"]
+        account = account or routed["account"]
+        kickoff = routed["kickoff"]
+    if not (worktree and account):
+        dw, da = _pick_defaults(mission)
+        worktree, account = worktree or dw, account or da
+    if not worktree:
+        return {"ok": False, "message": "no free worktree available"}
+    if not account:
+        return {"ok": False, "message": "every account is exhausted"}
+    wt = next((w for w in discover_worktrees() if w["name"] == worktree), None)
+    if not wt:
+        return {"ok": False, "message": f"unknown worktree {worktree}"}
+    home = next((h for h in claude_homes() if account_label(h) == account), None)
+    if not home:
+        return {"ok": False, "message": f"unknown account {account}"}
+
+    name = "mission-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower() \
+           + time.strftime("-%H%M%S")
+    shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
+                 f"exec claude --dangerously-skip-permissions")
+    rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
+                   "-c", wt["path"], shell_cmd])
+    if rc != 0:
+        return {"ok": False, "message": f"tmux failed: {out or 'is tmux installed?'}"}
+    brief = re.sub(r"\s*\n\s*", " ", kickoff).strip()
+
+    def _feed():
+        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "-l", brief])
+        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
+    threading.Timer(6.0, _feed).start()
+    return {"ok": True,
+            "message": f"launched {name} in {worktree} on [{account}]"
+                       + (" (routed by claude)" if routed else " (rule-picked)"),
+            "session": name, "worktree": worktree, "account": account,
+            "kickoff": kickoff,
+            "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"}
+
+
 # ------------------------------------------------------------------- server
 
 class Handler(BaseHTTPRequestHandler):
@@ -931,6 +1185,13 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/limits"):
             body = json.dumps(cached_limits(refresh="refresh=1" in self.path)).encode()
             ctype = "application/json"
+        elif self.path.startswith("/api/chat"):
+            qa = re.search(r"account=([^&]+)", self.path)
+            qs = re.search(r"sid=([0-9a-fA-F-]+)", self.path)
+            result = read_chat(qa.group(1), qs.group(1)) if qa and qs else \
+                {"ok": False, "error": "need account & sid"}
+            body = json.dumps(result).encode()
+            ctype = "application/json"
         elif self.path == "/" or self.path.startswith("/index"):
             body = (HERE / "index.html").read_bytes()
             ctype = "text/html; charset=utf-8"
@@ -947,6 +1208,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(n).decode() or "{}")
+        except (ValueError, OSError):
+            payload = {}
+        if self.path.startswith("/api/send"):
+            result = send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
+        elif self.path.startswith("/api/dispatch"):
+            result = dispatch(payload.get("mission"), payload.get("worktree") or None,
+                              payload.get("account") or None, bool(payload.get("router")))
+        else:
+            self.send_error(404)
+            return
+        body = json.dumps(result).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 

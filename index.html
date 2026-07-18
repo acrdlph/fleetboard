@@ -125,6 +125,68 @@ header {
   box-shadow:0 10px 30px rgba(0,0,0,.5);
 }
 
+/* ---- action buttons ---- */
+.abtn {
+  font:inherit; font-size:10.5px; font-weight:700; color:var(--muted);
+  background:var(--bg-2); border:1px solid var(--border-2); border-radius:5px;
+  padding:2px 8px; cursor:pointer; transition:all .15s var(--ease);
+}
+.abtn:hover { color:var(--fg); border-color:var(--accent); }
+.abtn:disabled { opacity:.45; cursor:default; }
+.abtn.armed { color:var(--green); border-color:var(--green); animation:pulse 1.6s var(--ease) infinite; }
+#missionBtn {
+  font:inherit; font-size:12px; font-weight:800; color:var(--accent);
+  background:var(--bg-2); border:1px solid var(--accent); border-radius:7px;
+  padding:6px 13px; cursor:pointer; transition:all .15s var(--ease);
+}
+#missionBtn:hover { background:var(--accent); color:var(--bg); }
+
+/* ---- drawer (chat / mission) ---- */
+#drawer {
+  position:fixed; top:52px; right:0; bottom:0; width:460px; z-index:30;
+  background:var(--bg-2); border-left:1px solid var(--border-2);
+  box-shadow:-18px 0 50px rgba(0,0,0,.55);
+  display:none; flex-direction:column;
+}
+#drawer.open { display:flex; }
+.dhead { display:flex; align-items:center; gap:10px; padding:12px 16px;
+  border-bottom:1px solid var(--border); background:var(--surface); }
+.dhead .t { font-weight:800; font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dhead .sub { color:var(--muted-2); font-size:11px; }
+.dhead button { margin-left:auto; font:inherit; background:none; border:none;
+  color:var(--muted); font-size:16px; cursor:pointer; }
+.dhead button:hover { color:var(--fg); }
+#dbody { flex:1; overflow-y:auto; padding:14px 16px; display:flex; flex-direction:column; gap:10px; }
+.msg { font-size:12px; line-height:1.5; border-radius:8px; padding:8px 11px; max-width:95%; }
+.msg.you { background:var(--surface-2); border:1px solid var(--border-2); align-self:flex-end; color:var(--fg); }
+.msg.you::before { content:"❯ "; color:var(--accent); font-weight:700; }
+.msg.agent { background:var(--surface); border:1px solid var(--border); align-self:flex-start; color:var(--muted); }
+.msg.agent::before { content:"⏎ "; color:var(--green); }
+.dfoot { border-top:1px solid var(--border); padding:12px 14px; background:var(--surface);
+  display:flex; flex-direction:column; gap:8px; }
+.dfoot textarea, .dfoot input[type=text] {
+  font:inherit; font-size:12.5px; color:var(--fg); background:var(--bg);
+  border:1px solid var(--border-2); border-radius:8px; padding:9px 11px; width:100%;
+  resize:vertical; min-height:38px;
+}
+.dfoot textarea:focus, .dfoot select:focus { outline:1px solid var(--accent); }
+.dfoot select {
+  font:inherit; font-size:11.5px; color:var(--muted); background:var(--bg);
+  border:1px solid var(--border-2); border-radius:7px; padding:6px 8px;
+}
+.dfoot .row { display:flex; gap:8px; align-items:center; }
+.dfoot .send {
+  font:inherit; font-size:12px; font-weight:800; color:var(--bg);
+  background:var(--accent); border:none; border-radius:7px; padding:8px 16px; cursor:pointer;
+}
+.dfoot .send:hover { background:var(--accent-2); }
+.dfoot .send:disabled { opacity:.5; cursor:default; }
+.dnote { color:var(--muted-2); font-size:10.5px; line-height:1.5; }
+.dnote b { color:var(--yellow); }
+.dresult { font-size:12px; color:var(--muted); background:var(--surface); border:1px solid var(--border);
+  border-radius:8px; padding:10px 12px; line-height:1.6; }
+.dresult code { color:var(--cyan); }
+
 .gitline { padding:9px 14px 0; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:baseline; font-size:12.5px; }
 .gitline .branch { color:var(--cyan); font-weight:600; }
 .gitline .branch::before { content:" "; color:var(--muted-2); }
@@ -185,8 +247,16 @@ header {
 <header><div class="wrap nav">
   <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> <span class="cmd">./fleetboard --watch</span><span class="cursor"></span></div>
   <div class="navr">
+  <button id="missionBtn" onclick="openMission()">🚀 new mission</button>
   <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div></div>
 </div></header>
+
+<div id="drawer">
+  <div class="dhead"><div><div class="t" id="dtitle"></div><div class="sub" id="dsub"></div></div>
+    <button onclick="closeDrawer()">✕</button></div>
+  <div id="dbody"></div>
+  <div class="dfoot" id="dfoot"></div>
+</div>
 
 <nav class="side">
   <a href="/" class="active"><span class="g">⌗</span>board</a>
@@ -242,9 +312,13 @@ function maybeBell(attn) {
   lastAttn = attn;
 }
 
+const REG = {};
 function render(st) {
   const now = st.generated_at;
   $("brandUser").textContent = `${st.user || "you"}@fleet`;
+  for (const w of st.worktrees)
+    for (const s of w.sessions)
+      REG[`${w.name}|${s.sid}`] = { s, procs: w.live_procs, wt: w.name };
   const c = st.counts;
   const attn = c.needs_input + c.blocked + c.waiting + (c.limit || 0);
   maybeBell(attn);
@@ -282,6 +356,11 @@ function render(st) {
           ${s.subdir ? `<span class="subdir">./${esc(s.subdir)}</span>` : ""}
           ${s.branch && s.branch !== g.branch ? `<span class="meta"> ${esc(s.branch)}</span>` : ""}
           ${s.subagents_active ? `<span class="subag">⚙ subagents running</span>` : ""}
+          <span style="margin-left:auto;display:flex;gap:6px">
+            ${s.status === "limit" && s.limit && s.limit.group === "session" && s.limit.resets_at
+              ? `<button class="abtn resume" data-key="${esc(w.name)}|${esc(s.sid)}" data-until="${s.limit.resets_at}">▶ resume</button>` : ""}
+            <button class="abtn" onclick="openChat('${esc(w.name)}|${esc(s.sid)}')">✉ chat</button>
+          </span>
         </div>
         ${s.topic ? `<div class="topic">${esc(s.topic)}</div>` : ""}
         ${s.last_user && s.last_user !== s.topic ? `<div class="you">${esc(s.last_user)}</div>` : ""}
@@ -345,8 +424,142 @@ $("showEnded").addEventListener("change", () => { localStorage.fbEnded = $("show
 $("bell").addEventListener("change", () => { localStorage.fbBell = $("bell").checked ? "1" : ""; });
 $("showEnded").checked = localStorage.fbEnded === "1";
 $("bell").checked = localStorage.fbBell === "1";
+// ---- drawer: chat with an agent / launch a mission -------------------------
+let chatCtx = null, chatTimer = null;
+function closeDrawer() {
+  $("drawer").classList.remove("open");
+  chatCtx = null;
+  clearTimeout(chatTimer);
+}
+function reachableProcs(procs) { return procs.filter(p => p.reachable); }
+
+function openChat(key) {
+  const r = REG[key];
+  if (!r) return;
+  chatCtx = { key, account: r.s.account, sid: r.s.sid };
+  $("dtitle").textContent = `${r.wt} · [${r.s.account}]`;
+  $("dsub").textContent = r.s.topic || r.s.sid;
+  const procs = reachableProcs(r.procs);
+  $("dfoot").innerHTML = procs.length ? `
+    ${r.procs.length > 1 ? `<select id="chatTarget">${r.procs.map(p =>
+      `<option value="${p.pid}" ${p.reachable ? "" : "disabled"}>⌖ ${p.pid} · ${esc(p.tty || "?")} · ${esc(p.host || "?")}${p.reachable ? "" : " (unreachable)"}</option>`).join("")}</select>` : ""}
+    <div class="row">
+      <textarea id="chatText" placeholder="type an instruction for this agent…"></textarea>
+      <button class="send" onclick="sendChat()">send</button>
+    </div>
+    <div class="dnote">typed straight into the agent's terminal (${esc(procs[0].tty || "tmux")} · ${esc(procs[0].host || "tmux")})</div>`
+    : `<div class="dnote"><b>read-only</b> — no scriptable live process for this worktree
+       (Cursor/VS Code terminals can't be typed into; ended sessions have no terminal)</div>`;
+  if (procs.length === 1) window._chatPid = procs[0].pid;
+  $("dbody").innerHTML = `<div class="dnote">loading transcript…</div>`;
+  $("drawer").classList.add("open");
+  loadChatMsgs();
+}
+async function loadChatMsgs() {
+  if (!chatCtx) return;
+  try {
+    const r = await fetch(`/api/chat?account=${encodeURIComponent(chatCtx.account)}&sid=${chatCtx.sid}`);
+    const d = await r.json();
+    if (d.ok) {
+      $("dbody").innerHTML = d.messages.map(m =>
+        `<div class="msg ${m.role === "you" ? "you" : "agent"}">${esc(m.text)}</div>`).join("")
+        || `<div class="dnote">no conversation yet</div>`;
+      $("dbody").scrollTop = $("dbody").scrollHeight;
+    } else $("dbody").innerHTML = `<div class="dnote">✗ ${esc(d.error)}</div>`;
+  } catch (e) {}
+  chatTimer = setTimeout(loadChatMsgs, 5000);
+}
+async function sendToPid(pid, text) {
+  const r = await fetch("/api/send", { method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pid, text }) });
+  return r.json();
+}
+async function sendChat() {
+  const text = $("chatText").value.trim();
+  if (!text || !chatCtx) return;
+  const sel = $("chatTarget");
+  const pid = sel ? parseInt(sel.value) : window._chatPid;
+  if (!pid) { toast("✗ no reachable process"); return; }
+  $("chatText").value = "";
+  $("dbody").insertAdjacentHTML("beforeend", `<div class="msg you">${esc(text)}</div>`);
+  $("dbody").scrollTop = $("dbody").scrollHeight;
+  const res = await sendToPid(pid, text);
+  toast((res.ok ? "✓ " : "✗ ") + res.message);
+}
+
+// ---- resume: arm the button when a session limit has reset -----------------
+document.addEventListener("click", async (ev) => {
+  const b = ev.target.closest ? ev.target.closest(".resume") : null;
+  if (!b || b.disabled) return;
+  const r = REG[b.dataset.key];
+  const procs = r ? reachableProcs(r.procs) : [];
+  if (!procs.length) { toast("✗ no scriptable terminal for this worktree"); return; }
+  toast("▶ sending continue…");
+  const res = await sendToPid(procs[0].pid, "continue");
+  toast((res.ok ? "✓ resumed — " : "✗ ") + res.message);
+});
+setInterval(() => {
+  const now = Date.now() / 1000;
+  document.querySelectorAll(".resume").forEach(b => {
+    const left = parseFloat(b.dataset.until) - now;
+    if (left <= 0) { b.disabled = false; b.classList.add("armed"); b.textContent = "▶ resume now"; }
+    else { b.disabled = true; b.classList.remove("armed"); b.textContent = "▶ resume in " + rel(left); }
+  });
+}, 1000);
+
+// ---- mission composer ------------------------------------------------------
+let LIMITS = null;
+function acctLabel(dir) {
+  const base = (dir || "").split("/").pop();
+  return base === ".claude" ? "main" : base.replace(/^\.claude-?/, "");
+}
+function openMission() {
+  chatCtx = null; clearTimeout(chatTimer);
+  $("dtitle").textContent = "🚀 new mission";
+  $("dsub").textContent = "dispatch a tmux-hosted agent into the fleet";
+  const frees = lastState ? lastState.free_worktrees : [];
+  const all = lastState ? lastState.worktrees.map(w => w.name) : [];
+  const accts = LIMITS && LIMITS.accounts ? LIMITS.accounts.filter(a => a.ok) : [];
+  $("dbody").innerHTML = `<div class="dnote">describe the feature or task. worktree &
+    account default to the best free/most-headroom picks; the router option asks a
+    one-shot claude (haiku) to choose and to write the kickoff brief.</div>`;
+  $("dfoot").innerHTML = `
+    <textarea id="mText" style="min-height:90px" placeholder="what should be built?"></textarea>
+    <div class="row">
+      <select id="mWt"><option value="">worktree: auto (${esc(frees[0] || "none free")})</option>
+        ${all.map(n => `<option value="${esc(n)}">${esc(n)}${frees.includes(n) ? " · free" : ""}</option>`).join("")}</select>
+      <select id="mAcct"><option value="">account: auto</option>
+        ${accts.map(a => `<option value="${esc(acctLabel(a.config_dir))}">${esc(acctLabel(a.config_dir))} · ${Math.round(a.headroom_percent ?? 0)}% left</option>`).join("")}</select>
+    </div>
+    <div class="row"><label class="dnote" style="cursor:pointer">
+      <input type="checkbox" id="mRouter" checked> route &amp; brief with claude (haiku, one call)</label>
+      <button class="send" style="margin-left:auto" onclick="launchMission()">launch</button></div>`;
+  $("drawer").classList.add("open");
+}
+async function launchMission() {
+  const mission = $("mText").value.trim();
+  if (!mission) { toast("✗ empty mission"); return; }
+  $("dbody").innerHTML = `<div class="dnote">dispatching… (router adds ~15s)</div>`;
+  try {
+    const r = await fetch("/api/dispatch", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mission, worktree: $("mWt").value, account: $("mAcct").value,
+                             router: $("mRouter").checked }) });
+    const d = await r.json();
+    $("dbody").innerHTML = d.ok
+      ? `<div class="dresult">✓ ${esc(d.message)}<br><br>kickoff brief:<br>${esc(d.kickoff)}<br><br>
+         attach anytime: <code>${esc(d.attach)}</code><br>
+         the agent appears on the board once its transcript starts (~30s).</div>`
+      : `<div class="dresult">✗ ${esc(d.message)}</div>`;
+    toast((d.ok ? "✓ " : "✗ ") + d.message);
+  } catch (e) { toast("✗ dispatch failed"); }
+}
+
 // prime the server's cclimits cache so exhausted accounts surface as ⛔ LIMIT
-function primeLimits() { fetch("/api/limits").then(() => tick()).catch(() => {}); }
+function primeLimits() {
+  fetch("/api/limits").then(r => r.json()).then(d => { LIMITS = d; tick(); }).catch(() => {});
+}
 tick();
 primeLimits();
 setInterval(tick, 5000);

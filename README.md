@@ -98,6 +98,28 @@ this terminal can be closed"**, drops out of the need-you counts, and stops
 speaking for the branch on the map — the successor's status takes over. Only
 a stranded agent with *no* successor keeps demanding your attention.
 
+## Acting on the fleet — chat, resume, dispatch
+
+fleetboard is also a control plane (loopback-only; every action is an explicit
+click):
+
+- **✉ chat** — every session row opens a chat drawer: the conversation is read
+  from the transcript, and your reply is typed straight into the agent's
+  terminal (tmux `send-keys`; AppleScript for Terminal.app/iTerm2 — grant the
+  Automation permission; editor-embedded terminals are read-only).
+- **▶ resume** — a session-limit-stuck agent gets a resume button with a live
+  countdown that arms itself the moment the limit resets, then types
+  `continue` for you. Weekly limits never show it (they won't heal soon).
+- **🚀 new mission** — describe a feature; fleetboard picks the cleanest free
+  worktree and the account with most headroom (or lets a one-shot
+  `claude -p --model haiku` router choose and write the kickoff brief), then
+  launches a tmux-hosted agent: `tmux -L fleet` sessions, attachable from any
+  terminal, visible on the board like any other agent.
+
+Dispatched agents run `--dangerously-skip-permissions` — nobody is at their
+prompt to approve tools. Nothing dispatches, resumes, or spends usage on its
+own; you are always the trigger.
+
 ## Limits — is the agent stuck, or out of juice?
 
 An agent parked at the prompt on an exhausted account isn't "your turn" — it's
