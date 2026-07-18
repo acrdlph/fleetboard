@@ -99,9 +99,13 @@ refetch". Nothing polls the Anthropic API on a timer.
   `continue`. Weekly limits never show it — they won't heal soon.
 - **🚀 new mission** — describe a feature; fleetboard picks the cleanest free
   worktree and the most-headroom account (or a one-shot
-  `claude -p --model haiku` router picks them *and writes the kickoff brief*),
-  then launches a tmux-hosted agent: `tmux -L fleet attach -t mission-…` from
-  any terminal, and it appears on the board like any other agent.
+  `claude -p --model haiku` router picks them, plus a branch name), then
+  launches a tmux-hosted agent: `tmux -L fleet attach -t mission-…` from any
+  terminal, and it appears on the board like any other agent. **Your mission
+  text is never rewritten** — the router only makes routing decisions; the
+  agent receives a deterministic operational header (branch, commit
+  discipline) followed by the author's words verbatim. Every dispatch is
+  logged to `dispatch.log.jsonl` (gitignored) for auditing.
   **Model & effort** are selectable (or "auto": the router matches them to the
   mission — ultracode for hard features, xhigh for research, high for simple
   tasks — and avoids models whose model-scoped limit is exhausted on the

@@ -1124,7 +1124,9 @@ def _route_with_claude(mission):
         router_home = next((h for h in claude_homes()
                             if account_label(h) == ok_accounts[-1][1]), None)
     prompt = (
-        "You route work across git worktrees and Claude accounts. Fleet state:\n"
+        "You route work across git worktrees and Claude accounts. You do NOT "
+        "rewrite the mission — the author's text is passed to the agent "
+        "verbatim; you only make routing decisions. Fleet state:\n"
         + json.dumps(fleet) + "\n\nMission from the user:\n" + mission +
         "\n\nPick a FREE worktree (prefer clean ones and a thematic fit with its "
         "branch) and a non-exhausted account with the most headroom. Also pick "
@@ -1132,13 +1134,12 @@ def _route_with_claude(mission):
         "in that account's exhausted_limits — e.g. if 'Fable' is exhausted "
         "there, pick opus or another account) and the reasoning effort: "
         "'ultracode' for genuinely hard multi-step features, 'xhigh' for "
-        "research or medium tasks, 'high' for simple tasks. Write a kickoff "
-        "brief for the agent: restate the mission precisely, tell it to check "
-        "out an appropriately named new branch from latest origin/main unless "
-        "the worktree's current branch is clearly the right home, and to "
-        "commit as it goes. Reply with ONLY this JSON, no fences:\n"
+        "research or medium tasks, 'high' for simple tasks. Finally suggest a "
+        "conventional branch name for this mission (feat/fix/docs/...), or "
+        "null if the worktree's current branch is clearly the right home. "
+        "Reply with ONLY this JSON, no fences:\n"
         '{"worktree": "...", "account": "...", "model": "fable|opus|sonnet|haiku", '
-        '"effort": "high|xhigh|ultracode", "kickoff": "..."}')
+        '"effort": "high|xhigh|ultracode", "branch": "feat/...|null"}')
     env = dict(os.environ)
     if router_home:
         env["CLAUDE_CONFIG_DIR"] = str(router_home)
@@ -1147,7 +1148,7 @@ def _route_with_claude(mission):
                            capture_output=True, text=True, timeout=120, env=env)
         m = re.search(r"\{.*\}", p.stdout, re.S)
         d = json.loads(m.group(0))
-        if d.get("worktree") and d.get("account") and d.get("kickoff"):
+        if d.get("worktree") and d.get("account"):
             return d
     except Exception:
         pass
@@ -1161,16 +1162,26 @@ def dispatch(mission, worktree=None, account=None, use_router=False,
     mission = (mission or "").strip()
     if not mission:
         return {"ok": False, "message": "empty mission"}
-    kickoff = mission
     routed = None
     if use_router and not (worktree and account and model and effort):
         routed = _route_with_claude(mission)
+    branch = None
     if routed:
         worktree = worktree or routed["worktree"]
         account = account or routed["account"]
         model = model or routed.get("model")
         effort = effort or routed.get("effort")
-        kickoff = routed["kickoff"]
+        b = routed.get("branch")
+        branch = b if isinstance(b, str) and b and b.lower() != "null" else None
+    # The kickoff is a deterministic template around the author's verbatim text —
+    # no model ever rewrites the mission.
+    header = (f"First check out a new branch {branch} from latest origin/main. "
+              if branch else
+              "If this worktree's current branch is not the right home for this "
+              "work, check out an appropriately named new branch from latest "
+              "origin/main first. ")
+    kickoff = (header + "Commit as you go. Your mission, in the author's own "
+               "words: " + mission)
     if not (worktree and account):
         dw, da = _pick_defaults(mission)
         worktree, account = worktree or dw, account or da
@@ -1215,6 +1226,15 @@ def dispatch(mission, worktree=None, account=None, use_router=False,
     effort_note = ""
     if effort:
         effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")
+    try:  # audit trail: every dispatch, with the author's original words
+        with open(HERE / "dispatch.log.jsonl", "a") as lf:
+            lf.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": name,
+                "worktree": worktree, "account": account, "model": model,
+                "effort": effort, "routed": bool(routed),
+                "mission_original": mission, "kickoff": kickoff}) + "\n")
+    except OSError:
+        pass
     return {"ok": True,
             "message": f"launched {name} in {worktree} on [{account}]"
                        + (f" · {model}" if model else "") + effort_note
