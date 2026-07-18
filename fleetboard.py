@@ -505,7 +505,23 @@ def collect_state():
                 # trust it even when the cclimits cache is cold/stale
                 s["status"] = "limit"
                 s["limit"] = {"worst": None, "resets_in": None}
-        ss.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
+
+    # Handoff awareness: a limit-hit session whose worktree has a FRESHER live
+    # session (typically another account continuing from a handoff doc) is no
+    # longer the actionable one — annotate the succession and stop treating
+    # the stranded session as needing attention.
+    for ss in sessions.values():
+        alive = [s for s in ss if s["status"] in ("working", "waiting", "needs_input", "blocked")]
+        for s in ss:
+            if s["status"] == "limit":
+                succ = [a for a in alive if a["age_s"] < s["age_s"]]
+                if succ:
+                    s["handed_to"] = min(succ, key=lambda a: a["age_s"])["account"]
+        ss.sort(key=lambda s: (4.5 if s.get("handed_to") else rank[s["status"]], s["age_s"]))
+
+    def _attention_statuses(ss):
+        return [s["status"] for s in ss
+                if not (s["status"] == "limit" and s.get("handed_to"))]
 
     cards = []
     for w in worktrees:
@@ -523,7 +539,7 @@ def collect_state():
         })
 
     for c in cards:
-        st = [s["status"] for s in c["sessions"]]
+        st = _attention_statuses(c["sessions"])
         if c["live_procs"] or "working" in st:
             if any(k in st for k in ("needs_input", "blocked", "waiting", "limit")):
                 c["availability"] = "attention"   # agent parked here, needs you
@@ -536,7 +552,7 @@ def collect_state():
     other = [p for p in procs if p["pid"] not in matched]
 
     def severity(c):
-        st = [s["status"] for s in c["sessions"]]
+        st = _attention_statuses(c["sessions"])
         if "needs_input" in st: return 0
         if "limit" in st: return 1
         if "blocked" in st: return 2
@@ -548,6 +564,8 @@ def collect_state():
     counts = {"working": 0, "needs_input": 0, "limit": 0, "blocked": 0, "waiting": 0, "ended": 0}
     for c in cards:
         for s in c["sessions"]:
+            if s["status"] == "limit" and s.get("handed_to"):
+                continue  # informational — work already continues elsewhere
             counts[s["status"]] += 1
     return {
         "generated_at": now,

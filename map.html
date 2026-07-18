@@ -156,7 +156,8 @@ function rel(s) {
 
 function statusOf(wt) {
   if (!wt) return { key:"free", ...STATUS.free };
-  const st = wt.sessions.map(s => s.status);
+  // a handed-off limit session no longer speaks for the worktree
+  const st = wt.sessions.filter(s => !(s.status === "limit" && s.handed_to)).map(s => s.status);
   if (st.includes("needs_input") || st.includes("blocked")) return { key:"needs", ...STATUS.needs };
   if (st.includes("limit")) return { key:"limit", ...STATUS.limit };
   if (st.includes("waiting")) return { key:"turn", ...STATUS.turn };
@@ -302,8 +303,8 @@ function tipHTML(b) {
   h += `<div class="mut">+${b.ahead} ahead · ↓${b.behind} behind ${esc("origin/main")} · Δ${b.dirty} uncommitted</div>`;
   h += `<div class="dim">forked ${rel(now-b.fork_ts)} ago</div>`;
   if (wt) {
-    for (const s of wt.sessions.slice(0, 2))
-      h += `<div class="dim">· ${esc(s.status)} [${esc(s.account)}] ${esc(s.model||"")} ${rel(s.age_s)} ago</div>`;
+    for (const s of wt.sessions.slice(0, 3))
+      h += `<div class="dim">· ${esc(s.status)} [${esc(s.account)}]${s.handed_to ? ` ↳ continued by [${esc(s.handed_to)}]` : ""} ${esc(s.model||"")} ${rel(s.age_s)} ago</div>`;
     for (const p of wt.live_procs)
       h += `<div class="mut">⌖ ${p.pid}${p.tty ? " · " + esc(p.tty) : ""}${p.host ? " · " + esc(p.host) : ""} <span class="dim">— click to focus</span></div>`;
   }
