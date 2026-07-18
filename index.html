@@ -143,12 +143,21 @@ header {
 
 /* ---- drawer (chat / mission) ---- */
 #drawer {
-  position:fixed; top:52px; right:0; bottom:0; width:460px; z-index:30;
+  position:fixed; top:52px; right:0; bottom:0; width:min(460px, 96vw); z-index:30;
   background:var(--bg-2); border-left:1px solid var(--border-2);
   box-shadow:-18px 0 50px rgba(0,0,0,.55);
   display:none; flex-direction:column;
+  transition:width .2s var(--ease);
 }
 #drawer.open { display:flex; }
+#drawer.wide { width:min(920px, 94vw); }
+#drawer.wide #dbody { padding:18px 26px; }
+#mText {
+  flex:1; min-height:45vh; resize:none; font-size:13.5px; line-height:1.65;
+  font:inherit; color:var(--fg); background:var(--bg);
+  border:1px solid var(--border-2); border-radius:10px; padding:14px 16px; width:100%;
+}
+#mText:focus { outline:1px solid var(--accent); }
 .dhead { display:flex; align-items:center; gap:10px; padding:12px 16px;
   border-bottom:1px solid var(--border); background:var(--surface); }
 .dhead .t { font-weight:800; font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -429,7 +438,7 @@ $("bell").checked = localStorage.fbBell === "1";
 // ---- drawer: chat with an agent / launch a mission -------------------------
 let chatCtx = null, chatTimer = null;
 function closeDrawer() {
-  $("drawer").classList.remove("open");
+  $("drawer").classList.remove("open", "wide");
   chatCtx = null;
   clearTimeout(chatTimer);
 }
@@ -454,6 +463,7 @@ function openChat(key) {
        (Cursor/VS Code terminals can't be typed into; ended sessions have no terminal)</div>`;
   if (procs.length === 1) window._chatPid = procs[0].pid;
   $("dbody").innerHTML = `<div class="dnote">loading transcript…</div>`;
+  $("drawer").classList.remove("wide");
   $("drawer").classList.add("open");
   loadChatMsgs();
 }
@@ -523,11 +533,11 @@ function openMission() {
   const frees = lastState ? lastState.free_worktrees : [];
   const all = lastState ? lastState.worktrees.map(w => w.name) : [];
   const accts = LIMITS && LIMITS.accounts ? LIMITS.accounts.filter(a => a.ok) : [];
-  $("dbody").innerHTML = `<div class="dnote">describe the feature or task. worktree &
-    account default to the best free/most-headroom picks; the router option asks a
-    one-shot claude (haiku) to choose and to write the kickoff brief.</div>`;
+  $("dbody").innerHTML = `<div class="dnote">describe the feature or task — your text
+    reaches the agent verbatim; the router only picks where it runs. worktree &amp;
+    account default to the best free/most-headroom picks.</div>
+    <textarea id="mText" placeholder="what should be built?"></textarea>`;
   $("dfoot").innerHTML = `
-    <textarea id="mText" style="min-height:90px" placeholder="what should be built?"></textarea>
     <div class="row">
       <select id="mWt"><option value="">worktree: auto (${esc(frees[0] || "none free")})</option>
         ${all.map(n => `<option value="${esc(n)}">${esc(n)}${frees.includes(n) ? " · free" : ""}</option>`).join("")}</select>
@@ -546,7 +556,8 @@ function openMission() {
     <div class="row"><label class="dnote" style="cursor:pointer">
       <input type="checkbox" id="mRouter" checked> route &amp; brief with claude (haiku, one call)</label>
       <button class="send" style="margin-left:auto" onclick="launchMission()">launch</button></div>`;
-  $("drawer").classList.add("open");
+  $("drawer").classList.add("open", "wide");
+  $("mText").focus();
 }
 async function launchMission() {
   const mission = $("mText").value.trim();
@@ -578,6 +589,10 @@ tick();
 primeLimits();
 setInterval(tick, 5000);
 setInterval(primeLimits, 300000);
+
+// deep link: /?mission opens the composer, /?mission=<text> prefills it
+const _mq = new URLSearchParams(location.search).get("mission");
+if (_mq !== null) setTimeout(() => { openMission(); if (_mq) $("mText").value = _mq; }, 600);
 </script>
 </body>
 </html>

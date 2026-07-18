@@ -1270,7 +1270,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "need account & sid"}
             body = json.dumps(result).encode()
             ctype = "application/json"
-        elif self.path == "/" or self.path.startswith("/index"):
+        elif self.path.split("?", 1)[0] in ("/", "/index", "/index.html"):
             body = (HERE / "index.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         elif self.path.startswith("/map"):
