@@ -54,6 +54,24 @@ header {
 .sync .dot { width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 8px var(--green-glow); }
 .sync.err .dot { background:var(--accent); }
 
+/* ---- side nav ---- */
+.side { position:fixed; left:0; top:52px; bottom:0; width:118px; z-index:9;
+  padding:16px 10px; display:flex; flex-direction:column; gap:5px;
+  border-right:1px solid var(--border); background:var(--bg-2); }
+.side a { color:var(--muted); text-decoration:none; font-size:12.5px; font-weight:600;
+  padding:8px 12px; border-radius:7px; display:flex; gap:9px; align-items:baseline;
+  transition:color .2s var(--ease), background .2s var(--ease); }
+.side a .g { color:var(--muted-2); }
+.side a:hover { color:var(--fg); background:var(--surface); }
+.side a.active { color:var(--fg); background:var(--surface); box-shadow:inset 2px 0 0 var(--accent); }
+.side a.active .g { color:var(--accent); }
+.content { margin-left:118px; }
+@media (max-width:860px) {
+  .side { position:static; width:auto; flex-direction:row; border-right:none;
+    border-bottom:1px solid var(--border); padding:8px 22px; }
+  .content { margin-left:0; }
+}
+
 /* ---- stat tiles ---- */
 .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; margin:18px 0; }
 .tile {
@@ -124,6 +142,7 @@ header {
 .sess .row1 { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:baseline; }
 .st { font-weight:800; font-size:10.5px; letter-spacing:.07em; white-space:nowrap; }
 .sess.working      { border-left-color:var(--green); }
+.sess.limit        { border-left-color:var(--yellow); }
 .sess.needs_input,
 .sess.blocked      { border-left-color:var(--accent); }
 .sess.waiting      { border-left-color:var(--accent-2); }
@@ -131,6 +150,7 @@ header {
 .st.working  { color:var(--green); }
 .st.working .g { animation:blink 1.2s steps(1) infinite; }
 .st.needs_input { color:var(--accent); }
+.st.limit    { color:var(--yellow); }
 .st.blocked  { color:var(--yellow); }
 .st.waiting  { color:var(--accent-2); }
 .st.ended    { color:var(--muted-2); }
@@ -163,11 +183,17 @@ header {
 <body>
 <header><div class="wrap nav">
   <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> <span class="cmd">./fleetboard --watch</span><span class="cursor"></span></div>
-  <div class="navr"><a class="maplink" href="/map">map</a>
+  <div class="navr">
   <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div></div>
 </div></header>
 
-<div class="wrap">
+<nav class="side">
+  <a href="/" class="active"><span class="g">⌗</span>board</a>
+  <a href="/map"><span class="g">⌁</span>map</a>
+  <a href="/limits"><span class="g">◔</span>limits</a>
+</nav>
+
+<div class="wrap content">
   <div class="tiles" id="tiles"></div>
   <div class="grid" id="grid"></div>
   <div class="controls">
@@ -185,6 +211,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&
 const STATUS = {
   working:     { glyph:"●", label:"WORKING" },
   needs_input: { glyph:"▲", label:"NEEDS ANSWER" },
+  limit:       { glyph:"⛔", label:"LIMIT HIT" },
   blocked:     { glyph:"■", label:"BLOCKED · pending tool" },
   waiting:     { glyph:"◆", label:"YOUR TURN · idle @ prompt" },
   ended:       { glyph:"○", label:"ENDED" },
@@ -218,7 +245,7 @@ function render(st) {
   const now = st.generated_at;
   $("brandUser").textContent = `${st.user || "you"}@fleet`;
   const c = st.counts;
-  const attn = c.needs_input + c.blocked + c.waiting;
+  const attn = c.needs_input + c.blocked + c.waiting + (c.limit || 0);
   maybeBell(attn);
   document.title = attn > 0 ? `(${attn}!) fleetboard` : "fleetboard";
 
@@ -226,7 +253,7 @@ function render(st) {
   $("tiles").innerHTML = `
     <div class="tile ok"><div class="k">● working</div><div class="v">${c.working}</div><div class="sub">agents mid-turn</div></div>
     <div class="tile ${attn ? "attn" : ""}"><div class="k">▲ need you</div><div class="v">${attn}</div>
-      <div class="sub">${c.needs_input} question · ${c.blocked} blocked · ${c.waiting} idle</div></div>
+      <div class="sub">${c.needs_input} question · ${c.limit || 0} ⛔ limit · ${c.blocked} blocked · ${c.waiting} idle</div></div>
     <div class="tile free"><div class="k">◇ free worktrees</div><div class="v">${freeNames.length}</div>
       <div class="sub" title="${esc(freeNames.join(", "))}">${esc(freeNames.join(", ") || "none — everything busy")}</div></div>
     <div class="tile"><div class="k">⌁ live agents</div><div class="v">${st.worktrees.reduce((n,w)=>n+w.live_procs.length,0) + st.other_procs.length}</div>
@@ -240,7 +267,9 @@ function render(st) {
     const showEnded = $("showEnded").checked;
     const sess = w.sessions.filter(s => showEnded || s.status !== "ended");
     const rows = sess.map(s => {
-      const stt = STATUS[s.status];
+      const stt = { ...STATUS[s.status] };
+      if (s.status === "limit" && s.limit)
+        stt.label = `LIMIT HIT · ${s.limit.worst || "usage"}${s.limit.resets_in ? " · resets in " + rel(s.limit.resets_in) : ""}`;
       const pend = (s.status !== "working" && s.pending_tools.length)
         ? `<div class="pending">⧗ waiting on: ${esc(s.pending_tools.join(", "))}</div>` : "";
       return `<div class="sess ${s.status}">
@@ -314,8 +343,12 @@ $("showEnded").addEventListener("change", () => { localStorage.fbEnded = $("show
 $("bell").addEventListener("change", () => { localStorage.fbBell = $("bell").checked ? "1" : ""; });
 $("showEnded").checked = localStorage.fbEnded === "1";
 $("bell").checked = localStorage.fbBell === "1";
+// prime the server's cclimits cache so exhausted accounts surface as ⛔ LIMIT
+function primeLimits() { fetch("/api/limits").then(() => tick()).catch(() => {}); }
 tick();
+primeLimits();
 setInterval(tick, 5000);
+setInterval(primeLimits, 300000);
 </script>
 </body>
 </html>

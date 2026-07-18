@@ -84,6 +84,26 @@ is a branch that stopped moving. A long flat arc that forked far left and is
 status color from the fleet state (a working agent's tip pulses). Hover any
 line for details; click a node to jump to that agent's terminal.
 
+## Limits — is the agent stuck, or out of juice?
+
+An agent parked at the prompt on an exhausted account isn't "your turn" — it's
+out of usage. fleetboard shells out to
+[cclimits](https://github.com/acrdlph/cclimits) and joins per-account limit
+state into every session: exhausted accounts flip their parked sessions to
+`⛔ LIMIT HIT · Weekly · resets in 4d2h`, and the CLI's own "out of usage
+credits" transcript notice is detected as a fallback even when the limits
+cache is cold.
+
+The `/limits` view shows every account side by side — headroom, per-limit
+bars, reset countdowns, and which account has the most room for your next
+agent:
+
+![the limits view](docs/limits.png)
+
+Polling discipline: results are cached server-side for 5 minutes on top of
+cclimits' own cache, and a **network refetch only ever happens when you click
+"force refetch"** — nothing polls the Anthropic API on a timer.
+
 ## Usage
 
 ```bash

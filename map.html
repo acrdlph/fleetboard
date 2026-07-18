@@ -49,6 +49,24 @@ header {
 .sync .dot { width:8px; height:8px; border-radius:50%; background:var(--green); }
 .sync.err .dot { background:var(--accent); }
 
+.side { position:fixed; left:0; top:52px; bottom:0; width:118px; z-index:9;
+  padding:16px 10px; display:flex; flex-direction:column; gap:5px;
+  border-right:1px solid var(--border); background:var(--bg-2); }
+.side a { color:var(--muted); text-decoration:none; font-size:12.5px; font-weight:600;
+  padding:8px 12px; border-radius:7px; display:flex; gap:9px; align-items:baseline;
+  transition:color .2s var(--ease), background .2s var(--ease); }
+.side a::before { content:none; }
+.side a .g { color:var(--muted-2); }
+.side a:hover { color:var(--fg); background:var(--surface); }
+.side a.active { color:var(--fg); background:var(--surface); box-shadow:inset 2px 0 0 var(--accent); }
+.side a.active .g { color:var(--accent); }
+.content { margin-left:118px; }
+@media (max-width:860px) {
+  .side { position:static; width:auto; flex-direction:row; border-right:none;
+    border-bottom:1px solid var(--border); padding:8px 22px; }
+  .content { margin-left:0; }
+}
+
 .bar { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin:16px 0 4px; }
 .chip { font-size:11px; font-weight:800; letter-spacing:.07em; border:1px solid; border-radius:6px;
   padding:4px 10px; background:var(--bg-2); }
@@ -56,6 +74,7 @@ header {
 .chip.n { color:var(--accent); border-color:var(--accent); }
 .chip.t { color:var(--accent-2); border-color:var(--accent-2); }
 .chip.f { color:var(--muted); border-color:var(--border-2); }
+.chip.l { color:var(--yellow); border-color:var(--yellow); }
 .hint { color:var(--muted-2); font-size:11.5px; margin-left:auto; }
 
 #viz { margin:6px 0 40px; }
@@ -88,15 +107,22 @@ g.branchg:hover .bline { stroke-opacity:1; }
 <body>
 <header><div class="wrap nav">
   <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./fleetboard --map<span class="cursor"></span></div>
-  <div class="right"><a href="/">board</a>
+  <div class="right">
     <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div></div>
 </div></header>
 
-<div class="wrap">
+<nav class="side">
+  <a href="/"><span class="g">⌗</span>board</a>
+  <a href="/map" class="active"><span class="g">⌁</span>map</a>
+  <a href="/limits"><span class="g">◔</span>limits</a>
+</nav>
+
+<div class="wrap content">
   <div class="bar">
     <span class="chip w">● WORKING</span>
     <span class="chip n">▲ NEEDS YOU</span>
     <span class="chip t">◆ YOUR TURN</span>
+    <span class="chip l">⛔ LIMIT</span>
     <span class="chip f">◇ FREE</span>
     <span class="hint">time runs log-scaled into “now” → · ⌖ click a node to jump to its terminal</span>
   </div>
@@ -113,6 +139,7 @@ const C = { green:"#87b386", accent:"#d97757", accent2:"#e8a87c", cyan:"#7fb3c8"
             border:"#2a2a2a", bg:"#0d0d0d" };
 const STATUS = {
   needs: { color:C.accent,  glyph:"▲", word:"NEEDS YOU" },
+  limit: { color:C.yellow,  glyph:"⛔", word:"LIMIT" },
   turn:  { color:C.accent2, glyph:"◆", word:"YOUR TURN" },
   work:  { color:C.green,   glyph:"●", word:"WORKING" },
   free:  { color:C.muted,   glyph:"◇", word:"FREE" },
@@ -131,6 +158,7 @@ function statusOf(wt) {
   if (!wt) return { key:"free", ...STATUS.free };
   const st = wt.sessions.map(s => s.status);
   if (st.includes("needs_input") || st.includes("blocked")) return { key:"needs", ...STATUS.needs };
+  if (st.includes("limit")) return { key:"limit", ...STATUS.limit };
   if (st.includes("waiting")) return { key:"turn", ...STATUS.turn };
   if (wt.availability !== "free") return { key:"work", ...STATUS.work };
   return { key:"free", ...STATUS.free };
@@ -331,6 +359,7 @@ async function loadTopo() {
   catch (e) { $("sync").classList.add("err"); }
   render();
 }
+fetch("/api/limits").then(() => loadState()).catch(() => {});
 loadTopo(); loadState();
 setInterval(loadState, 10000);
 setInterval(loadTopo, 30000);

@@ -20,6 +20,7 @@ import getpass
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -453,29 +454,15 @@ def scan_sessions(worktrees, procs, now):
     for wt, sessions in by_wt.items():
         sessions.sort(key=lambda s: s["age_s"])
         # A live process proves at most ONE session is really attended.
-        # Pass 1: exact-cwd match, freshest first. Pass 2: procs whose cwd
-        # matched no session (e.g. the session recorded a subdir cwd) vouch
-        # for the freshest still-unmatched sessions in this worktree.
-        wt_proc_cwds = [p["cwd"] for p in procs if p.get("cwd") and
-                        (p["cwd"] == wt or p["cwd"].startswith(wt + "/"))]
-        budget = {}
-        for c in wt_proc_cwds:
-            budget[c] = budget.get(c, 0) + 1
-        slots_left = len(wt_proc_cwds)
+        # N procs under a worktree vouch for its N freshest sessions —
+        # freshness beats cwd matching (recorded cwds drift as agents cd
+        # around, and a stale exact match must not outrank the live session).
+        slots_left = sum(1 for p in procs if p.get("cwd") and
+                         (p["cwd"] == wt or p["cwd"].startswith(wt + "/")))
         for s in sessions:
-            s["_alive"] = False
-            if budget.get(s["cwd"], 0) > 0:
-                budget[s["cwd"]] -= 1
+            alive = slots_left > 0
+            if alive:
                 slots_left -= 1
-                s["_alive"] = True
-        for s in sessions:
-            if slots_left <= 0:
-                break
-            if not s["_alive"]:
-                s["_alive"] = True
-                slots_left -= 1
-        for s in sessions:
-            alive = s.pop("_alive")
             pend = s["pending_tools"]
             if s["age_s"] < CFG["working_s"]:
                 status = "working"
@@ -499,6 +486,27 @@ def collect_state():
     procs = claude_processes()
     sessions = scan_sessions(worktrees, procs, now)
 
+    # An agent parked at the prompt on an exhausted account isn't "your turn" —
+    # it's out of juice. Joined from the cclimits cache (populated lazily by
+    # /api/limits; never fetched on the state path).
+    acct_limits = limits_by_account()
+    limit_re = re.compile(r"out of usage credits|(reached|hit) your .{0,30}limit", re.I)
+    rank = {"needs_input": 0, "limit": 1, "blocked": 2, "working": 3, "waiting": 4, "ended": 5}
+    for ss in sessions.values():
+        for s in ss:
+            if s["status"] not in ("needs_input", "blocked", "waiting"):
+                continue
+            al = acct_limits.get(s["account"])
+            if al and al["exhausted"]:
+                s["status"] = "limit"
+                s["limit"] = {"worst": al["worst"], "resets_in": al["resets_in"]}
+            elif limit_re.search(s["last_assistant"] or ""):
+                # the CLI wrote its limit notice into the transcript —
+                # trust it even when the cclimits cache is cold/stale
+                s["status"] = "limit"
+                s["limit"] = {"worst": None, "resets_in": None}
+        ss.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
+
     cards = []
     for w in worktrees:
         ss = sessions.get(w["path"], [])
@@ -517,7 +525,7 @@ def collect_state():
     for c in cards:
         st = [s["status"] for s in c["sessions"]]
         if c["live_procs"] or "working" in st:
-            if "needs_input" in st or "blocked" in st or "waiting" in st:
+            if any(k in st for k in ("needs_input", "blocked", "waiting", "limit")):
                 c["availability"] = "attention"   # agent parked here, needs you
             else:
                 c["availability"] = "busy"        # agent actively working
@@ -530,13 +538,14 @@ def collect_state():
     def severity(c):
         st = [s["status"] for s in c["sessions"]]
         if "needs_input" in st: return 0
-        if "blocked" in st: return 1
-        if "waiting" in st: return 2
-        if "working" in st: return 3
-        return 4
+        if "limit" in st: return 1
+        if "blocked" in st: return 2
+        if "waiting" in st: return 3
+        if "working" in st: return 4
+        return 5
     cards.sort(key=lambda c: (severity(c), c["name"].lower()))
 
-    counts = {"working": 0, "needs_input": 0, "blocked": 0, "waiting": 0, "ended": 0}
+    counts = {"working": 0, "needs_input": 0, "limit": 0, "blocked": 0, "waiting": 0, "ended": 0}
     for c in cards:
         for s in c["sessions"]:
             counts[s["status"]] += 1
@@ -695,8 +704,12 @@ def demo_state():
                       "Profile the webhook worker under load", None)], [41234]),
         card("orbital-web", "attention", "fix/checkout-race", 3, 1, 0, 5400,
              "fix(cart): serialize checkout mutations", [
-                 sess("waiting", "personal", "fable-5", 2100,
+                 dict(sess("limit", "work", "opus-4-8", 3900,
                       "The checkout button double-fires on slow connections — find and fix the race",
+                      "I'll continue once usage is available again."),
+                      limit={"worst": "Session", "resets_in": 7560}),
+                 sess("waiting", "personal", "fable-5", 2100,
+                      "Audit the cart telemetry events for double-counting",
                       "Fixed and verified — the mutation is now idempotent and the test suite passes. Ready for review.")], [41567]),
         card("kepler-worker", "busy", "perf/batch-inserts", 7, 0, 0, 600,
              "perf(db): batch event inserts, 40x fewer round-trips", [
@@ -710,7 +723,7 @@ def demo_state():
     ]
     return {
         "generated_at": now, "hostname": "starbase", "user": "you",
-        "counts": {"working": 1, "needs_input": 1, "blocked": 0, "waiting": 1, "ended": 1},
+        "counts": {"working": 1, "needs_input": 1, "limit": 1, "blocked": 0, "waiting": 1, "ended": 1},
         "free_worktrees": ["voyager-cli", "lander-docs"],
         "worktrees": cards,
         "other_procs": [{"pid": 40001, "cpu": 1.1, "etime": "15:02", "cwd": "/demo/scratch"}],
@@ -725,6 +738,89 @@ def cached_state():
         _cache["state"] = collect_state()
         _cache["t"] = now
     return _cache["state"]
+
+
+# ------------------------------------------------------------ usage limits
+
+LIMITS_TTL_S = 300.0           # cclimits --json (its own cache) at most this often
+_limits = {"t": 0.0, "data": None}
+
+
+def _cclimits_bin():
+    cmd = CFG.get("cclimits_cmd")
+    if cmd:
+        return cmd
+    found = shutil.which("cclimits")
+    if found:
+        return found
+    fallback = HOME / ".local" / "bin" / "cclimits"
+    return str(fallback) if fallback.exists() else None
+
+
+def cached_limits(refresh=False):
+    """Per-account usage limits via cclimits (github.com/acrdlph/cclimits).
+    Lazy + cached; a network refetch happens only on explicit refresh."""
+    if DEMO:
+        return demo_limits()
+    now = time.time()
+    if not refresh and _limits["data"] is not None and now - _limits["t"] < LIMITS_TTL_S:
+        return _limits["data"]
+    binp = _cclimits_bin()
+    if not binp:
+        return {"available": False, "error": "cclimits not found — install github.com/acrdlph/cclimits"}
+    cmd = [binp, "--json"] + (["--refresh"] if refresh else [])
+    rc, out = run(cmd, timeout=90 if refresh else 30)
+    if rc != 0 or not out:
+        return _limits["data"] or {"available": False, "error": "cclimits failed (see terminal)"}
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return _limits["data"] or {"available": False, "error": "cclimits returned non-JSON"}
+    data["available"] = True
+    data["fetched_at"] = now
+    _limits["data"], _limits["t"] = data, now
+    return data
+
+
+def limits_by_account():
+    """account label -> {exhausted, worst, resets_in, headroom} (None if unknown)."""
+    data = _limits["data"] if not DEMO else demo_limits()
+    if not data or not data.get("available"):
+        return {}
+    out = {}
+    for acc in data.get("accounts", []):
+        if not acc.get("ok"):
+            continue
+        label = account_label(Path(acc["config_dir"]))
+        exhausted = [l for l in acc.get("limits", []) if l.get("exhausted_now")]
+        worst = min(exhausted, key=lambda l: l.get("resets_in_seconds") or 0) if exhausted else None
+        out[label] = {
+            "headroom": acc.get("headroom_percent"),
+            "exhausted": bool(exhausted),
+            "worst": worst["label"] if worst else None,
+            "resets_in": worst.get("resets_in_seconds") if worst else None,
+        }
+    return out
+
+
+def demo_limits():
+    now = time.time()
+    def lim(label, group, pct, ex, resets_h, scoped=False):
+        return {"label": label, "group": group, "percent": pct,
+                "remaining_percent": 100 - pct, "model_scoped": scoped,
+                "exhausted_now": ex, "resets_at": None,
+                "resets_in_seconds": resets_h * 3600}
+    return {"available": True, "fetched_at": now, "generated_at": None, "accounts": [
+        {"slug": "default", "email": None, "plan": "max", "config_dir": "~/.claude",
+         "ok": True, "error": None, "headroom_percent": 62.0, "limits": [
+            lim("Session", "session", 21, False, 3.2), lim("Weekly", "weekly", 38, False, 96)]},
+        {"slug": "work", "email": None, "plan": "max", "config_dir": "~/.claude-work",
+         "ok": True, "error": None, "headroom_percent": 0.0, "limits": [
+            lim("Session", "session", 100, True, 2.1), lim("Weekly", "weekly", 91, False, 30)]},
+        {"slug": "spare", "email": None, "plan": "pro", "config_dir": "~/.claude-spare",
+         "ok": True, "error": None, "headroom_percent": 88.0, "limits": [
+            lim("Session", "session", 4, False, 4.8), lim("Weekly", "weekly", 12, False, 120)]},
+    ]}
 
 
 # --------------------------------------------------------------- focus jump
@@ -814,11 +910,17 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/topology"):
             body = json.dumps(cached_topology()).encode()
             ctype = "application/json"
+        elif self.path.startswith("/api/limits"):
+            body = json.dumps(cached_limits(refresh="refresh=1" in self.path)).encode()
+            ctype = "application/json"
         elif self.path == "/" or self.path.startswith("/index"):
             body = (HERE / "index.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         elif self.path.startswith("/map"):
             body = (HERE / "map.html").read_bytes()
+            ctype = "text/html; charset=utf-8"
+        elif self.path.startswith("/limits"):
+            body = (HERE / "limits.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         else:
             self.send_error(404)
