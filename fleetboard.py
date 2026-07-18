@@ -499,8 +499,13 @@ def scan_sessions(worktrees, procs, now):
         # N procs under a worktree vouch for its N freshest sessions —
         # freshness beats cwd matching (recorded cwds drift as agents cd
         # around, and a stale exact match must not outrank the live session).
-        slots_left = sum(1 for p in procs if p.get("cwd") and
-                         (p["cwd"] == wt or p["cwd"].startswith(wt + "/")))
+        wt_procs = [p for p in procs if p.get("cwd") and
+                    (p["cwd"] == wt or p["cwd"].startswith(wt + "/"))]
+        slots_left = len(wt_procs)
+        # With --dangerously-skip-permissions there are no approval prompts:
+        # an unresolved tool call means a long-running tool, not "blocked".
+        skip_perms = bool(wt_procs) and all(
+            "--dangerously-skip-permissions" in p["cmd"] for p in wt_procs)
         for s in sessions:
             alive = slots_left > 0
             if alive:
@@ -512,6 +517,9 @@ def scan_sessions(worktrees, procs, now):
                 status = "needs_input"
             elif alive and s["pending_workflows"]:
                 status = "working"   # delegated — waiting on its own workflows
+            elif alive and pend and skip_perms:
+                status = "working"   # long tool run, nothing to approve
+                s["tool_running"] = True
             elif alive and pend:
                 status = "blocked"
             elif alive:
@@ -541,6 +549,9 @@ def collect_state():
             if s["status"] not in ("needs_input", "blocked", "waiting"):
                 continue
             al = acct_limits.get(s["account"])
+            if al and al["exhausted"] and al["worst_scoped"] and \
+                    (al["worst"] or "").lower() not in (s["model"] or "").lower():
+                al = None  # limit is model-scoped and this session runs another model
             if al and al["exhausted"]:
                 s["status"] = "limit"
                 s["limit"] = {"worst": al["worst"], "group": al["group"],
@@ -589,10 +600,12 @@ def collect_state():
     for c in cards:
         st = _attention_statuses(c["sessions"])
         if c["live_procs"] or "working" in st:
-            if any(k in st for k in ("needs_input", "blocked", "waiting", "limit")):
-                c["availability"] = "attention"   # agent parked here, needs you
+            if any(k in st for k in ("needs_input", "blocked", "limit")):
+                c["availability"] = "attention"   # hard blocker — needs you
+            elif "waiting" in st and "working" not in st:
+                c["availability"] = "attention"   # everyone parked — needs direction
             else:
-                c["availability"] = "busy"        # agent actively working
+                c["availability"] = "busy"        # something is actively working
         else:
             c["availability"] = "free"            # safe to point a new agent here
 
@@ -604,7 +617,7 @@ def collect_state():
         if "needs_input" in st: return 0
         if "limit" in st: return 1
         if "blocked" in st: return 2
-        if "waiting" in st: return 3
+        if "waiting" in st and "working" not in st: return 3
         if "working" in st: return 4
         return 5
     cards.sort(key=lambda c: (severity(c), c["name"].lower()))
@@ -866,6 +879,7 @@ def limits_by_account():
             "headroom": acc.get("headroom_percent"),
             "exhausted": bool(exhausted),
             "worst": worst["label"] if worst else None,
+            "worst_scoped": bool(worst.get("model_scoped")) if worst else False,
             "group": worst.get("group") if worst else None,
             "resets_in": resets_in,
             "resets_at": fetched + resets_in if resets_in else None,
