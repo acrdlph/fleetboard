@@ -205,9 +205,17 @@ function render() {
     const branches = g.branches.filter(b => b.ahead > 0).sort((a,b) => a.fork_ts - b.fork_ts);
     const riders   = g.branches.filter(b => b.ahead === 0).sort((a,b) => a.tip_ts - b.tip_ts);
     const trunkY = y + TOP_PAD + branches.length * LANE_H + 26;
-    const riderRows = Math.min(3, riders.length);
-    const gh = TOP_PAD + branches.length * LANE_H + 26 + (riders.length ? 30 + riderRows * 32 + 16 : 40);
-    groupsG.push({ g, branches, riders, top:y, trunkY, h:gh });
+    // x-aware label stagger: each rider takes the first row with >=180px clearance
+    const rowsX = [];
+    const riderPlace = riders.map(b => {
+      const rx = x(b.tip_ts);
+      let row = rowsX.findIndex(lx => rx - lx >= 180);
+      if (row === -1) row = rowsX.length;
+      rowsX[row] = rx;
+      return row;
+    });
+    const gh = TOP_PAD + branches.length * LANE_H + 26 + (riders.length ? 30 + rowsX.length * 32 + 16 : 40);
+    groupsG.push({ g, branches, riders, riderPlace, top:y, trunkY, h:gh });
     y += gh;
   }
   const H = y + AXIS_H;
@@ -272,7 +280,7 @@ function render() {
       const key = `b:${esc(b.worktree)}`; lookup[key] = b;
       const st = statusOf(byName[b.worktree]);
       const rx = x(b.tip_ts);
-      const row = i % 3;
+      const row = G.riderPlace[i];
       const lyy = trunkY + 28 + row * 32;
       let inner = `<line x1="${rx}" y1="${trunkY+6}" x2="${rx}" y2="${lyy-6}" stroke="${C.border}" stroke-width="1"/>`;
       if (st.key === "work")
