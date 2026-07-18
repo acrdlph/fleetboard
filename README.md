@@ -7,7 +7,7 @@ several accounts. Which agent is working? Which one is stuck waiting for an
 answer? Which worktree is free for the next feature? fleetboard puts it on one
 board.
 
-![fleetboard](docs/screenshot.png)
+![fleetboard](docs/social-preview.png)
 
 It's a **read-only observer**: it never launches, wraps, or touches your
 sessions. Point it at your existing chaos and it reports. Zero dependencies —
@@ -55,6 +55,10 @@ in one table — see its README for how to set up multiple accounts via
 The page auto-refreshes every 5 s (collectors are cached at 4 s so the browser
 can't hammer git/lsof), flags the tab title with `(N!)` when agents need you,
 and can optionally ring a terminal bell.
+
+The board itself (`--demo` data):
+
+![the fleetboard dashboard](docs/screenshot.png)
 
 ## Usage
 
