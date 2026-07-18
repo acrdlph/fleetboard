@@ -1,0 +1,5 @@
+fleetboard.config.json
+__pycache__/
+*.log
+nohup.out
+.DS_Store

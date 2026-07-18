@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fleetboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2224%22 fill=%22%230d0d0d%22/><text x=%2250%22 y=%2272%22 font-size=%2260%22 text-anchor=%22middle%22 fill=%22%23d97757%22 font-family=%22monospace%22>⌁</text></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --bg:#0d0d0d; --bg-2:#111111; --surface:#161616; --surface-2:#1c1c1c;
+  --border:#2a2a2a; --border-2:#3a3a3a;
+  --fg:#e8e6e3; --muted:#8a8784; --muted-2:#6a6764;
+  --accent:#d97757; --accent-2:#e8a87c; --green:#87b386; --cyan:#7fb3c8; --yellow:#d4b06a;
+  --accent-glow:rgba(217,119,87,.25); --green-glow:rgba(135,179,134,.18);
+  --mono:"JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --ease:cubic-bezier(0.22,1,0.36,1);
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html { background:var(--bg); }
+body {
+  font-family:var(--mono); font-size:13.5px; color:var(--fg);
+  background:
+    radial-gradient(1200px 500px at 70% -10%, rgba(217,119,87,.05), transparent 60%),
+    var(--bg);
+  min-height:100vh; padding-bottom:60px;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap { max-width:1500px; margin-inline:auto; padding-inline:22px; }
+
+/* ---- header ---- */
+header {
+  position:sticky; top:0; z-index:10;
+  background:color-mix(in oklab, var(--bg) 86%, transparent);
+  backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--border);
+}
+.nav { display:flex; align-items:center; justify-content:space-between; height:52px; gap:16px; }
+.brand { font-weight:700; white-space:nowrap; overflow:hidden; }
+.brand .prompt { color:var(--accent); }
+.brand .path { color:var(--cyan); }
+.brand .cmd { color:var(--fg); }
+.brand .cursor { display:inline-block; width:8px; height:15px; background:var(--accent);
+  vertical-align:-2px; margin-left:2px; animation:blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity:0; } }
+.sync { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:12px; white-space:nowrap; }
+.sync .dot { width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 8px var(--green-glow); }
+.sync.err .dot { background:var(--accent); }
+
+/* ---- stat tiles ---- */
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; margin:18px 0; }
+.tile {
+  background:var(--surface); border:1px solid var(--border); border-radius:10px;
+  padding:12px 14px;
+}
+.tile .k { font-size:11px; letter-spacing:.08em; color:var(--muted); text-transform:uppercase; }
+.tile .v { font-size:26px; font-weight:800; margin-top:2px; }
+.tile .sub { font-size:11.5px; color:var(--muted); margin-top:2px; min-height:15px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tile.attn { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent-glow), 0 0 18px var(--accent-glow); }
+.tile.attn .v { color:var(--accent); }
+.tile.ok .v { color:var(--green); }
+.tile.free .v { color:var(--cyan); }
+
+/* ---- worktree cards ---- */
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(430px,1fr)); gap:12px; }
+@media (max-width:520px){ .grid { grid-template-columns:1fr; } }
+.card {
+  background:var(--surface); border:1px solid var(--border); border-radius:12px;
+  overflow:hidden; transition:border-color .25s var(--ease);
+}
+.card.attention { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent-glow); }
+.card-head {
+  display:flex; align-items:center; gap:10px; padding:10px 14px;
+  background:var(--surface-2); border-bottom:1px solid var(--border);
+}
+.card-head .name { font-weight:800; font-size:15px; }
+.badge {
+  font-size:10px; font-weight:800; letter-spacing:.1em; padding:3px 8px;
+  border-radius:5px; border:1px solid; white-space:nowrap;
+}
+.badge.free  { color:var(--green);  border-color:var(--green);  background:var(--green-glow); }
+.badge.busy  { color:var(--cyan);   border-color:var(--cyan);   background:rgba(127,179,200,.12); }
+.badge.attention { color:var(--accent); border-color:var(--accent); background:var(--accent-glow);
+  animation:pulse 1.6s var(--ease) infinite; }
+@keyframes pulse { 50% { box-shadow:0 0 10px var(--accent-glow); } }
+.card-head .procs { margin-left:auto; color:var(--muted); font-size:11.5px; white-space:nowrap; }
+
+.gitline { padding:9px 14px 0; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:baseline; font-size:12.5px; }
+.gitline .branch { color:var(--cyan); font-weight:600; }
+.gitline .branch::before { content:" "; color:var(--muted-2); }
+.gitline .delta { color:var(--yellow); }
+.gitline .sync-count { color:var(--muted); }
+.commit { padding:4px 14px 0; color:var(--muted); font-size:12px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.commit .hash { color:var(--accent-2); }
+
+.sessions { padding:10px 8px 10px; display:flex; flex-direction:column; gap:6px; }
+.sess {
+  border:1px solid var(--border); border-left-width:3px; border-radius:8px;
+  padding:8px 10px; background:var(--bg-2); font-size:12px;
+}
+.sess .row1 { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:baseline; }
+.st { font-weight:800; font-size:10.5px; letter-spacing:.07em; white-space:nowrap; }
+.sess.working      { border-left-color:var(--green); }
+.sess.needs_input,
+.sess.blocked      { border-left-color:var(--accent); }
+.sess.waiting      { border-left-color:var(--accent-2); }
+.sess.ended        { border-left-color:var(--border-2); opacity:.55; }
+.st.working  { color:var(--green); }
+.st.working .g { animation:blink 1.2s steps(1) infinite; }
+.st.needs_input { color:var(--accent); }
+.st.blocked  { color:var(--yellow); }
+.st.waiting  { color:var(--accent-2); }
+.st.ended    { color:var(--muted-2); }
+.acct { color:var(--cyan); font-size:11px; }
+.meta { color:var(--muted-2); font-size:11px; }
+.subdir { color:var(--yellow); font-size:11px; }
+.topic { color:var(--fg); margin-top:4px; font-size:11.5px;
+  display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
+.said { color:var(--muted); margin-top:3px; font-size:11.5px; line-height:1.45;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.said::before { content:"⏎ "; color:var(--muted-2); }
+.pending { color:var(--yellow); font-size:11px; margin-top:3px; }
+.none { color:var(--muted-2); font-size:12px; padding:2px 6px 6px; }
+
+/* ---- footer ---- */
+.other { margin-top:20px; color:var(--muted); font-size:12px; }
+.other h3 { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted-2); margin-bottom:6px; }
+.controls { display:flex; gap:18px; margin:18px 0 6px; color:var(--muted); font-size:12px; flex-wrap:wrap; }
+.controls label { cursor:pointer; user-select:none; }
+.controls input { accent-color:var(--accent); margin-right:5px; vertical-align:-1px; }
+</style>
+</head>
+<body>
+<header><div class="wrap nav">
+  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> <span class="cmd">./fleetboard --watch</span><span class="cursor"></span></div>
+  <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div>
+</div></header>
+
+<div class="wrap">
+  <div class="tiles" id="tiles"></div>
+  <div class="grid" id="grid"></div>
+  <div class="controls">
+    <label><input type="checkbox" id="showEnded"> show ended sessions</label>
+    <label><input type="checkbox" id="bell"> ␇ bell when an agent needs you</label>
+  </div>
+  <div class="other" id="other"></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const STATUS = {
+  working:     { glyph:"●", label:"WORKING" },
+  needs_input: { glyph:"▲", label:"NEEDS ANSWER" },
+  blocked:     { glyph:"■", label:"BLOCKED · pending tool" },
+  waiting:     { glyph:"◆", label:"YOUR TURN · idle @ prompt" },
+  ended:       { glyph:"○", label:"ENDED" },
+};
+const AVAIL = { free:"FREE", busy:"BUSY", attention:"NEEDS YOU" };
+
+function rel(s) {
+  if (s == null) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m";
+  if (s < 86400) return Math.floor(s/3600) + "h" + Math.floor((s%3600)/60) + "m";
+  return Math.floor(s/86400) + "d";
+}
+
+let lastAttn = null;
+function maybeBell(attn) {
+  if ($("bell").checked && lastAttn != null && attn > lastAttn) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "square"; o.frequency.value = 880;
+      g.gain.setValueAtTime(.06, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(.0001, ctx.currentTime + .35);
+      o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + .36);
+    } catch (e) {}
+  }
+  lastAttn = attn;
+}
+
+function render(st) {
+  const now = st.generated_at;
+  $("brandUser").textContent = `${st.user || "you"}@fleet`;
+  const c = st.counts;
+  const attn = c.needs_input + c.blocked + c.waiting;
+  maybeBell(attn);
+  document.title = attn > 0 ? `(${attn}!) fleetboard` : "fleetboard";
+
+  const freeNames = st.free_worktrees || [];
+  $("tiles").innerHTML = `
+    <div class="tile ok"><div class="k">● working</div><div class="v">${c.working}</div><div class="sub">agents mid-turn</div></div>
+    <div class="tile ${attn ? "attn" : ""}"><div class="k">▲ need you</div><div class="v">${attn}</div>
+      <div class="sub">${c.needs_input} question · ${c.blocked} blocked · ${c.waiting} idle</div></div>
+    <div class="tile free"><div class="k">◇ free worktrees</div><div class="v">${freeNames.length}</div>
+      <div class="sub" title="${esc(freeNames.join(", "))}">${esc(freeNames.join(", ") || "none — everything busy")}</div></div>
+    <div class="tile"><div class="k">⌁ live agents</div><div class="v">${st.worktrees.reduce((n,w)=>n+w.live_procs.length,0) + st.other_procs.length}</div>
+      <div class="sub">claude processes on ${esc(st.hostname)}</div></div>`;
+
+  $("grid").innerHTML = st.worktrees.map(w => {
+    const g = w.git || {};
+    const sync = (g.ahead != null) ? `<span class="sync-count">↑${g.ahead} ↓${g.behind}</span>` : "";
+    const dirty = g.dirty ? `<span class="delta">Δ${g.dirty} uncommitted</span>` : "";
+    const commit = g.commit ? `<span class="hash">${esc(g.commit.hash)}</span> · ${rel(Math.max(0, Math.floor(now - g.commit.ts)))} ago · ${esc(g.commit.subject)}` : "no commits";
+    const showEnded = $("showEnded").checked;
+    const sess = w.sessions.filter(s => showEnded || s.status !== "ended");
+    const rows = sess.map(s => {
+      const stt = STATUS[s.status];
+      const pend = (s.status !== "working" && s.pending_tools.length)
+        ? `<div class="pending">⧗ waiting on: ${esc(s.pending_tools.join(", "))}</div>` : "";
+      return `<div class="sess ${s.status}">
+        <div class="row1">
+          <span class="st ${s.status}"><span class="g">${stt.glyph}</span> ${stt.label}</span>
+          <span class="acct">[${esc(s.account)}]</span>
+          <span class="meta">${esc(s.model || "?")}</span>
+          <span class="meta">${rel(s.age_s)} ago</span>
+          ${s.subdir ? `<span class="subdir">./${esc(s.subdir)}</span>` : ""}
+          ${s.branch && s.branch !== g.branch ? `<span class="meta"> ${esc(s.branch)}</span>` : ""}
+        </div>
+        ${s.topic ? `<div class="topic">${esc(s.topic)}</div>` : ""}
+        ${s.last_assistant ? `<div class="said">${esc(s.last_assistant)}</div>` : ""}
+        ${pend}
+      </div>`;
+    }).join("");
+    return `<div class="card ${w.availability === "attention" ? "attention" : ""}">
+      <div class="card-head">
+        <span class="badge ${w.availability}">${AVAIL[w.availability]}</span>
+        <span class="name">${esc(w.name)}</span>
+        <span class="procs">${w.live_procs.length ? w.live_procs.length + " proc · " + w.live_procs.map(p=>p.pid).join(",") : "no live proc"}</span>
+      </div>
+      <div class="gitline"><span class="branch">${esc(g.branch || "?")}</span>${dirty}${sync}</div>
+      <div class="commit" title="${esc(g.commit ? g.commit.subject : "")}">${commit}</div>
+      <div class="sessions">${rows || `<div class="none">${w.sessions.length ? w.sessions.length + " ended session(s) hidden" : "no recent sessions"}</div>`}</div>
+    </div>`;
+  }).join("");
+
+  $("other").innerHTML = st.other_procs.length
+    ? `<h3>other live agents (outside watched worktrees)</h3>` +
+      st.other_procs.map(p => `<div>⌁ pid ${p.pid} · ${p.cpu.toFixed(1)}% cpu · up ${esc(p.etime)} · ${esc(p.cwd || "?")}</div>`).join("")
+    : "";
+}
+
+let lastState = null;
+async function tick() {
+  try {
+    const r = await fetch("/api/state");
+    lastState = await r.json();
+    render(lastState);
+    $("sync").classList.remove("err");
+    $("syncText").textContent = "sync " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("sync").classList.add("err");
+    $("syncText").textContent = "reconnecting…";
+  }
+}
+$("showEnded").addEventListener("change", () => { localStorage.fbEnded = $("showEnded").checked ? "1" : ""; lastState && render(lastState); });
+$("bell").addEventListener("change", () => { localStorage.fbBell = $("bell").checked ? "1" : ""; });
+$("showEnded").checked = localStorage.fbEnded === "1";
+$("bell").checked = localStorage.fbBell === "1";
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>
