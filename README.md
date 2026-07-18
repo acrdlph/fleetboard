@@ -102,6 +102,14 @@ refetch". Nothing polls the Anthropic API on a timer.
   `claude -p --model haiku` router picks them *and writes the kickoff brief*),
   then launches a tmux-hosted agent: `tmux -L fleet attach -t mission-…` from
   any terminal, and it appears on the board like any other agent.
+  **Model & effort** are selectable (or "auto": the router matches them to the
+  mission — ultracode for hard features, xhigh for research, high for simple
+  tasks — and avoids models whose model-scoped limit is exhausted on the
+  chosen account). Model is a launch flag; effort is typed as `/effort <level>`
+  into the new session and **verified** via capture-pane (⚠ shown if
+  unconfirmed). Caveat: the CLI saves non-ultracode effort levels as that
+  account's default for new sessions — dispatching with an explicit effort
+  updates that account's default too.
 
 ### Handoffs across accounts
 

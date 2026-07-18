@@ -534,6 +534,15 @@ function openMission() {
       <select id="mAcct"><option value="">account: auto</option>
         ${accts.map(a => `<option value="${esc(acctLabel(a.config_dir))}">${esc(acctLabel(a.config_dir))} · ${Math.round(a.headroom_percent ?? 0)}% left</option>`).join("")}</select>
     </div>
+    <div class="row">
+      <select id="mModel"><option value="">model: auto</option>
+        <option value="fable">fable</option><option value="opus">opus</option>
+        <option value="sonnet">sonnet</option><option value="haiku">haiku</option></select>
+      <select id="mEffort"><option value="">effort: auto</option>
+        <option value="high">high — simple task</option>
+        <option value="xhigh">xhigh — research / medium</option>
+        <option value="ultracode">ultracode — hard feature</option></select>
+    </div>
     <div class="row"><label class="dnote" style="cursor:pointer">
       <input type="checkbox" id="mRouter" checked> route &amp; brief with claude (haiku, one call)</label>
       <button class="send" style="margin-left:auto" onclick="launchMission()">launch</button></div>`;
@@ -547,10 +556,13 @@ async function launchMission() {
     const r = await fetch("/api/dispatch", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mission, worktree: $("mWt").value, account: $("mAcct").value,
+                             model: $("mModel").value, effort: $("mEffort").value,
                              router: $("mRouter").checked }) });
     const d = await r.json();
     $("dbody").innerHTML = d.ok
-      ? `<div class="dresult">✓ ${esc(d.message)}<br><br>kickoff brief:<br>${esc(d.kickoff)}<br><br>
+      ? `<div class="dresult">✓ ${esc(d.message)}<br>
+         ${d.effort && d.effort_confirmed === false ? `<b style="color:var(--yellow)">⚠ /effort ${esc(d.effort)} not confirmed — check the session</b><br>` : ""}<br>
+         kickoff brief:<br>${esc(d.kickoff)}<br><br>
          attach anytime: <code>${esc(d.attach)}</code><br>
          the agent appears on the board once its transcript starts (~30s).</div>`
       : `<div class="dresult">✗ ${esc(d.message)}</div>`;

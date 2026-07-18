@@ -29,7 +29,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1091,6 +1090,7 @@ FLEET_SOCK = "fleet"
 
 def _pick_defaults(mission):
     state = cached_state()
+    cached_limits()  # ensure the account picker isn't working from a cold cache
     limits = limits_by_account()
     free = [w for w in state["worktrees"] if w["availability"] == "free"]
     free.sort(key=lambda w: (w["git"]["dirty"] or 0))
@@ -1102,14 +1102,20 @@ def _pick_defaults(mission):
 
 
 def _route_with_claude(mission):
-    """One-shot routing call: haiku picks worktree/account and writes the brief."""
+    """One-shot routing call: haiku picks worktree/account/model/effort and
+    writes the kickoff brief."""
     state = cached_state()
     limits = limits_by_account()
+    ex_map = {}
+    for acc in (_limits["data"] or {}).get("accounts", []):
+        label = account_label(Path(acc["config_dir"]))
+        ex_map[label] = [l["label"] for l in acc.get("limits", []) if l.get("exhausted_now")]
     fleet = {
         "worktrees": [{"name": w["name"], "branch": w["git"]["branch"],
                        "dirty": w["git"]["dirty"], "availability": w["availability"]}
                       for w in state["worktrees"]],
-        "accounts": [{"label": a, "headroom_pct": d["headroom"], "exhausted": d["exhausted"]}
+        "accounts": [{"label": a, "headroom_pct": d["headroom"], "exhausted": d["exhausted"],
+                      "exhausted_limits": ex_map.get(a, [])}
                      for a, d in limits.items()],
     }
     router_home = None
@@ -1121,12 +1127,18 @@ def _route_with_claude(mission):
         "You route work across git worktrees and Claude accounts. Fleet state:\n"
         + json.dumps(fleet) + "\n\nMission from the user:\n" + mission +
         "\n\nPick a FREE worktree (prefer clean ones and a thematic fit with its "
-        "branch) and a non-exhausted account with the most headroom. Write a "
-        "kickoff brief for the agent: restate the mission precisely, tell it to "
-        "check out an appropriately named new branch from latest origin/main "
-        "unless the worktree's current branch is clearly the right home, and to "
+        "branch) and a non-exhausted account with the most headroom. Also pick "
+        "the model (fable > opus > sonnet by capability; NEVER a model listed "
+        "in that account's exhausted_limits — e.g. if 'Fable' is exhausted "
+        "there, pick opus or another account) and the reasoning effort: "
+        "'ultracode' for genuinely hard multi-step features, 'xhigh' for "
+        "research or medium tasks, 'high' for simple tasks. Write a kickoff "
+        "brief for the agent: restate the mission precisely, tell it to check "
+        "out an appropriately named new branch from latest origin/main unless "
+        "the worktree's current branch is clearly the right home, and to "
         "commit as it goes. Reply with ONLY this JSON, no fences:\n"
-        '{"worktree": "...", "account": "...", "kickoff": "..."}')
+        '{"worktree": "...", "account": "...", "model": "fable|opus|sonnet|haiku", '
+        '"effort": "high|xhigh|ultracode", "kickoff": "..."}')
     env = dict(os.environ)
     if router_home:
         env["CLAUDE_CONFIG_DIR"] = str(router_home)
@@ -1142,7 +1154,8 @@ def _route_with_claude(mission):
     return None
 
 
-def dispatch(mission, worktree=None, account=None, use_router=False):
+def dispatch(mission, worktree=None, account=None, use_router=False,
+             model=None, effort=None):
     if DEMO:
         return {"ok": False, "message": "demo mode — dispatch disabled"}
     mission = (mission or "").strip()
@@ -1150,11 +1163,13 @@ def dispatch(mission, worktree=None, account=None, use_router=False):
         return {"ok": False, "message": "empty mission"}
     kickoff = mission
     routed = None
-    if use_router and not (worktree and account):
+    if use_router and not (worktree and account and model and effort):
         routed = _route_with_claude(mission)
     if routed:
         worktree = worktree or routed["worktree"]
         account = account or routed["account"]
+        model = model or routed.get("model")
+        effort = effort or routed.get("effort")
         kickoff = routed["kickoff"]
     if not (worktree and account):
         dw, da = _pick_defaults(mission)
@@ -1172,22 +1187,40 @@ def dispatch(mission, worktree=None, account=None, use_router=False):
 
     name = "mission-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower() \
            + time.strftime("-%H%M%S")
+    model_flag = f" --model {shlex.quote(model)}" if model else ""
     shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
-                 f"exec claude --dangerously-skip-permissions")
+                 f"exec claude --dangerously-skip-permissions{model_flag}")
     rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
                    "-c", wt["path"], shell_cmd])
     if rc != 0:
         return {"ok": False, "message": f"tmux failed: {out or 'is tmux installed?'}"}
     brief = re.sub(r"\s*\n\s*", " ", kickoff).strip()
 
-    def _feed():
-        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "-l", brief])
-        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
-    threading.Timer(6.0, _feed).start()
+    def keys(*args):
+        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name] + list(args))
+
+    time.sleep(6)  # let the CLI boot before typing
+    effort_confirmed = None
+    if effort:
+        keys("-l", f"/effort {effort}")
+        keys("Enter")
+        time.sleep(3)
+        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+        effort_confirmed = "set effort level" in pane.lower()
+        if not effort_confirmed:
+            keys("Escape")  # don't leave a stray picker blocking the brief
+            time.sleep(1)
+    keys("-l", brief)
+    keys("Enter")
+    effort_note = ""
+    if effort:
+        effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")
     return {"ok": True,
             "message": f"launched {name} in {worktree} on [{account}]"
+                       + (f" · {model}" if model else "") + effort_note
                        + (" (routed by claude)" if routed else " (rule-picked)"),
             "session": name, "worktree": worktree, "account": account,
+            "model": model, "effort": effort, "effort_confirmed": effort_confirmed,
             "kickoff": kickoff,
             "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"}
 
@@ -1246,7 +1279,8 @@ class Handler(BaseHTTPRequestHandler):
             result = send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
         elif self.path.startswith("/api/dispatch"):
             result = dispatch(payload.get("mission"), payload.get("worktree") or None,
-                              payload.get("account") or None, bool(payload.get("router")))
+                              payload.get("account") or None, bool(payload.get("router")),
+                              payload.get("model") or None, payload.get("effort") or None)
         else:
             self.send_error(404)
             return
