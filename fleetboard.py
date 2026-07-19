@@ -6,12 +6,15 @@ setups included), and live `claude` processes; serves three views on
 http://127.0.0.1:4242 — the board (who's working / who needs you / which
 worktree is free), the map (real git topology of every branch), and limits
 (per-account usage via cclimits) — plus a click-only control plane: chat with
-any agent, resume a limit-stuck one when its session limit resets, and
-dispatch new tmux-hosted agents into free worktrees.
+any agent, resume a limit-stuck one when its session limit resets, dispatch
+new tmux-hosted agents into free worktrees, and finish a done mission (an
+agent lands the branch; the worktree goes free).
 
-Watching is read-only and touches nothing. Acting (chat/resume/dispatch)
-happens only on an explicit request, and dispatch spends account usage.
-Zero dependencies — python3 stdlib only.
+Watching is read-only and touches nothing. Acting (chat/resume/dispatch/
+finish) happens only on an explicit request — dispatch spends account usage,
+and finish hands a closeout brief to an agent that merges and pushes; the
+board never runs git write commands itself. Zero dependencies — python3
+stdlib only.
 
     python3 fleetboard.py --root ~/code
     python3 fleetboard.py --demo          # fictional data, for screenshots

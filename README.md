@@ -14,10 +14,11 @@ one silently hit a usage limit an hour ago? Which worktree is free for the
 next feature — and on which account? fleetboard answers all of it on one dark
 board, and (when you click) acts on it too.
 
-It's an agent **harness** built as a **read-only observer with an opt-in
-control plane**: watching never touches your sessions; acting — chat, resume,
-dispatch, ✓ finish — only ever happens on an explicit click, and always by
-talking to a terminal. Zero dependencies — one python3 stdlib file.
+It's an agent **harness** with a hard line down the middle: **watching only
+reads** — transcripts, processes, git — and never touches your sessions;
+**acting** — chat, resume, dispatch, ✓ finish — happens only on an explicit
+click, and always by talking to a terminal, never behind your back. Zero
+dependencies — one python3 stdlib file.
 
 ```bash
 git clone https://github.com/acrdlph/fleetboard && cd fleetboard
