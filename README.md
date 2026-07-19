@@ -14,9 +14,7 @@ one silently hit a usage limit an hour ago? Which worktree is free for the
 next feature — and on which account? orchestr answers all of it on one dark
 board, and (when you click) acts on it too.
 
-It's an agent **harness** with a hard line down the middle: **watching only
-reads**, **acting** only ever happens on a click. Zero dependencies — one
-python3 stdlib file.
+It's an agent **harness** with zero dependencies — one python3 stdlib file.
 
 ```bash
 git clone https://github.com/acrdlph/orchestr && cd orchestr
