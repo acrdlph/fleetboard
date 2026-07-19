@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1139,9 +1140,9 @@ def _pick_defaults(mission):
     return wt, acct
 
 
-def _route_with_claude(mission):
-    """One-shot routing call: haiku picks worktree/account/model/effort and
-    writes the kickoff brief."""
+def _route_with_claude(mission, on_text=None):
+    """One-shot routing call: haiku picks worktree/account/model/effort/branch.
+    If on_text is given, streams haiku's output through it as it generates."""
     state = cached_state()
     limits = limits_by_account()
     ex_map = {}
@@ -1181,28 +1182,103 @@ def _route_with_claude(mission):
     env = dict(os.environ)
     if router_home:
         env["CLAUDE_CONFIG_DIR"] = str(router_home)
+    # Non-streaming path (kept for callers without a progress sink).
+    if on_text is None:
+        try:
+            p = subprocess.run(["claude", "-p", "--model", "haiku", prompt],
+                               capture_output=True, text=True, timeout=120, env=env)
+            d = json.loads(re.search(r"\{.*\}", p.stdout, re.S).group(0))
+            if d.get("worktree") and d.get("account"):
+                return d
+        except Exception:
+            pass
+        return None
+    # Streaming path: forward haiku's text as it lands (for display), but parse
+    # the authoritative final text from the 'result' event.
+    streamed, result_text = [], None
     try:
-        p = subprocess.run(["claude", "-p", "--model", "haiku", prompt],
-                           capture_output=True, text=True, timeout=120, env=env)
-        m = re.search(r"\{.*\}", p.stdout, re.S)
-        d = json.loads(m.group(0))
+        proc = subprocess.Popen(
+            ["claude", "-p", "--model", "haiku",
+             "--output-format", "stream-json", "--verbose", prompt],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env)
+        for line in proc.stdout:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("type") == "assistant":
+                for b in (e.get("message") or {}).get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                        streamed.append(b["text"]); on_text(b["text"])
+            elif e.get("type") == "result" and e.get("result"):
+                result_text = e["result"]
+        proc.wait(timeout=120)
+        text = result_text if result_text else "".join(streamed)
+        d = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
         if d.get("worktree") and d.get("account"):
             return d
     except Exception:
-        pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
     return None
 
 
-def dispatch(mission, worktree=None, account=None, use_router=False,
-             model=None, effort=None):
+_jobs = {}                 # job_id -> {progress, done, result}
+_jobs_lock = threading.Lock()
+_job_seq = [0]
+
+
+def _log(job, line):
+    with _jobs_lock:
+        job["progress"].append(line)
+
+
+def start_dispatch(mission, worktree=None, account=None, use_router=False,
+                   model=None, effort=None):
+    """Kick a dispatch off in the background; return a job id to poll."""
+    _job_seq[0] += 1
+    job_id = "job-" + time.strftime("%H%M%S") + f"-{_job_seq[0]}"
+    job = {"progress": [], "done": False, "result": None}
+    with _jobs_lock:
+        _jobs[job_id] = job
+        for old in list(_jobs)[:-20]:   # keep only the last 20 jobs
+            del _jobs[old]
+    threading.Thread(target=_run_dispatch, daemon=True, args=(
+        job, mission, worktree, account, use_router, model, effort)).start()
+    return {"job": job_id}
+
+
+def _run_dispatch(job, mission, worktree, account, use_router, model, effort):
+    def finish(result):
+        with _jobs_lock:
+            job["result"] = result
+            job["done"] = True
+
     if DEMO:
-        return {"ok": False, "message": "demo mode — dispatch disabled"}
+        return finish({"ok": False, "message": "demo mode — dispatch disabled"})
     mission = (mission or "").strip()
     if not mission:
-        return {"ok": False, "message": "empty mission"}
+        return finish({"ok": False, "message": "empty mission"})
+
     routed = None
     if use_router and not (worktree and account and model and effort):
-        routed = _route_with_claude(mission)
+        _log(job, "① routing — asking claude (haiku) where this should run…")
+        buf = [""]
+
+        def on_text(t):  # stream haiku's output, line by line
+            buf[0] += t
+            while "\n" in buf[0]:
+                head, buf[0] = buf[0].split("\n", 1)
+                if head.strip():
+                    _log(job, "  haiku › " + head.strip()[:160])
+        routed = _route_with_claude(mission, on_text=on_text)
+        if buf[0].strip():
+            _log(job, "  haiku › " + buf[0].strip()[:160])
+        if not routed:
+            _log(job, "  router failed — falling back to rule-based picks")
+
     branch = None
     if routed:
         worktree = worktree or routed["worktree"]
@@ -1211,8 +1287,25 @@ def dispatch(mission, worktree=None, account=None, use_router=False,
         effort = effort or routed.get("effort")
         b = routed.get("branch")
         branch = b if isinstance(b, str) and b and b.lower() != "null" else None
-    # The kickoff is a deterministic template around the author's verbatim text —
-    # no model ever rewrites the mission.
+        _log(job, f"✓ routed → {worktree} · [{account}]"
+                  + (f" · {model}" if model else "") + (f" · {effort}" if effort else "")
+                  + (f" · {branch}" if branch else ""))
+
+    if not (worktree and account):
+        dw, da = _pick_defaults(mission)
+        worktree, account = worktree or dw, account or da
+        _log(job, f"✓ picked → {worktree} · [{account}] (rules)")
+    if not worktree:
+        return finish({"ok": False, "message": "no free worktree available"})
+    if not account:
+        return finish({"ok": False, "message": "every account is exhausted"})
+    wt = next((w for w in discover_worktrees() if w["name"] == worktree), None)
+    if not wt:
+        return finish({"ok": False, "message": f"unknown worktree {worktree}"})
+    home = next((h for h in claude_homes() if account_label(h) == account), None)
+    if not home:
+        return finish({"ok": False, "message": f"unknown account {account}"})
+
     header = (f"First check out a new branch {branch} from latest origin/main. "
               if branch else
               "If this worktree's current branch is not the right home for this "
@@ -1220,52 +1313,42 @@ def dispatch(mission, worktree=None, account=None, use_router=False,
               "origin/main first. ")
     kickoff = (header + "Commit as you go. Your mission, in the author's own "
                "words: " + mission)
-    if not (worktree and account):
-        dw, da = _pick_defaults(mission)
-        worktree, account = worktree or dw, account or da
-    if not worktree:
-        return {"ok": False, "message": "no free worktree available"}
-    if not account:
-        return {"ok": False, "message": "every account is exhausted"}
-    wt = next((w for w in discover_worktrees() if w["name"] == worktree), None)
-    if not wt:
-        return {"ok": False, "message": f"unknown worktree {worktree}"}
-    home = next((h for h in claude_homes() if account_label(h) == account), None)
-    if not home:
-        return {"ok": False, "message": f"unknown account {account}"}
 
     name = "mission-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower() \
            + time.strftime("-%H%M%S")
     model_flag = f" --model {shlex.quote(model)}" if model else ""
     shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
                  f"exec claude --dangerously-skip-permissions{model_flag}")
+    _log(job, f"② creating tmux session {name}…")
     rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
                    "-c", wt["path"], shell_cmd])
     if rc != 0:
-        return {"ok": False, "message": f"tmux failed: {out or 'is tmux installed?'}"}
+        return finish({"ok": False, "message": f"tmux failed: {out or 'is tmux installed?'}"})
     brief = re.sub(r"\s*\n\s*", " ", kickoff).strip()
 
     def keys(*args):
         run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name] + list(args))
 
-    time.sleep(6)  # let the CLI boot before typing
+    _log(job, "③ booting claude…")
+    time.sleep(6)
     effort_confirmed = None
     if effort:
+        _log(job, f"④ setting effort {effort}…")
         keys("-l", f"/effort {effort}")
         keys("Enter")
         time.sleep(3)
         _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
         effort_confirmed = "set effort level" in pane.lower()
+        _log(job, "  effort " + ("confirmed ✓" if effort_confirmed else "UNCONFIRMED ⚠"))
         if not effort_confirmed:
-            keys("Escape")  # don't leave a stray picker blocking the brief
+            keys("Escape")
             time.sleep(1)
+    _log(job, "⑤ sending kickoff brief…")
     keys("-l", brief)
     keys("Enter")
-    effort_note = ""
-    if effort:
-        effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")
+
     try:  # audit trail: every dispatch, with the author's original words
-        with open(HERE / "dispatch.log.jsonl", "a") as lf:
+        with open(DISPATCH_LOG, "a") as lf:
             lf.write(json.dumps({
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": name,
                 "worktree": worktree, "account": account, "model": model,
@@ -1273,14 +1356,27 @@ def dispatch(mission, worktree=None, account=None, use_router=False,
                 "mission_original": mission, "kickoff": kickoff}) + "\n")
     except OSError:
         pass
-    return {"ok": True,
+    effort_note = ""
+    if effort:
+        effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")
+    _log(job, "✓ launched")
+    finish({"ok": True,
             "message": f"launched {name} in {worktree} on [{account}]"
                        + (f" · {model}" if model else "") + effort_note
                        + (" (routed by claude)" if routed else " (rule-picked)"),
             "session": name, "worktree": worktree, "account": account,
             "model": model, "effort": effort, "effort_confirmed": effort_confirmed,
             "kickoff": kickoff,
-            "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"}
+            "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
+
+
+def dispatch_status(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return {"ok": False, "error": "unknown job"}
+        return {"ok": True, "progress": list(job["progress"]),
+                "done": job["done"], "result": job["result"]}
 
 
 # ------------------------------------------------------------------- server
@@ -1303,6 +1399,11 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "application/json"
         elif self.path.startswith("/api/dispatchlog"):
             body = json.dumps(read_dispatch_log()).encode()
+            ctype = "application/json"
+        elif self.path.startswith("/api/dispatch/status"):
+            m = re.search(r"job=([\w-]+)", self.path)
+            body = json.dumps(dispatch_status(m.group(1)) if m
+                              else {"ok": False, "error": "no job"}).encode()
             ctype = "application/json"
         elif self.path.startswith("/api/chat"):
             qa = re.search(r"account=([^&]+)", self.path)
@@ -1339,9 +1440,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/send"):
             result = send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
         elif self.path.startswith("/api/dispatch"):
-            result = dispatch(payload.get("mission"), payload.get("worktree") or None,
-                              payload.get("account") or None, bool(payload.get("router")),
-                              payload.get("model") or None, payload.get("effort") or None)
+            result = start_dispatch(
+                payload.get("mission"), payload.get("worktree") or None,
+                payload.get("account") or None, bool(payload.get("router")),
+                payload.get("model") or None, payload.get("effort") or None)
         else:
             self.send_error(404)
             return

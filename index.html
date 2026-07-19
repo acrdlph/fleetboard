@@ -203,6 +203,11 @@ header {
 .logrow .ls.off { color:var(--muted-2); }
 .logrow .lm { color:var(--cyan); margin-left:8px; }
 .logrow .lx { color:var(--muted); margin-top:4px; line-height:1.45; }
+.proglive { border:1px solid var(--accent); border-radius:9px; padding:10px 12px;
+  margin-bottom:14px; background:var(--bg); box-shadow:0 0 0 1px var(--accent-glow); }
+.progline { font-size:12px; line-height:1.6; color:var(--fg); }
+.progline.sub { color:var(--muted); padding-left:12px; }
+.progline .c { color:var(--cyan); }
 
 .gitline { padding:9px 14px 0; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:baseline; font-size:12.5px; }
 .gitline .branch { color:var(--cyan); font-weight:600; }
@@ -541,7 +546,8 @@ function openMission() {
   const frees = lastState ? lastState.free_worktrees : [];
   const all = lastState ? lastState.worktrees.map(w => w.name) : [];
   const accts = LIMITS && LIMITS.accounts ? LIMITS.accounts.filter(a => a.ok) : [];
-  $("dbody").innerHTML = `<div class="dnote">describe the feature or task — your text
+  $("dbody").innerHTML = `<div id="mStatus"></div>
+    <div class="dnote">describe the feature or task — your text
     reaches the agent verbatim; the router only picks where it runs. worktree &amp;
     account default to the best free/most-headroom picks. <b>⌘/Ctrl+Enter</b> launches.</div>
     <textarea id="mText" placeholder="what should be built?"
@@ -584,26 +590,50 @@ async function loadDispatchLog() {
       </div>`).join("");
   } catch (e) {}
 }
+let dispatchPoll = null;
 async function launchMission() {
   const mission = $("mText").value.trim();
   if (!mission) { toast("✗ empty mission"); return; }
-  $("dbody").innerHTML = `<div class="dnote">dispatching… (router adds ~15s)</div>`;
+  const st = $("mStatus");
+  st.innerHTML = `<div class="proglive"><div class="progline">▸ dispatching…</div></div>`;
+  st.scrollIntoView({ block: "nearest" });
   try {
     const r = await fetch("/api/dispatch", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mission, worktree: $("mWt").value, account: $("mAcct").value,
                              model: $("mModel").value, effort: $("mEffort").value,
                              router: $("mRouter").checked }) });
-    const d = await r.json();
-    $("dbody").innerHTML = d.ok
-      ? `<div class="dresult">✓ ${esc(d.message)}<br>
-         ${d.effort && d.effort_confirmed === false ? `<b style="color:var(--yellow)">⚠ /effort ${esc(d.effort)} not confirmed — check the session</b><br>` : ""}<br>
-         kickoff brief:<br>${esc(d.kickoff)}<br><br>
-         attach anytime: <code>${esc(d.attach)}</code><br>
-         the agent appears on the board once its transcript starts (~30s).</div>`
-      : `<div class="dresult">✗ ${esc(d.message)}</div>`;
-    toast((d.ok ? "✓ " : "✗ ") + d.message);
+    const { job } = await r.json();
+    if (!job) { toast("✗ dispatch failed to start"); return; }
+    clearInterval(dispatchPoll);
+    dispatchPoll = setInterval(() => pollDispatch(job), 1000);
+    pollDispatch(job);
   } catch (e) { toast("✗ dispatch failed"); }
+}
+async function pollDispatch(job) {
+  try {
+    const r = await fetch(`/api/dispatch/status?job=${job}`);
+    const s = await r.json();
+    if (!s.ok) return;
+    const lines = (s.progress || []).map(l =>
+      `<div class="progline${l.startsWith("  ") ? " sub" : ""}">${esc(l)}</div>`).join("");
+    const d = s.result;
+    let tail = "";
+    if (s.done && d) {
+      tail = d.ok
+        ? `<div class="dresult" style="margin-top:8px">✓ ${esc(d.message)}<br>
+           ${d.effort && d.effort_confirmed === false ? `<b style="color:var(--yellow)">⚠ effort not confirmed — check the session</b><br>` : ""}
+           attach: <code>${esc(d.attach)}</code> · appears on the board in ~30s</div>`
+        : `<div class="dresult" style="margin-top:8px">✗ ${esc(d.message)}</div>`;
+    }
+    $("mStatus").innerHTML = `<div class="proglive">${lines}${tail}</div>`;
+    if (s.done) {
+      clearInterval(dispatchPoll);
+      toast((d && d.ok ? "✓ " : "✗ ") + (d ? d.message : "done"));
+      loadDispatchLog();
+      if (d && d.ok) $("mText").value = "";
+    }
+  } catch (e) {}
 }
 
 // prime the server's cclimits cache so exhausted accounts surface as ⛔ LIMIT
