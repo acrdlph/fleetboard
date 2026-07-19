@@ -605,13 +605,36 @@ async function launchMission() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mission, worktree: $("mWt").value, account: $("mAcct").value,
                              model: $("mModel").value, effort: $("mEffort").value,
-                             router: $("mRouter").checked }) });
-    const { job } = await r.json();
+                             router: $("mRouter").checked,
+                             force_model: !!window._forceModel }) });
+    window._forceModel = false;
+    const resp = await r.json();
+    if (resp.needs_decision) { showModelDecision(resp); return; }
+    const job = resp.job;
     if (!job) { toast("✗ dispatch failed to start"); return; }
     clearInterval(dispatchPoll);
     dispatchPoll = setInterval(() => pollDispatch(job), 1000);
     pollDispatch(job);
   } catch (e) { toast("✗ dispatch failed"); }
+}
+function showModelDecision(resp) {
+  const opusBtn = resp.can_opus
+    ? `<button class="send" onclick="relaunch('opus', false)">▶ start with Opus${resp.opus_account ? ` — [${esc(resp.opus_account)}] ${resp.opus_left}% left` : ""}</button>`
+    : `<span class="dnote">no account has Opus headroom either</span>`;
+  $("mStatus").innerHTML = `<div class="proglive" style="border-color:var(--yellow);box-shadow:0 0 0 1px rgba(212,176,106,.25)">
+    <div class="progline">⚠ ${esc(resp.message)}</div>
+    <div class="progline sub">${esc(resp.model)} would run into a limit / reserve. choose:</div>
+    <div class="row" style="margin-top:10px;gap:8px;flex-wrap:wrap">
+      ${opusBtn}
+      <button class="abtn" onclick="relaunch('${esc(resp.model)}', true)">⚑ use ${esc(resp.model)} anyway</button>
+      <button class="abtn" onclick="$('mStatus').innerHTML=''">✕ cancel</button>
+    </div></div>`;
+  $("mStatus").scrollIntoView({ block: "nearest" });
+}
+async function relaunch(model, force) {
+  const mSel = $("mModel"); if (mSel) mSel.value = (model === "opus" ? "opus" : model);
+  window._forceModel = force;
+  launchMission();
 }
 async function pollDispatch(job) {
   try {

@@ -117,7 +117,11 @@ refetch". Nothing polls the Anthropic API on a timer.
   **Model & effort** are selectable (or "auto": the router matches them to the
   mission — ultracode for hard features, xhigh for research, high for simple
   tasks — and avoids models whose model-scoped limit is exhausted on the
-  chosen account). Model is a launch flag; effort is typed as `/effort <level>`
+  chosen account). Picking a specific model checks that model's *own* limit
+  per account (Fable can be gone while the weekly limit is fine); if no
+  account clears its reserve buffer for it, the dispatch pauses with a dialog
+  offering **Opus** instead (or use it anyway) rather than launching blindly.
+  Model is a launch flag; effort is typed as `/effort <level>`
   into the new session and **verified** via capture-pane (⚠ shown if
   unconfirmed). Caveat: the CLI saves non-ultracode effort levels as that
   account's default for new sessions — dispatching with an explicit effort

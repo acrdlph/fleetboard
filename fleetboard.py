@@ -885,6 +885,52 @@ def account_reserve(label):
     return rp.get(label, rp.get("*", 0)) or 0
 
 
+def _model_remaining(acc, model):
+    """Min remaining % across the limits that running `model` consumes on this
+    account: all non-model-scoped limits (session, weekly) + the model-scoped
+    limit matching `model`, if the account has one. None if unknown."""
+    if not acc.get("ok"):
+        return None
+    rems = []
+    for l in acc.get("limits", []):
+        rem = l.get("remaining_percent")
+        if rem is None:
+            rem = 100 - (l.get("percent") or 0)
+        if l.get("model_scoped"):
+            if model and model.lower() in (l.get("label", "").lower()):
+                rems.append(rem)     # this model's own cap
+        else:
+            rems.append(rem)         # session / weekly always apply
+    return min(rems) if rems else None
+
+
+def model_candidates(model, only_account=None):
+    """Accounts that could run `model`, each with remaining headroom and whether
+    it clears its reserve buffer. Sorted by most remaining first."""
+    data = _limits["data"] if not DEMO else demo_limits()
+    if not data or not data.get("available"):
+        return []
+    excl = set(CFG.get("exclude_accounts") or [])
+    out = []
+    for acc in data.get("accounts", []):
+        if not acc.get("ok"):
+            continue
+        label = account_label(Path(acc["config_dir"]))
+        if only_account:
+            if label != only_account:
+                continue
+        elif label in excl:
+            continue
+        rem = _model_remaining(acc, model)
+        if rem is None:
+            continue
+        reserve = account_reserve(label)
+        out.append({"label": label, "remaining": round(rem),
+                    "reserve": reserve, "ok": rem > 0 and rem >= reserve})
+    out.sort(key=lambda x: -x["remaining"])
+    return out
+
+
 def set_reserve(label, percent):
     """Set an account's reserve buffer from the UI: update CFG, persist to the
     config file, and re-apply to the cached limits so it takes effect at once."""
@@ -1320,8 +1366,31 @@ def _log(job, line):
 
 
 def start_dispatch(mission, worktree=None, account=None, use_router=False,
-                   model=None, effort=None):
-    """Kick a dispatch off in the background; return a job id to poll."""
+                   model=None, effort=None, force_model=False):
+    """Kick a dispatch off in the background; return a job id to poll.
+    If an explicit model has no account with enough headroom (above reserve),
+    return a needs_decision instead of launching — unless force_model."""
+    if not DEMO and model and not force_model:
+        cached_limits()
+        cands = model_candidates(model, only_account=account)
+        if not any(c["ok"] for c in cands):
+            best = cands[0] if cands else None
+            opus = model_candidates("opus", only_account=account)
+            best_opus = next((c for c in opus if c["ok"]), None)
+            where = f"account [{account}]" if account else "any account"
+            if best and best["reserve"] > 0:
+                detail = (f"best is [{best['label']}] at {best['remaining']}% "
+                          f"left, below its {best['reserve']}% reserve")
+            elif best:
+                detail = (f"best is [{best['label']}] at {best['remaining']}% — "
+                          f"the {model} limit is used up")
+            else:
+                detail = "no readable account for this model"
+            return {"ok": False, "needs_decision": True, "model": model,
+                    "message": f"No {model} headroom on {where} — {detail}.",
+                    "can_opus": bool(best_opus),
+                    "opus_account": best_opus["label"] if best_opus else None,
+                    "opus_left": best_opus["remaining"] if best_opus else None}
     _job_seq[0] += 1
     job_id = "job-" + time.strftime("%H%M%S") + f"-{_job_seq[0]}"
     job = {"progress": [], "done": False, "result": None}
@@ -1529,7 +1598,8 @@ class Handler(BaseHTTPRequestHandler):
             result = start_dispatch(
                 payload.get("mission"), payload.get("worktree") or None,
                 payload.get("account") or None, bool(payload.get("router")),
-                payload.get("model") or None, payload.get("effort") or None)
+                payload.get("model") or None, payload.get("effort") or None,
+                bool(payload.get("force_model")))
         else:
             self.send_error(404)
             return
