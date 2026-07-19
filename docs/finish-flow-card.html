@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>fleetboard finish flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --bg:#0d0d0d; --bg-2:#111111; --surface:#161616; --surface-2:#1c1c1c;
+  --border:#2a2a2a; --border-2:#3a3a3a;
+  --fg:#e8e6e3; --muted:#8a8784; --muted-2:#6a6764;
+  --accent:#d97757; --accent-2:#e8a87c; --green:#87b386; --cyan:#7fb3c8; --yellow:#d4b06a;
+  --accent-glow:rgba(217,119,87,.25); --green-glow:rgba(135,179,134,.2);
+  --mono:"IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --sans:"Inter", ui-sans-serif, system-ui, sans-serif;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html,body { width:1400px; height:560px; overflow:hidden; }
+body {
+  font-family:var(--sans); color:var(--fg);
+  background:
+    radial-gradient(1000px 480px at 15% -8%, rgba(135,179,134,.09), transparent 60%),
+    radial-gradient(900px 420px at 85% -8%, rgba(217,119,87,.08), transparent 60%),
+    var(--bg);
+  position:relative; padding:44px 52px;
+}
+body::before {
+  content:""; position:absolute; inset:0;
+  background-image:radial-gradient(rgba(232,230,227,.045) 1px, transparent 1px);
+  background-size:26px 26px;
+  mask-image:linear-gradient(180deg, transparent 10%, black 55%);
+  -webkit-mask-image:linear-gradient(180deg, transparent 10%, black 55%);
+}
+.head { position:relative; z-index:2; margin-bottom:26px; }
+.prompt { font-family:var(--mono); font-size:15px; color:var(--muted); }
+.prompt .u { color:var(--accent); font-weight:700; } .prompt .p { color:var(--cyan); }
+h1 { font-size:33px; font-weight:800; letter-spacing:-0.02em; margin-top:12px; }
+h1 .a { color:var(--green); }
+.lead { color:var(--muted); font-size:16px; margin-top:8px; max-width:980px; line-height:1.5; }
+.lead b { color:var(--fg); font-weight:700; }
+.lead .mono { font-family:var(--mono); font-size:14px; }
+
+/* the two doors — faithful replicas of the board's buttons */
+.doors { position:relative; z-index:2; display:flex; align-items:center; gap:18px; margin-top:26px; }
+.btn { font-family:var(--mono); font-weight:600; border-radius:7px; padding:9px 18px; font-size:15px; }
+.btn.mission { color:var(--accent); background:var(--bg-2); border:1.5px solid var(--accent); }
+.btn.finish  { color:var(--green); background:var(--bg-2); border:1.5px solid var(--green);
+  box-shadow:0 0 0 1px var(--green-glow), 0 0 20px var(--green-glow); }
+.doors .life { flex:1; display:flex; align-items:center; gap:12px; color:var(--muted-2);
+  font-family:var(--mono); font-size:12.5px; white-space:nowrap; }
+.doors .life .line { flex:1; border-top:1.5px dashed var(--border-2); }
+.doors .cap { font-family:var(--mono); font-size:11.5px; color:var(--muted-2); }
+
+.flow { position:relative; z-index:2; display:flex; align-items:stretch; gap:22px; margin-top:26px; }
+.step { flex:1; background:var(--surface); border:1.5px solid var(--border); border-radius:13px;
+  padding:16px 17px; position:relative; box-shadow:0 14px 34px rgba(0,0,0,.4); }
+.step.brief    { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent-glow), 0 14px 34px rgba(0,0,0,.4); }
+.step.dispatch { border-color:var(--border-2); }
+.step.exit     { border-color:var(--green); }
+.step .n { font-family:var(--mono); font-size:12px; font-weight:700; color:var(--muted-2); letter-spacing:.12em; }
+.step .n .st { font-weight:700; }
+.step .n .st.or { color:var(--accent); } .step .n .st.gn { color:var(--green); }
+.step .t { font-size:16px; font-weight:800; margin-top:7px; }
+.step .d { color:var(--muted); font-size:13px; line-height:1.5; margin-top:8px; }
+.step .d b { color:var(--fg); font-weight:600; }
+.step .d code { font-family:var(--mono); font-size:12px; color:var(--cyan); }
+.foot { position:relative; z-index:2; margin-top:24px; text-align:center;
+  font-family:var(--mono); font-size:13.5px; color:var(--muted-2); }
+.foot b { color:var(--cyan); font-weight:600; }
+</style>
+</head>
+<body>
+  <div class="head">
+    <div class="prompt"><span class="u">you@fleet</span><span class="p">:~</span><span class="u">$</span> ./fleetboard — a harness closes its loops</div>
+    <h1>One button opens a mission. <span class="a">One button lands it.</span></h1>
+    <div class="lead"><b>✓ finish</b> never runs git itself — like everything in the
+      harness, it acts by talking to a terminal. An agent gets the closeout runbook:
+      merge the trunk in, resolve conflicts, push, tidy the worktree, report.</div>
+  </div>
+
+  <div class="doors">
+    <span class="btn mission">🚀 new mission</span>
+    <span class="cap">dispatch an agent</span>
+    <div class="life"><div class="line"></div>the mission runs — watch · chat · resume<div class="line"></div></div>
+    <span class="cap">land the work</span>
+    <span class="btn finish">✓ finish</span>
+  </div>
+
+  <div class="flow">
+    <div class="step brief">
+      <div class="n">CASE 1 · <span class="st or">AGENT ALIVE</span></div>
+      <div class="t">the live agent gets the brief</div>
+      <div class="d">The closeout runbook is <b>typed into its terminal</b>: land the
+        branch on the trunk, resolve anything, tidy up, report one line. Conflicts
+        are handled by an agent with context — not by blind automation.</div>
+    </div>
+    <div class="step dispatch">
+      <div class="n">CASE 2 · <span class="st">TERMINAL GONE</span></div>
+      <div class="t">a closeout agent is dispatched</div>
+      <div class="d">Killed the tmux window already? A <b>small closeout agent</b> is
+        launched into the worktree with the same brief — routed like any mission,
+        logged like any dispatch.</div>
+    </div>
+    <div class="step exit">
+      <div class="n">CASE 3 · <span class="st gn">ALREADY LANDED</span></div>
+      <div class="t">just close the door</div>
+      <div class="d">Work merged, agent idling at its prompt? <code>/exit</code> is
+        typed and the terminal closes. The card flips to <b>◇ FREE</b> by itself —
+        free is observed, never set.</div>
+    </div>
+  </div>
+
+  <div class="foot">the board picks the right case from live fleet state — <b>one click</b>, and the worktree is ready for the next mission</div>
+</body>
+</html>

@@ -3,7 +3,8 @@
 [![CI](https://github.com/acrdlph/fleetboard/actions/workflows/ci.yml/badge.svg)](https://github.com/acrdlph/fleetboard/actions/workflows/ci.yml)
 
 **Mission control for parallel Claude Code agents — watch every worktree and
-account on one board, chat with any agent, and dispatch new ones.**
+account on one board, chat with any agent, dispatch new missions, and land
+finished ones.**
 
 ![fleetboard](docs/social-preview-v2.png)
 
@@ -13,9 +14,10 @@ one silently hit a usage limit an hour ago? Which worktree is free for the
 next feature — and on which account? fleetboard answers all of it on one dark
 board, and (when you click) acts on it too.
 
-It's built as a **read-only observer with an opt-in control plane**: watching
-never touches your sessions; acting (chat, resume, dispatch) only ever happens
-on an explicit click. Zero dependencies — one python3 stdlib file.
+It's an agent **harness** built as a **read-only observer with an opt-in
+control plane**: watching never touches your sessions; acting — chat, resume,
+dispatch, ✓ finish — only ever happens on an explicit click, and always by
+talking to a terminal. Zero dependencies — one python3 stdlib file.
 
 ```bash
 git clone https://github.com/acrdlph/fleetboard && cd fleetboard
@@ -78,7 +80,8 @@ tip on a **log time scale ending at "now"**; worktrees whose HEAD sits on main
 ride the trunk at the exact commit they're parked on. A tip short of the right
 edge is a branch that stopped moving; a long flat arc `↓137` behind is rebase
 debt as literal distance. Dots are commits, tips take live status colors (a
-working agent's tip pulses), hover for details, click to jump to the terminal.
+working agent's tip pulses), hover for details, click a node for actions
+(⌖ focus its terminal · ✓ finish the mission).
 
 ### ◔ Limits — is the agent stuck, or out of juice?
 
@@ -107,6 +110,10 @@ refetch". Nothing polls the Anthropic API on a timer.
 - **▶ resume** — a session-limit-stuck agent gets a button with a live
   countdown that **arms itself the moment the limit resets**, then types
   `continue`. Weekly limits never show it — they won't heal soon.
+- **✓ finish** — one click hands closeout to an agent: the live one gets a
+  closeout brief (land the branch, tidy up, report), a missing one is
+  replaced by a freshly dispatched closeout agent, and an idle agent whose
+  work already landed just gets `/exit`. See *Closing out a mission* below.
 - **🚀 new mission** — describe a feature; fleetboard picks the cleanest free
   worktree and the most-headroom account (or a one-shot
   `claude -p --model haiku` router picks them, plus a branch name), then
@@ -141,6 +148,30 @@ understands the succession: a limit-hit session with a fresher live session in
 its worktree is annotated **"↳ work continued by [account] — this terminal can
 be closed"**, leaves the need-you counts, and stops speaking for the branch on
 the map. Only a stranded agent with *no* successor keeps demanding attention.
+
+### Closing out a mission
+
+One button: **✓ finish**, on every worktree card and in a map node's panel.
+It arms on the first click, runs on the second, and — like everything
+fleetboard does — works by talking to a terminal:
+
+![one button lands it](docs/finish-flow.png)
+
+- **agent alive** → it receives a closeout brief: land the branch on the
+  trunk (merge, resolve, push), tidy the worktree, report back. ✓ finish
+  again once it's done closes the terminal.
+- **terminal already gone** → a small closeout agent is dispatched into the
+  worktree to do the same.
+- **everything landed, agent idle** → `/exit` is typed and the terminal
+  closes.
+
+Then wait a few seconds: the session flips to `○ ENDED` and the card returns
+to `◇ FREE` by itself — free is observed (no live process, no fresh
+transcript writes), never set by hand.
+
+The board serves the full operating manual at **`/guide`** — status
+vocabulary, mission lifecycle, what the closeout brief asks the agent to do,
+and the gotchas.
 
 ---
 
