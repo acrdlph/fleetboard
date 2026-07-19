@@ -15,10 +15,8 @@ next feature — and on which account? orchestr answers all of it on one dark
 board, and (when you click) acts on it too.
 
 It's an agent **harness** with a hard line down the middle: **watching only
-reads** — transcripts, processes, git — and never touches your sessions;
-**acting** — chat, resume, dispatch, ✓ finish — happens only on an explicit
-click, and always by talking to a terminal, never behind your back. Zero
-dependencies — one python3 stdlib file.
+reads**, **acting** only ever happens on a click. Zero dependencies — one
+python3 stdlib file.
 
 ```bash
 git clone https://github.com/acrdlph/orchestr && cd orchestr
