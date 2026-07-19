@@ -222,14 +222,31 @@ Pure stdlib `unittest`, zero dependencies — same as the app:
 python3 -m unittest discover -s tests     # from the repo root
 ```
 
-Covers the logic that's easy to get wrong: transcript text cleaning and the
-real-vs-machine prompt filter, account labelling, longest-prefix worktree
-matching, session-status classification (working / needs-input / limit /
-blocked / your-turn / ended), per-model headroom + reserve buffers, the
-reserve-persist round-trip, dispatch-log parsing, and an HTTP smoke test that
-boots the real server in `--demo` mode (no subprocess) and hits every
-endpoint. Filesystem/process/network code stays out of the unit tests by
-design — it's exercised through demo mode.
+**Unit tests** (`tests/test_fleetboard.py`) cover the logic that's easy to get
+wrong: transcript text cleaning and the real-vs-machine prompt filter, account
+labelling, longest-prefix worktree matching, session-status classification
+(working / needs-input / limit / blocked / your-turn / ended), per-model
+headroom + reserve buffers, the reserve-persist round-trip, dispatch-log
+parsing, and an HTTP smoke test that boots the real server in `--demo` mode
+and hits every endpoint.
+
+**Integration tests** (`tests/test_integration.py`) exercise the *real*
+pipeline against controlled fixtures — no dependency on your live fleet:
+
+- a temp **git repo** + a temp **Claude home** with real `.jsonl` transcripts,
+  run through the actual `discover_worktrees` → `git_info` → `scan_sessions` →
+  `collect_state` path (branch, dirty count, topic extraction, fresh-vs-ended
+  status, pending-workflow reporting). Live-system inputs (`ps`/`lsof`,
+  `cclimits`) are stubbed to empty so the git + transcript code runs for real.
+- `branch_topology` against a repo with a real `origin/main` ref (fork point,
+  ahead/behind).
+- the **tmux actuation** layer (`send-keys` + `capture-pane`) that dispatch,
+  chat, resume, and effort-verification depend on — on its own socket, with a
+  plain shell, never launching `claude`.
+
+Tests self-skip where a tool is missing (`git`, `tmux`). What stays manual:
+the real `claude`/`cclimits`/AppleScript calls — verified by driving a live
+dispatch (kickoff → READY → instruction → DONE).
 
 ## Security & spending
 
