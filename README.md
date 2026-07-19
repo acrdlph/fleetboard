@@ -1,5 +1,7 @@
 # fleetboard ⌁
 
+[![CI](https://github.com/acrdlph/fleetboard/actions/workflows/ci.yml/badge.svg)](https://github.com/acrdlph/fleetboard/actions/workflows/ci.yml)
+
 **Mission control for parallel Claude Code agents — watch every worktree and
 account on one board, chat with any agent, and dispatch new ones.**
 
