@@ -154,11 +154,14 @@ function render(d) {
   }
   const accounts = [...d.accounts].sort((a, b) => (b.headroom_percent ?? -1) - (a.headroom_percent ?? -1));
   const bestSlug = accounts.length && accounts[0].ok ? accounts[0].slug : null;
+  const reserveOf = (a) => a.reserve_percent || 0;
+  const reserveBlocked = (a) => reserveOf(a) > 0 && (a.headroom_percent ?? 100) < reserveOf(a);
   $("out").innerHTML = `<div class="grid">` + accounts.map(a => {
     if (!a.ok) return `<div class="acct"><div class="ahead"><span class="nm">${esc(a.slug)}</span>
       <span class="tag gone">✗ ERROR</span></div><div class="lims"><div class="lim"><span class="lab">${esc(a.error || "unreadable")}</span></div></div></div>`;
     const exhausted = a.limits.some(l => l.exhausted_now);
     const hr = a.headroom_percent ?? 0;
+    const rsv = reserveOf(a), rBlocked = reserveBlocked(a);
     const rows = a.limits.map(l => {
       const rem = l.remaining_percent ?? (100 - l.percent);
       const col = l.exhausted_now ? "var(--accent)" : shade(rem);
@@ -170,15 +173,17 @@ function render(d) {
         out += `<div class="lim"><span></span><span class="resets ${l.exhausted_now ? "hot" : ""}">${l.exhausted_now ? "⛔ exhausted — " : ""}resets in ${rel(l.resets_in_seconds)}</span></div>`;
       return out;
     }).join("");
-    return `<div class="acct${exhausted ? " exhausted" : ""}${a.slug === bestSlug && !exhausted ? " best" : ""}">
+    const autoFull = exhausted || rBlocked;
+    return `<div class="acct${autoFull ? " exhausted" : ""}${a.slug === bestSlug && !autoFull ? " best" : ""}">
       <div class="ahead">
         <span class="nm">${esc(a.slug)}</span>
         <span class="plan">${esc((a.plan || "?").toUpperCase())}</span>
-        ${a.slug === bestSlug && !exhausted ? `<span class="tag best">◇ MOST HEADROOM</span>` : ""}
+        ${a.slug === bestSlug && !autoFull ? `<span class="tag best">◇ MOST HEADROOM</span>` : ""}
         ${exhausted ? `<span class="tag gone">⛔ EXHAUSTED</span>` : ""}
+        ${!exhausted && rBlocked ? `<span class="tag gone">🔒 RESERVE</span>` : ""}
         <span class="hr" style="color:${shade(hr)}">${Math.round(hr)}<span class="u">% left</span></span>
       </div>
-      <div class="dirline">${esc(a.config_dir)}</div>
+      <div class="dirline">${esc(a.config_dir)}${rsv ? ` · reserve ${rsv}% (auto-dispatch stops below)` : ""}</div>
       <div class="lims">${rows}</div>
     </div>`;
   }).join("") + `</div>`;

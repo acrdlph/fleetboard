@@ -48,6 +48,7 @@ CFG = {
     "max_sessions": 6,         # per worktree card
     "exclude_accounts": [],    # account labels never AUTO-picked for dispatch/router
     "router_home": None,       # fixed Claude home for the haiku router (else auto)
+    "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)
 }
 
 TAIL_BYTES = 128 * 1024
@@ -859,12 +860,26 @@ def cached_limits(refresh=False):
         return _limits["data"] or {"available": False, "error": "cclimits returned non-JSON"}
     data["available"] = True
     data["fetched_at"] = now
+    for acc in data.get("accounts", []):
+        if acc.get("config_dir"):
+            r = account_reserve(account_label(Path(acc["config_dir"])))
+            acc["reserve_percent"] = r
+            acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
     _limits["data"], _limits["t"] = data, now
     return data
 
 
+def account_reserve(label):
+    """Headroom % this account must keep free before auto-dispatch treats it
+    as full. Per-account override, else '*' default, else 0."""
+    rp = CFG.get("reserve_percent") or {}
+    if not isinstance(rp, dict):
+        return 0
+    return rp.get(label, rp.get("*", 0)) or 0
+
+
 def limits_by_account():
-    """account label -> {exhausted, worst, resets_in, headroom} (None if unknown)."""
+    """account label -> {exhausted, worst, resets_in, headroom, reserve, available}."""
     data = _limits["data"] if not DEMO else demo_limits()
     if not data or not data.get("available"):
         return {}
@@ -877,14 +892,22 @@ def limits_by_account():
         worst = min(exhausted, key=lambda l: l.get("resets_in_seconds") or 0) if exhausted else None
         resets_in = worst.get("resets_in_seconds") if worst else None
         fetched = (data.get("fetched_at") or time.time())
+        headroom = acc.get("headroom_percent")
+        reserve = account_reserve(label)
+        # reserve-blocked: less than the required buffer remains → treat as full
+        reserve_blocked = reserve > 0 and headroom is not None and headroom < reserve
         out[label] = {
-            "headroom": acc.get("headroom_percent"),
+            "headroom": headroom,
             "exhausted": bool(exhausted),
             "worst": worst["label"] if worst else None,
             "worst_scoped": bool(worst.get("model_scoped")) if worst else False,
             "group": worst.get("group") if worst else None,
             "resets_in": resets_in,
             "resets_at": fetched + resets_in if resets_in else None,
+            "reserve": reserve,
+            "reserve_blocked": reserve_blocked,
+            # usable for AUTO dispatch/router: has real headroom above its buffer
+            "available": (not exhausted) and not reserve_blocked,
         }
     return out
 
@@ -1137,7 +1160,7 @@ def _pick_defaults(mission):
     free.sort(key=lambda w: (w["git"]["dirty"] or 0))
     wt = free[0]["name"] if free else None
     excl = set(CFG.get("exclude_accounts") or [])
-    accounts = [(a, d) for a, d in limits.items() if not d["exhausted"] and a not in excl]
+    accounts = [(a, d) for a, d in limits.items() if d["available"] and a not in excl]
     accounts.sort(key=lambda x: -(x[1]["headroom"] or 0))
     acct = accounts[0][0] if accounts else None
     return wt, acct
@@ -1156,8 +1179,12 @@ def _route_with_claude(mission, on_text=None):
         "worktrees": [{"name": w["name"], "branch": w["git"]["branch"],
                        "dirty": w["git"]["dirty"], "availability": w["availability"]}
                       for w in state["worktrees"]],
-        "accounts": [{"label": a, "headroom_pct": d["headroom"], "exhausted": d["exhausted"],
-                      "exhausted_limits": ex_map.get(a, [])}
+        "accounts": [{"label": a, "headroom_pct": d["headroom"],
+                      "exhausted": d["exhausted"] or d["reserve_blocked"],
+                      "exhausted_limits": ex_map.get(a, []),
+                      "reserve_pct": d["reserve"],
+                      "reserve_blocked": d["reserve_blocked"],
+                      "available": d["available"] and a not in (CFG.get("exclude_accounts") or [])}
                      for a, d in limits.items()],
     }
     # The router runs `claude -p` under some account's config dir. Never let it
@@ -1170,7 +1197,7 @@ def _route_with_claude(mission, on_text=None):
     if router_home is None:
         excl = set(CFG.get("exclude_accounts") or [])
         ok_accounts = sorted((d["headroom"] or 0, a) for a, d in limits.items()
-                             if not d["exhausted"] and a not in excl)
+                             if d["available"] and a not in excl)
         if ok_accounts:
             router_home = next((h for h in claude_homes()
                                 if account_label(h) == ok_accounts[-1][1]), None)
@@ -1180,7 +1207,10 @@ def _route_with_claude(mission, on_text=None):
         "verbatim; you only make routing decisions. Fleet state:\n"
         + json.dumps(fleet) + "\n\nMission from the user:\n" + mission +
         "\n\nPick a FREE worktree (prefer clean ones and a thematic fit with its "
-        "branch) and a non-exhausted account with the most headroom. Also pick "
+        "branch) and an account. ONLY choose an account whose \"available\" is "
+        "true — treat exhausted, reserve_blocked (its headroom is below the "
+        "reserve buffer it must keep free), or unavailable accounts as off "
+        "limits. Prefer the available account with the most headroom. Also pick "
         "the model (fable > opus > sonnet by capability; NEVER a model listed "
         "in that account's exhausted_limits — e.g. if 'Fable' is exhausted "
         "there, pick opus or another account) and the reasoning effort: "
