@@ -229,7 +229,23 @@ header {
 .logrow .ls.on { color:var(--green); }
 .logrow .ls.off { color:var(--muted-2); }
 .logrow .lm { color:var(--cyan); margin-left:8px; }
-.logrow .lx { color:var(--muted); margin-top:4px; line-height:1.5; }
+.logrow .lchat { margin-left:8px; float:right; padding:2px 8px; font-size:var(--fs-2xs); }
+.logrow .lwait { margin-left:8px; float:right; color:var(--muted-2); font-size:var(--fs-2xs); }
+/* the brief stays clamped until clicked — full text on demand, not by default */
+.logrow .lx { color:var(--muted); margin-top:4px; line-height:1.5; cursor:pointer;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.logrow .lx.open { -webkit-line-clamp:unset; display:block; }
+/* what you just launched, lifted out of the input and parked above it */
+.sent { border:1px solid var(--green); border-radius:9px; padding:9px 12px;
+  margin-bottom:12px; background:var(--bg); }
+.sent.bad { border-color:var(--accent); }
+.sent .sentbar { display:flex; align-items:center; gap:10px; font-size:var(--fs-2xs);
+  font-weight:600; margin-bottom:5px; }
+.sent .sl { color:var(--green); }
+.sent.bad .sl { color:var(--accent); }
+.sent .sn { color:var(--muted-2); font-weight:400; }
+.sent .sentbar .abtn { margin-left:auto; padding:2px 8px; }
+.sent .sentx { color:var(--fg); font-size:var(--fs-sm); line-height:1.5; white-space:pre-wrap; }
 .proglive { border:1px solid var(--accent); border-radius:9px; padding:10px 12px;
   margin-bottom:14px; background:var(--bg); box-shadow:0 0 0 1px var(--accent-glow); }
 .progline { font-size:var(--fs-sm); line-height:1.6; color:var(--fg); }
@@ -604,6 +620,13 @@ setInterval(() => {
 
 // ---- mission composer ------------------------------------------------------
 let LIMITS = null;
+// ⌘Enter launches on mac, Ctrl+Enter everywhere else — one chord per platform,
+// so the hint never names a key the keyboard doesn't have.
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const LAUNCH_CHORD = IS_MAC ? "⌘Enter" : "Ctrl+Enter";
+function isLaunchChord(ev) {
+  return ev.key === "Enter" && (IS_MAC ? ev.metaKey : ev.ctrlKey);
+}
 function acctLabel(dir) {
   const base = (dir || "").split("/").pop();
   return base === ".claude" ? "main" : base.replace(/^\.claude-?/, "");
@@ -615,13 +638,14 @@ function openMission() {
   const frees = lastState ? lastState.free_worktrees : [];
   const all = lastState ? lastState.worktrees.map(w => w.name) : [];
   const accts = LIMITS && LIMITS.accounts ? LIMITS.accounts.filter(a => a.ok) : [];
-  $("dbody").innerHTML = `<div id="mStatus"></div>
+  $("dbody").innerHTML = `<div id="mSent"></div><div id="mStatus"></div>
     <div class="dnote">describe the feature or task — your text
     reaches the agent verbatim; the router only picks where it runs. worktree &amp;
-    account default to the best free/most-headroom picks. <b>⌘/Ctrl+Enter</b> launches.</div>
+    account default to the best free/most-headroom picks. <b>${LAUNCH_CHORD}</b> launches.</div>
     <textarea id="mText" placeholder="what should be built?"
-      onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();launchMission();}"></textarea>
+      onkeydown="if(isLaunchChord(event)){event.preventDefault();launchMission();}"></textarea>
     <div id="mLog"></div>`;
+  renderInFlight();   // a dispatch still running stays visible across reopens
   loadDispatchLog();
   $("dfoot").innerHTML = `
     <div class="row">
@@ -645,24 +669,50 @@ function openMission() {
   $("drawer").classList.add("open", "wide");
   $("mText").focus();
 }
+// the board's session registry is keyed `worktree|sid`; a dispatch only knows
+// its worktree, so match on that and take the freshest session (lowest age).
+function chatKeyForWorktree(wt) {
+  const keys = Object.keys(REG).filter(k => REG[k].wt === wt);
+  if (!keys.length) return null;
+  return keys.sort((a, b) => (REG[a].s.age_s ?? 1e9) - (REG[b].s.age_s ?? 1e9))[0];
+}
 async function loadDispatchLog() {
   try {
     const r = await fetch("/api/dispatchlog");
     const d = await r.json();
     if (!d.entries || !d.entries.length) return;
-    $("mLog").innerHTML = `<div class="dnote" style="margin-top:16px">recent dispatches</div>` +
-      d.entries.map(e => `<div class="logrow">
+    $("mLog").innerHTML = `<div class="dnote" style="margin-top:16px">recent dispatches — click one to read the full brief</div>` +
+      d.entries.map(e => {
+        const key = e.alive ? chatKeyForWorktree(e.worktree) : null;
+        return `<div class="logrow">
         <span class="lt">${esc((e.ts || "").replace("T", " ").slice(5, 16))}</span>
         <span class="ls ${e.alive ? "on" : "off"}">${e.alive ? "● live" : "○ ended"}</span>
         <span class="lm">${esc(e.worktree || "?")} · [${esc(e.account || "?")}]${e.model ? " · " + esc(e.model) : ""}${e.effort ? " · " + esc(e.effort) : ""}${e.routed ? " · routed" : ""}</span>
-        <div class="lx">${esc((e.mission_original || "").slice(0, 160))}${(e.mission_original || "").length > 160 ? "…" : ""}</div>
-      </div>`).join("");
+        ${key ? `<button class="abtn lchat" onclick="event.stopPropagation();openChat('${esc(key)}')">✉ chat</button>`
+              : e.alive ? `<span class="lwait">starting…</span>` : ""}
+        <div class="lx" onclick="this.classList.toggle('open')">${esc(e.mission_original || "")}</div>
+      </div>`; }).join("");
   } catch (e) {}
 }
 let dispatchPoll = null;
-async function launchMission() {
-  const mission = $("mText").value.trim();
+// the mission in flight — the composer's textarea is cleared the moment you
+// launch, so this (not the input) is what relaunch/retry reads back.
+let inFlight = null;
+function renderInFlight(note) {
+  if (!inFlight) return;
+  $("mSent").innerHTML = `<div class="sent">
+    <div class="sentbar"><span class="sl">▸ launching</span>
+      <span class="sn">${esc(note || "dispatching…")}</span></div>
+    <div class="sentx">${esc(inFlight)}</div></div>`;
+}
+async function launchMission(missionArg) {
+  // on a relaunch the textarea is already empty — fall back to the in-flight text
+  const mission = (missionArg !== undefined ? missionArg
+                                            : $("mText").value.trim()) || inFlight;
   if (!mission) { toast("✗ empty mission"); return; }
+  inFlight = mission;
+  $("mText").value = "";        // out of the input the instant you commit to it
+  renderInFlight();
   const st = $("mStatus");
   st.innerHTML = `<div class="proglive"><div class="progline">▸ dispatching…</div></div>`;
   st.scrollIntoView({ block: "nearest" });
@@ -700,7 +750,18 @@ function showModelDecision(resp) {
 async function relaunch(model, force) {
   const mSel = $("mModel"); if (mSel) mSel.value = (model === "opus" ? "opus" : model);
   window._forceModel = force;
-  launchMission();
+  launchMission(inFlight);
+}
+// a failed dispatch must never eat what you wrote — put it back in the composer
+let failedMission = null;
+function reeditMission() {
+  if (failedMission === null) return;
+  $("mText").value = failedMission;
+  failedMission = null;
+  inFlight = null;
+  $("mSent").innerHTML = "";
+  $("mStatus").innerHTML = "";
+  $("mText").focus();
 }
 async function pollDispatch(job) {
   try {
@@ -722,8 +783,17 @@ async function pollDispatch(job) {
     if (s.done) {
       clearInterval(dispatchPoll);
       toast((d && d.ok ? "✓ " : "✗ ") + (d ? d.message : "done"));
+      if (d && d.ok) {
+        inFlight = null;
+        $("mSent").innerHTML = "";     // it graduates into the dispatch list below
+      } else if (inFlight) {
+        failedMission = inFlight;
+        $("mSent").innerHTML = `<div class="sent bad">
+          <div class="sentbar"><span class="sl">✗ not launched</span>
+            <button class="abtn" onclick="reeditMission()">↩ edit again</button></div>
+          <div class="sentx">${esc(failedMission)}</div></div>`;
+      }
       loadDispatchLog();
-      if (d && d.ok) $("mText").value = "";
     }
   } catch (e) {}
 }

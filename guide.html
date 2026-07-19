@@ -40,6 +40,15 @@ header {
   backdrop-filter:blur(8px); border-bottom:1px solid var(--border);
 }
 .nav { display:flex; align-items:center; justify-content:space-between; height:52px; gap:16px; }
+/* new mission lives in every header; the board owns the composer, so this is a
+   deep link into it rather than a second copy of the dispatch UI */
+#missionBtn {
+  font:inherit; font-size:var(--fs-sm); font-weight:600; color:var(--accent);
+  background:var(--bg-2); border:1px solid var(--accent); border-radius:7px;
+  padding:6px 13px; cursor:pointer; text-decoration:none; white-space:nowrap;
+  transition:all .15s var(--ease);
+}
+#missionBtn:hover { background:var(--accent); color:var(--bg); }
 .brand { font-weight:600; white-space:nowrap; }
 .brand .prompt { color:var(--accent); }
 .brand .path { color:var(--cyan); }
@@ -107,6 +116,7 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
 <body>
 <header><div class="wrap nav">
   <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./orchestr --help</div>
+  <a id="missionBtn" href="/?mission">🚀 new mission</a>
 </div></header>
 
 <nav class="side">
@@ -159,6 +169,12 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
   are named <code>mission-&lt;worktree&gt;-&lt;time&gt;</code> on the
   <code>fleet</code> tmux socket: <code>tmux -L fleet ls</code> shows them,
   <code>tmux -L fleet attach -t &lt;name&gt;</code> gives you the real terminal.</p>
+  <p>The composer is reachable from every page's header. On launch your text
+  leaves the input immediately and becomes a card — it stays readable while the
+  dispatch runs, and if the dispatch fails, <b>↩ edit again</b> puts it back so
+  nothing you wrote is lost. Once the agent lands on the board, its entry under
+  <i>recent dispatches</i> grows a <b>✉ chat</b> button; click the brief itself
+  to read it in full.</p>
 
   <h2><span class="g">§3</span> while it runs</h2>
   <p>The board refreshes every 5 s and sorts by attention. <b>✉ chat</b> shows

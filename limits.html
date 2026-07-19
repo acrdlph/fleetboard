@@ -48,6 +48,16 @@ header {
 .brand { font-weight:600; white-space:nowrap; }
 .brand .prompt { color:var(--accent); }
 .brand .path { color:var(--cyan); }
+.nav .right { display:flex; align-items:center; gap:10px; }
+/* new mission lives in every header; the board owns the composer, so this is a
+   deep link into it rather than a second copy of the dispatch UI */
+#missionBtn {
+  font:inherit; font-size:var(--fs-sm); font-weight:600; color:var(--accent);
+  background:var(--bg-2); border:1px solid var(--accent); border-radius:7px;
+  padding:6px 13px; cursor:pointer; text-decoration:none; white-space:nowrap;
+  transition:all .15s var(--ease);
+}
+#missionBtn:hover { background:var(--accent); color:var(--bg); }
 .sync { color:var(--muted); font-size:var(--fs-xs); display:flex; align-items:center; gap:8px; }
 .sync .dot { width:8px; height:8px; border-radius:50%; background:var(--green); }
 
@@ -121,7 +131,9 @@ button:disabled { opacity:.5; cursor:wait; }
 <body>
 <header><div class="wrap nav">
   <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./orchestr --limits</div>
-  <div class="sync" id="sync"><span class="dot"></span><span id="syncText">loading…</span></div>
+  <div class="right">
+    <a id="missionBtn" href="/?mission">🚀 new mission</a>
+    <div class="sync" id="sync"><span class="dot"></span><span id="syncText">loading…</span></div></div>
 </div></header>
 
 <nav class="side">
