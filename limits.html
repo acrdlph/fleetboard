@@ -193,7 +193,7 @@ function render(d) {
         <input type="number" min="0" max="95" step="5" value="${rsv}"
           onchange="setReserve('${esc(a.fb_label || a.slug)}', this.value)" title="headroom % kept free from auto-dispatch">
         <span class="pct">%</span>
-        <span class="rsub">${rsv ? "auto-dispatch stops below " + rsv + "%" : "no buffer — auto-dispatch may use it fully"}</span>
+        <span class="rsub">${rsv ? "auto-dispatch stops at " + (100 - rsv) + "% of the weekly limit" : "auto-dispatch may use the full weekly limit"}</span>
       </div>
       <div class="lims">${rows}</div>
     </div>`;
