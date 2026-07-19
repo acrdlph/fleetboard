@@ -54,10 +54,13 @@ latest subagent report. Session statuses:
 The header names the **FREE worktrees** — no live process, nothing mid-turn —
 so "where do I point the next agent?" is answered before you ask.
 
-**Lost the window an agent runs in?** Every process chip shows its tty and
-hosting app (`⌖ 38627 ttys024 Terminal`); click it and that window jumps to
-the front (AppleScript for Terminal.app/iTerm2; editors get activated with a
-pointer to the tty; tmux agents get the attach command).
+**Lost the window an agent runs in?** Each session carries its own terminal
+chip with tty and hosting app (`⌖ 38627 ttys024 Terminal`); click it and that
+window jumps to the front (AppleScript for Terminal.app/iTerm2; editors get
+activated with a pointer to the tty; tmux agents get the attach command). The
+chip sits on the session row, not the card, so a worktree running three agents
+says which window is which — sessions are matched to processes by the account
+each one runs under. A dashed chip means the pairing fell back to a guess.
 
 **One door into the fleet — the 🚀 new mission button.** Instead of picking a
 worktree, checking which account has usage left, opening a terminal, and

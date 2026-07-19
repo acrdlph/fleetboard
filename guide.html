@@ -180,6 +180,11 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
   <p>The board refreshes every 5 s and sorts by attention. <b>✉ chat</b> shows
   the transcript and types straight into the agent's terminal — it is exactly
   as if you typed there yourself. <b>⌖ pid</b> jumps to the terminal window.
+  Both act on <i>that session's own</i> terminal: sessions are paired to
+  processes by the account each runs under (<code>CLAUDE_CONFIG_DIR</code>), so
+  a worktree with three agents keeps them straight. A dashed chip means no
+  process advertised that account and the pairing fell back to freshness — it
+  may be the wrong window. Terminals no session claims stay in the card header.
   On the map, a pulsing node is working; click any node for actions
   (<b>⌖ focus</b> · <b>✓ finish</b>).</p>
   <div class="callout"><b>gotcha:</b> the map's click-toast says “no live

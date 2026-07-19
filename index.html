@@ -143,6 +143,9 @@ header {
 }
 .pidbtn:hover { color:var(--fg); border-color:var(--accent); }
 .pidbtn .tt { color:var(--cyan); }
+/* pairing fell back to freshness — shown, but not asserted */
+.pidbtn.guess { border-style:dashed; opacity:.75; }
+.pidbtn.guess .tt { color:var(--muted); }
 #toast {
   position:fixed; right:18px; bottom:18px; z-index:50; max-width:440px;
   background:var(--surface-2); border:1px solid var(--accent); border-radius:9px;
@@ -345,6 +348,26 @@ header {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+// The terminal chip for one session. It sits on the session row rather than the
+// card head so a worktree running several agents says which window is which —
+// the pairing comes from the process's CLAUDE_CONFIG_DIR matching the session's
+// account. A fallback pairing (no account match) is marked as a guess.
+function procChip(p, { certain = true, title } = {}) {
+  return `<button class="pidbtn${certain ? "" : " guess"}" onclick="focusPid(${p.pid})"
+    title="${esc(title || "jump to this terminal")}">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button>`;
+}
+function sessProc(w, s) {
+  if (!s.pid) return "";
+  const p = w.live_procs.find(x => x.pid === s.pid);
+  if (!p) return "";
+  return procChip(p, {
+    certain: s.pid_certain,
+    title: s.pid_certain
+      ? `jump to this session's terminal — [${s.account}] on ${p.tty || p.host || "tmux"}`
+      : `best guess: no process advertises account [${s.account}] in this worktree`,
+  });
+}
+
 const STATUS = {
   working:     { glyph:"●", label:"WORKING" },
   needs_input: { glyph:"▲", label:"NEEDS ANSWER" },
@@ -407,6 +430,9 @@ function render(st) {
     const commit = g.commit ? `<span class="hash">${esc(g.commit.hash)}</span> · ${rel(Math.max(0, Math.floor(now - g.commit.ts)))} ago · ${esc(g.commit.subject)}` : "no commits";
     const showEnded = $("showEnded").checked;
     const sess = w.sessions.filter(s => showEnded || s.status !== "ended");
+    // pids the sessions below account for, so the card head only carries the
+    // leftovers rather than repeating every terminal in the worktree
+    const claimed = new Set(w.sessions.map(s => s.pid).filter(Boolean));
     const rows = sess.map(s => {
       const stt = { ...STATUS[s.status] };
       if (s.status === "limit" && s.limit)
@@ -424,7 +450,8 @@ function render(st) {
           ${s.subagents_active ? `<span class="subag">⚙ subagents running</span>`
             : s.pending_workflows ? `<span class="subag">⚙ awaiting ${s.pending_workflows} workflow${s.pending_workflows > 1 ? "s" : ""}</span>`
             : s.tool_running ? `<span class="subag">⚙ running: ${esc((s.pending_tools[0] || "tool"))}</span>` : ""}
-          <span style="margin-left:auto;display:flex;gap:6px">
+          <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+            ${sessProc(w, s)}
             ${s.status === "limit" && s.limit && s.limit.group === "session" && s.limit.resets_at
               ? `<button class="abtn resume" data-key="${esc(w.name)}|${esc(s.sid)}" data-until="${s.limit.resets_at}">▶ resume</button>` : ""}
             <button class="abtn" onclick="openChat('${esc(w.name)}|${esc(s.sid)}')">✉ chat</button>
@@ -443,9 +470,13 @@ function render(st) {
       <div class="card-head">
         <span class="badge ${w.availability}">${AVAIL[w.availability]}</span>
         <span class="name">${esc(w.name)}</span>
-        <span class="procs">${w.live_procs.length
-          ? w.live_procs.map(p => `<button class="pidbtn" onclick="focusPid(${p.pid})" title="jump to this terminal">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button>`).join("")
-          : `<span class="noproc">no live proc</span>`}
+        <span class="procs">${(() => {
+          // terminals no session claims — an agent whose transcript hasn't been
+          // written yet, or one running outside any tracked session
+          const loose = w.live_procs.filter(p => !claimed.has(p.pid));
+          if (loose.length) return loose.map(p => procChip(p, { title: "live terminal in this worktree — not tied to a session yet" })).join("");
+          return w.live_procs.length ? "" : `<span class="noproc">no live proc</span>`;
+        })()}
           <button class="abtn finish ${finArmed ? "armed" : ""}" data-wt="${esc(w.name)}"
             title="close out: agent lands the branch, terminal closes, card goes free">${finArmed ? "✓ confirm" : "✓ finish"}</button></span>
       </div>
@@ -514,17 +545,22 @@ function openChat(key) {
   $("dtitle").textContent = `${r.wt} · [${r.s.account}]`;
   $("dsub").textContent = r.s.topic || r.s.sid;
   const procs = reachableProcs(r.procs);
+  // this session's own terminal, matched by account server-side — without it a
+  // worktree running several agents would default to whichever process sorted
+  // first and type into the wrong one
+  const own = r.procs.find(p => p.pid === r.s.pid);
+  const target = (own && own.reachable) ? own : procs[0];
   $("dfoot").innerHTML = procs.length ? `
     ${r.procs.length > 1 ? `<select id="chatTarget">${r.procs.map(p =>
-      `<option value="${p.pid}" ${p.reachable ? "" : "disabled"}>⌖ ${p.pid} · ${esc(p.tty || "?")} · ${esc(p.host || "?")}${p.reachable ? "" : " (unreachable)"}</option>`).join("")}</select>` : ""}
+      `<option value="${p.pid}" ${p.reachable ? "" : "disabled"} ${target && p.pid === target.pid ? "selected" : ""}>⌖ ${p.pid} · ${esc(p.tty || "?")} · ${esc(p.host || "?")}${own && p.pid === own.pid ? " · this session" : ""}${p.reachable ? "" : " (unreachable)"}</option>`).join("")}</select>` : ""}
     <div class="row">
       <textarea id="chatText" placeholder="type an instruction for this agent…"></textarea>
       <button class="send" onclick="sendChat()">send</button>
     </div>
-    <div class="dnote">typed straight into the agent's terminal (${esc(procs[0].tty || "tmux")} · ${esc(procs[0].host || "tmux")})</div>`
+    <div class="dnote">typed straight into the agent's terminal (${esc((target || procs[0]).tty || "tmux")} · ${esc((target || procs[0]).host || "tmux")})${own && !r.s.pid_certain ? " — best guess, no account match" : ""}</div>`
     : `<div class="dnote"><b>read-only</b> — no scriptable live process for this worktree
        (Cursor/VS Code terminals can't be typed into; ended sessions have no terminal)</div>`;
-  if (procs.length === 1) window._chatPid = procs[0].pid;
+  window._chatPid = target ? target.pid : null;
   $("dbody").innerHTML = `<div class="dnote">loading transcript…</div>`;
   $("drawer").classList.remove("wide");
   $("drawer").classList.add("open");
@@ -608,8 +644,10 @@ document.addEventListener("click", async (ev) => {
   const r = REG[b.dataset.key];
   const procs = r ? reachableProcs(r.procs) : [];
   if (!procs.length) { toast("✗ no scriptable terminal for this worktree"); return; }
+  // resume the session's own terminal, not just the worktree's first one
+  const own = r.procs.find(p => p.pid === r.s.pid && p.reachable);
   toast("▶ sending continue…");
-  const res = await sendToPid(procs[0].pid, "continue");
+  const res = await sendToPid((own || procs[0]).pid, "continue");
   toast((res.ok ? "✓ resumed — " : "✗ ") + res.message);
 });
 setInterval(() => {

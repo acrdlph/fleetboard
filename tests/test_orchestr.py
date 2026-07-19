@@ -157,6 +157,60 @@ class TestClassifySession(unittest.TestCase):
         self.assertEqual(fb.classify_session(200, False, [], 0, False, self.W)[0], "ended")
 
 
+# ------------------------------------------------ session <-> terminal pairing
+
+class TestPairSessionsWithProcs(unittest.TestCase):
+    """Which terminal belongs to which chat, for a worktree running several."""
+
+    def _s(self, sid, account, age):
+        return {"sid": sid, "account": account, "age_s": age}
+
+    def _p(self, pid, account):
+        return {"pid": pid, "account": account}
+
+    def test_pairs_by_account(self):
+        sessions = [self._s("a", "work", 10), self._s("b", "personal", 20)]
+        procs = [self._p(1, "personal"), self._p(2, "work")]
+        owner = fb.pair_sessions_with_procs(sessions, procs)
+        self.assertEqual(owner["a"]["pid"], 2)
+        self.assertEqual(owner["b"]["pid"], 1)
+
+    def test_account_match_beats_freshness(self):
+        # the fresher session has no process on its account; it must not take
+        # the one that demonstrably belongs to the older session
+        sessions = [self._s("fresh", "spare", 5), self._s("old", "work", 900)]
+        procs = [self._p(7, "work")]
+        owner = fb.pair_sessions_with_procs(sessions, procs)
+        self.assertNotIn("fresh", owner)
+        self.assertEqual(owner["old"]["pid"], 7)
+
+    def test_falls_back_to_freshness_when_account_unknown(self):
+        # environment unreadable -> accounts are None -> old slot behaviour
+        sessions = [self._s("a", "work", 10), self._s("b", "work", 20)]
+        procs = [self._p(1, None)]
+        owner = fb.pair_sessions_with_procs(sessions, procs)
+        self.assertEqual(owner["a"]["pid"], 1)
+        self.assertNotIn("b", owner)
+
+    def test_never_assigns_one_process_twice(self):
+        sessions = [self._s("a", "work", 10), self._s("b", "work", 20)]
+        procs = [self._p(1, "work")]
+        owner = fb.pair_sessions_with_procs(sessions, procs)
+        self.assertEqual(len(owner), 1)
+        self.assertEqual({o["pid"] for o in owner.values()}, {1})
+
+    def test_more_procs_than_sessions_leaves_leftovers(self):
+        sessions = [self._s("a", "work", 10)]
+        procs = [self._p(1, "work"), self._p(2, "spare")]
+        owner = fb.pair_sessions_with_procs(sessions, procs)
+        self.assertEqual(owner["a"]["pid"], 1)
+        self.assertEqual(len(owner), 1)
+
+    def test_no_procs_pairs_nothing(self):
+        sessions = [self._s("a", "work", 10)]
+        self.assertEqual(fb.pair_sessions_with_procs(sessions, []), {})
+
+
 # ----------------------------------------------------------- model headroom
 
 class TestModelHeadroom(ConfigGuard):
