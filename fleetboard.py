@@ -956,7 +956,21 @@ def focus_process(pid):
     tty, host, kind = proc["tty"], proc["host"], proc["host_kind"]
     where = f"pid {pid}" + (f" · {tty}" if tty else "")
     if kind == "tmux":
-        return {"ok": True, "message": f"{where} runs inside tmux — attach with:  {host} attach"}
+        # Open a real Terminal window attached to the session (read-write —
+        # you can type in it directly). Detach later with Ctrl-b d.
+        sock = proc.get("tmux_sock")
+        session = (proc.get("tmux_target") or "").split(":", 1)[0]
+        if not session:
+            return {"ok": False, "message": f"{where}: couldn't resolve tmux session"}
+        attach = "tmux" + (f" -L {shlex.quote(sock)}" if sock else "") + \
+                 f" attach -t {shlex.quote(session)}"
+        script = ('tell application "Terminal"\n  do script "%s"\n  activate\nend tell'
+                  % _osa_escape(attach))
+        rc, _ = run(["osascript", "-e", script], timeout=8)
+        if rc == 0:
+            return {"ok": True, "message": f"opened Terminal attached to {session} (Ctrl-b d to detach)"}
+        return {"ok": False, "message":
+                f"couldn't open Terminal — grant Automation permission, or run:  {attach}"}
     if host in ("Terminal", "iTerm2") and tty:
         script = (_FOCUS_TERMINAL if host == "Terminal" else _FOCUS_ITERM) % f"/dev/{tty}"
         rc, out = run(["osascript", "-e", script], timeout=8)
@@ -1086,6 +1100,30 @@ def read_chat(account, sid, limit=40):
 # --------------------------------------------------------------- dispatch
 
 FLEET_SOCK = "fleet"
+DISPATCH_LOG = HERE / "dispatch.log.jsonl"
+
+
+def read_dispatch_log(limit=25):
+    """Recent dispatches, newest first, each annotated with whether its tmux
+    session is still alive."""
+    if not DISPATCH_LOG.exists():
+        return {"entries": []}
+    rows = []
+    try:
+        for line in DISPATCH_LOG.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError:
+        return {"entries": []}
+    live = set()
+    rc, out = run(["tmux", "-L", FLEET_SOCK, "list-sessions", "-F", "#{session_name}"])
+    if rc == 0:
+        live = set(out.splitlines())
+    for r in rows:
+        r["alive"] = r.get("session") in live
+    return {"entries": rows[-limit:][::-1]}
 
 
 def _pick_defaults(mission):
@@ -1262,6 +1300,9 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "application/json"
         elif self.path.startswith("/api/limits"):
             body = json.dumps(cached_limits(refresh="refresh=1" in self.path)).encode()
+            ctype = "application/json"
+        elif self.path.startswith("/api/dispatchlog"):
+            body = json.dumps(read_dispatch_log()).encode()
             ctype = "application/json"
         elif self.path.startswith("/api/chat"):
             qa = re.search(r"account=([^&]+)", self.path)
