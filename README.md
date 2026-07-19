@@ -214,6 +214,23 @@ accounts via `CLAUDE_CONFIG_DIR`.
 - **Terminal actuation** — tmux targets are resolved by walking process
   ancestry to the owning pane; Terminal.app/iTerm2 tabs are matched by tty.
 
+## Tests
+
+Pure stdlib `unittest`, zero dependencies — same as the app:
+
+```bash
+python3 -m unittest discover -s tests     # from the repo root
+```
+
+Covers the logic that's easy to get wrong: transcript text cleaning and the
+real-vs-machine prompt filter, account labelling, longest-prefix worktree
+matching, session-status classification (working / needs-input / limit /
+blocked / your-turn / ended), per-model headroom + reserve buffers, the
+reserve-persist round-trip, dispatch-log parsing, and an HTTP smoke test that
+boots the real server in `--demo` mode (no subprocess) and hits every
+endpoint. Filesystem/process/network code stays out of the unit tests by
+design — it's exercised through demo mode.
+
 ## Security & spending
 
 - **The board serves your prompts and your agents' replies.** It binds to

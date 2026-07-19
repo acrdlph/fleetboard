@@ -431,26 +431,48 @@ def parse_session_tail(fp):
     return out
 
 
+def match_worktree(proj_name, wt_prefixes):
+    """Map a munged project-dir name to a worktree path by the LONGEST matching
+    prefix, so 'myapp' doesn't swallow 'myapp-audit'. Returns None if none match.
+    `wt_prefixes` is {worktree_path: munged_prefix}."""
+    best = None
+    for path, pref in wt_prefixes.items():
+        if proj_name == pref or proj_name.startswith(pref + "-"):
+            if best is None or len(pref) > len(wt_prefixes[best]):
+                best = path
+    return best
+
+
+def classify_session(age_s, alive, pending_tools, pending_workflows,
+                     skip_perms, working_s):
+    """Base session status from observable signals (before limit/handoff
+    overrides). Returns (status, tool_running)."""
+    pend = pending_tools or []
+    if age_s < working_s:
+        return "working", False
+    if alive and "AskUserQuestion" in pend:
+        return "needs_input", False
+    if alive and pending_workflows:          # delegated to its own workflows
+        return "working", False
+    if alive and pend and skip_perms:        # long tool run, nothing to approve
+        return "working", True
+    if alive and pend:
+        return "blocked", False
+    if alive:
+        return "waiting", False
+    return "ended", False
+
+
 def scan_sessions(worktrees, procs, now):
     """All recent sessions across every Claude home, mapped to worktrees."""
     by_wt = {w["path"]: [] for w in worktrees}
     wt_prefixes = {w["path"]: munge(w["path"]) for w in worktrees}
     window_s = CFG["session_window_h"] * 3600
 
-    def best_worktree(proj_name):
-        # Munged names are ambiguous (myapp vs myapp-audit):
-        # the longest matching worktree prefix wins.
-        best = None
-        for path, pref in wt_prefixes.items():
-            if proj_name == pref or proj_name.startswith(pref + "-"):
-                if best is None or len(pref) > len(wt_prefixes[best]):
-                    best = path
-        return best
-
     for home in claude_homes():
         acct = account_label(home)
         for proj in (home / "projects").iterdir():
-            wt = best_worktree(proj.name)
+            wt = match_worktree(proj.name, wt_prefixes)
             if wt is None:
                 continue
             for fp in proj.glob("*.jsonl"):
@@ -518,23 +540,12 @@ def scan_sessions(worktrees, procs, now):
             alive = slots_left > 0
             if alive:
                 slots_left -= 1
-            pend = s["pending_tools"]
-            if s["age_s"] < CFG["working_s"]:
-                status = "working"
-            elif alive and "AskUserQuestion" in pend:
-                status = "needs_input"
-            elif alive and s["pending_workflows"]:
-                status = "working"   # delegated — waiting on its own workflows
-            elif alive and pend and skip_perms:
-                status = "working"   # long tool run, nothing to approve
-                s["tool_running"] = True
-            elif alive and pend:
-                status = "blocked"
-            elif alive:
-                status = "waiting"
-            else:
-                status = "ended"
+            status, tool_running = classify_session(
+                s["age_s"], alive, s["pending_tools"], s["pending_workflows"],
+                skip_perms, CFG["working_s"])
             s["status"] = status
+            if tool_running:
+                s["tool_running"] = True
         sessions.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
         by_wt[wt] = sessions[: CFG["max_sessions"]]
     return by_wt
