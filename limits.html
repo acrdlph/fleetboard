@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>fleetboard — limits</title>
+<title>orchestr — limits</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2224%22 fill=%22%230d0d0d%22/><text x=%2250%22 y=%2272%22 font-size=%2260%22 text-anchor=%22middle%22 fill=%22%23d97757%22 font-family=%22monospace%22>⌁</text></svg>" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -120,7 +120,7 @@ button:disabled { opacity:.5; cursor:wait; }
 </head>
 <body>
 <header><div class="wrap nav">
-  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./fleetboard --limits</div>
+  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./orchestr --limits</div>
   <div class="sync" id="sync"><span class="dot"></span><span id="syncText">loading…</span></div>
 </div></header>
 
@@ -162,9 +162,9 @@ function shade(remaining) {
 function render(d) {
   if (!d || !d.available) {
     $("out").innerHTML = `<div class="err">◔ limits unavailable — ${esc(d && d.error || "no data")}.<br>
-      fleetboard shells out to <b>cclimits</b> for this view; install it from
+      orchestr shells out to <b>cclimits</b> for this view; install it from
       github.com/acrdlph/cclimits and make sure it's on PATH (or set
-      <b>"cclimits_cmd"</b> in fleetboard.config.json).</div>`;
+      <b>"cclimits_cmd"</b> in orchestr.config.json).</div>`;
     $("fetched").textContent = "";
     return;
   }

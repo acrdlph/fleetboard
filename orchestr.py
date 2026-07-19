@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fleetboard — local mission control for parallel Claude Code agents.
+"""orchestr — local mission control for parallel Claude Code agents.
 
 Watches your git worktrees, your Claude Code home directories (multi-account
 setups included), and live `claude` processes; serves three views on
@@ -16,10 +16,10 @@ and finish hands a closeout brief to an agent that merges and pushes; the
 board never runs git write commands itself. Zero dependencies — python3
 stdlib only.
 
-    python3 fleetboard.py --root ~/code
-    python3 fleetboard.py --demo          # fictional data, for screenshots
+    python3 orchestr.py --root ~/code
+    python3 orchestr.py --demo          # fictional data, for screenshots
 
-Configuration precedence: CLI flags > fleetboard.config.json (next to this
+Configuration precedence: CLI flags > orchestr.config.json (next to this
 script, else cwd) > defaults. See README.md.
 """
 
@@ -69,28 +69,28 @@ def load_config(argv=None):
     ap.add_argument("--pattern", metavar="REGEX", help="only watch dirs matching this regex (case-insensitive)")
     ap.add_argument("--home", action="append", metavar="DIR",
                     help="Claude home dir (repeatable; default: auto-discover ~/.claude*)")
-    ap.add_argument("--port", type=int, help="port (default 4242, env FLEETBOARD_PORT)")
+    ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTR_PORT)")
     ap.add_argument("--host", help="bind address (default 127.0.0.1 — the board serves your transcript text; do not expose it)")
     ap.add_argument("--window-h", type=float, help="ignore transcripts idle longer than this many hours (default 48)")
-    ap.add_argument("--config", metavar="FILE", help="path to a fleetboard.config.json")
+    ap.add_argument("--config", metavar="FILE", help="path to a orchestr.config.json")
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)
 
     global CONFIG_PATH
     candidates = [Path(args.config)] if args.config else [
-        HERE / "fleetboard.config.json", Path.cwd() / "fleetboard.config.json"]
+        HERE / "orchestr.config.json", Path.cwd() / "orchestr.config.json"]
     for p in candidates:
         if p.is_file():
             try:
                 CFG.update(json.loads(p.read_text()))
             except (ValueError, OSError) as e:
-                sys.exit(f"fleetboard: bad config {p}: {e}")
+                sys.exit(f"orchestr: bad config {p}: {e}")
             CONFIG_PATH = p
             break
     if CONFIG_PATH is None:  # where a UI edit will create/persist config
-        CONFIG_PATH = Path(args.config) if args.config else HERE / "fleetboard.config.json"
-    if os.environ.get("FLEETBOARD_PORT"):
-        CFG["port"] = int(os.environ["FLEETBOARD_PORT"])
+        CONFIG_PATH = Path(args.config) if args.config else HERE / "orchestr.config.json"
+    if os.environ.get("ORCHESTR_PORT"):
+        CFG["port"] = int(os.environ["ORCHESTR_PORT"])
     if args.root: CFG["roots"] = args.root
     if args.pattern is not None: CFG["pattern"] = args.pattern
     if args.home: CFG["homes"] = args.home
@@ -883,7 +883,7 @@ def cached_limits(refresh=False):
         if acc.get("config_dir"):
             label = account_label(Path(acc["config_dir"]))
             r = account_reserve(label)
-            acc["fb_label"] = label   # fleetboard's label (cclimits slug may differ)
+            acc["fb_label"] = label   # orchestr's label (cclimits slug may differ)
             acc["reserve_percent"] = r
             acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
     _limits["data"], _limits["t"] = data, now
@@ -1708,11 +1708,11 @@ if __name__ == "__main__":
     args = load_config()
     DEMO = args.demo
     if CFG["host"] not in ("127.0.0.1", "localhost", "::1"):
-        print("fleetboard: WARNING — binding beyond loopback serves your "
+        print("orchestr: WARNING — binding beyond loopback serves your "
               "transcript text to the network", file=sys.stderr)
     server = ThreadingHTTPServer((CFG["host"], CFG["port"]), Handler)
     mode = " (demo data)" if DEMO else ""
-    print(f"fleetboard up → http://{CFG['host']}:{CFG['port']}{mode}")
+    print(f"orchestr up → http://{CFG['host']}:{CFG['port']}{mode}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

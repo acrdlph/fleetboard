@@ -1,17 +1,17 @@
-# fleetboard ⌁
+# orchestr ⌁
 
-[![CI](https://github.com/acrdlph/fleetboard/actions/workflows/ci.yml/badge.svg)](https://github.com/acrdlph/fleetboard/actions/workflows/ci.yml)
+[![CI](https://github.com/acrdlph/orchestr/actions/workflows/ci.yml/badge.svg)](https://github.com/acrdlph/orchestr/actions/workflows/ci.yml)
 
 **Mission control for parallel Claude Code agents — watch every worktree and
 account on one board, chat with any agent, dispatch new missions, and land
 finished ones.**
 
-![fleetboard](docs/social-preview-v2.png)
+![orchestr](docs/social-preview-v2.png)
 
 You're running Claude Code agents in five worktrees at once, across several
 accounts. Which agent is working? Which one is waiting for an answer? Which
 one silently hit a usage limit an hour ago? Which worktree is free for the
-next feature — and on which account? fleetboard answers all of it on one dark
+next feature — and on which account? orchestr answers all of it on one dark
 board, and (when you click) acts on it too.
 
 It's an agent **harness** with a hard line down the middle: **watching only
@@ -21,11 +21,11 @@ click, and always by talking to a terminal, never behind your back. Zero
 dependencies — one python3 stdlib file.
 
 ```bash
-git clone https://github.com/acrdlph/fleetboard && cd fleetboard
-python3 fleetboard.py --root ~/code        # → http://127.0.0.1:4242
+git clone https://github.com/acrdlph/orchestr && cd orchestr
+python3 orchestr.py --root ~/code        # → http://127.0.0.1:4242
 ```
 
-Try it with nothing running: `python3 fleetboard.py --demo` serves fictional
+Try it with nothing running: `python3 orchestr.py --demo` serves fictional
 data.
 
 ---
@@ -38,7 +38,7 @@ A left rail navigates between them; all share one visual language:
 
 ### ⌗ Board — who needs me, and where can I put the next agent?
 
-![the fleetboard dashboard](docs/screenshot.png)
+![the orchestr dashboard](docs/screenshot.png)
 
 One card per worktree, attention-sorted, refreshed every 5 s. Each card:
 branch, dirty count, ahead/behind, last commit, live processes, and every
@@ -65,7 +65,7 @@ pointer to the tty; tmux agents get the attach command).
 
 **One door into the fleet — the 🚀 new mission button.** Instead of picking a
 worktree, checking which account has usage left, opening a terminal, and
-choosing a model by hand, you type what to build and fleetboard routes it:
+choosing a model by hand, you type what to build and orchestr routes it:
 
 ![mission dispatch flow](docs/mission-flow.png)
 
@@ -115,7 +115,7 @@ refetch". Nothing polls the Anthropic API on a timer.
   closeout brief (land the branch, tidy up, report), a missing one is
   replaced by a freshly dispatched closeout agent, and an idle agent whose
   work already landed just gets `/exit`. See *Closing out a mission* below.
-- **🚀 new mission** — describe a feature; fleetboard picks the cleanest free
+- **🚀 new mission** — describe a feature; orchestr picks the cleanest free
   worktree and the most-headroom account (or a one-shot
   `claude -p --model haiku` router picks them, plus a branch name), then
   launches a tmux-hosted agent: `tmux -L fleet attach -t mission-…` from any
@@ -144,7 +144,7 @@ The pattern that makes a multi-account fleet work:
 ![one branch, three accounts, zero downtime](docs/orchestration.png)
 
 An agent burns its account down, writes a handoff doc (drop to a cheaper model
-for that), and an agent on a different account picks the branch up. fleetboard
+for that), and an agent on a different account picks the branch up. orchestr
 understands the succession: a limit-hit session with a fresher live session in
 its worktree is annotated **"↳ work continued by [account] — this terminal can
 be closed"**, leaves the need-you counts, and stops speaking for the branch on
@@ -154,7 +154,7 @@ the map. Only a stranded agent with *no* successor keeps demanding attention.
 
 One button: **✓ finish**, on every worktree card and in a map node's panel.
 It arms on the first click, runs on the second, and — like everything
-fleetboard does — works by talking to a terminal:
+orchestr does — works by talking to a terminal:
 
 ![one button lands it](docs/finish-flow.png)
 
@@ -185,7 +185,7 @@ that, with `/proc`-based process detection. Optional: `tmux` (dispatch),
 `claude` on PATH (dispatch router).
 
 ```bash
-python3 fleetboard.py [--root DIR]... [--pattern REGEX] [--home DIR]...
+python3 orchestr.py [--root DIR]... [--pattern REGEX] [--home DIR]...
                       [--port N] [--window-h H] [--demo]
 ./start.sh            # restart + open browser (extra args passed through)
 ```
@@ -195,11 +195,11 @@ python3 fleetboard.py [--root DIR]... [--pattern REGEX] [--home DIR]...
 | `--root DIR` | cwd | directory whose git-repo children are watched (repeatable) |
 | `--pattern REGEX` | all | only watch child dirs matching this (case-insensitive) |
 | `--home DIR` | auto | Claude home dirs; default finds `~/.claude*` |
-| `--port N` | 4242 | also `FLEETBOARD_PORT` env |
+| `--port N` | 4242 | also `ORCHESTR_PORT` env |
 | `--window-h H` | 48 | ignore transcripts idle longer than this many hours |
 | `--demo` | — | fictional data (screenshots, kicking the tires) |
 
-Persistent settings go in `fleetboard.config.json` next to the script
+Persistent settings go in `orchestr.config.json` next to the script
 (gitignored):
 
 ```json
@@ -237,7 +237,7 @@ accounts via `CLAUDE_CONFIG_DIR`.
   with slash-command stubs, ANSI noise, and harness chatter filtered out.
 - **Subagents & workflows** — a session running a Workflow writes to
   `<session-id>/**/*.jsonl` while its main transcript sits untouched;
-  fleetboard counts that activity toward liveness (⚙ indicator) and surfaces
+  orchestr counts that activity toward liveness (⚙ indicator) and surfaces
   the newest subagent report, so multi-agent sessions never misreport as idle.
 - **Liveness** — `ps` for `claude` processes, cwds via one `lsof` call
   (macOS/BSD) or `/proc/<pid>/cwd` (Linux). N live processes under a worktree
@@ -256,7 +256,7 @@ Pure stdlib `unittest`, zero dependencies — same as the app:
 python3 -m unittest discover -s tests     # from the repo root
 ```
 
-**Unit tests** (`tests/test_fleetboard.py`) cover the logic that's easy to get
+**Unit tests** (`tests/test_orchestr.py`) cover the logic that's easy to get
 wrong: transcript text cleaning and the real-vs-machine prompt filter, account
 labelling, longest-prefix worktree matching, session-status classification
 (working / needs-input / limit / blocked / your-turn / ended), per-model

@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
 
       - name: Byte-compile
-        run: python -m py_compile fleetboard.py
+        run: python -m py_compile orchestr.py
 
       - name: Run tests
         run: python -m unittest discover -s tests -v

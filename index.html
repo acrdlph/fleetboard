@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>fleetboard</title>
+<title>orchestr</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2224%22 fill=%22%230d0d0d%22/><text x=%2250%22 y=%2272%22 font-size=%2260%22 text-anchor=%22middle%22 fill=%22%23d97757%22 font-family=%22monospace%22>⌁</text></svg>" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
 <style>
-/* ==== fleetboard type system =================================
+/* ==== orchestr type system =================================
    One typeface — IBM Plex Mono — but still two voices:
      --mono  the machine voice: identifiers, paths, counts, statuses,
              timestamps, buttons (they're commands). The default.
@@ -294,7 +294,7 @@ header {
 </head>
 <body>
 <header><div class="wrap nav">
-  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> <span class="cmd">./fleetboard --watch</span></div>
+  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> <span class="cmd">./orchestr --watch</span></div>
   <div class="navr">
   <button id="missionBtn" onclick="openMission()">🚀 new mission</button>
   <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div></div>
@@ -372,7 +372,7 @@ function render(st) {
   const c = st.counts;
   const attn = c.needs_input + c.blocked + c.waiting + (c.limit || 0);
   maybeBell(attn);
-  document.title = attn > 0 ? `(${attn}!) fleetboard` : "fleetboard";
+  document.title = attn > 0 ? `(${attn}!) orchestr` : "orchestr";
 
   const freeNames = st.free_worktrees || [];
   $("tiles").innerHTML = `

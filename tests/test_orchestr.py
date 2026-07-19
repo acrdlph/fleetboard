@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""fleetboard test suite — pure stdlib unittest, zero dependencies.
+"""orchestr test suite — pure stdlib unittest, zero dependencies.
 
     python3 -m unittest discover -s tests        # from repo root
-    python3 tests/test_fleetboard.py             # or run directly
+    python3 tests/test_orchestr.py             # or run directly
 
-fleetboard.py is a script (guarded by `if __name__ == "__main__"`), so importing
+orchestr.py is a script (guarded by `if __name__ == "__main__"`), so importing
 it here does NOT start the server. Data-driven functions read module globals
 (CFG, _limits, DEMO); tests set those and restore them.
 """
@@ -18,9 +18,9 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-# ---- load fleetboard.py by path (it's a script, not a package) --------------
+# ---- load orchestr.py by path (it's a script, not a package) --------------
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("fleetboard", ROOT / "fleetboard.py")
+_spec = importlib.util.spec_from_file_location("orchestr", ROOT / "orchestr.py")
 fb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fb)
 
@@ -343,7 +343,7 @@ class TestHTTPSmoke(ConfigGuard):
     def test_index_served(self):
         status, body = self._get("/")
         self.assertEqual(status, 200)
-        self.assertIn(b"fleetboard", body)
+        self.assertIn(b"orchestr", body)
 
     def test_query_string_route(self):
         status, _ = self._get("/?mission=hello")   # must not 404
