@@ -157,8 +157,16 @@ Persistent settings go in `fleetboard.config.json` next to the script
 (gitignored):
 
 ```json
-{ "roots": ["/Users/you/code"], "pattern": "myproject", "cclimits_cmd": null }
+{ "roots": ["/Users/you/code"], "pattern": "myproject", "cclimits_cmd": null,
+  "exclude_accounts": [], "router_home": null }
 ```
+
+`exclude_accounts` names accounts (by label) that dispatch/router will never
+**auto**-pick — useful for keeping a primary account (e.g. `main` = `~/.claude`)
+out of automated launches so a stale token there can't hijack a browser login.
+`router_home` pins the one-shot haiku router to a single known-good Claude home
+instead of rotating across accounts. Manual selection can still target any
+account.
 
 Worktrees are discovered as immediate children of each root that are git
 repositories (a `<dir>/repo` layout is also recognized).

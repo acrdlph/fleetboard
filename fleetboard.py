@@ -46,6 +46,8 @@ CFG = {
     "session_window_h": 48,    # ignore transcripts idle longer than this
     "working_s": 90,           # transcript written within this => working
     "max_sessions": 6,         # per worktree card
+    "exclude_accounts": [],    # account labels never AUTO-picked for dispatch/router
+    "router_home": None,       # fixed Claude home for the haiku router (else auto)
 }
 
 TAIL_BYTES = 128 * 1024
@@ -1134,7 +1136,8 @@ def _pick_defaults(mission):
     free = [w for w in state["worktrees"] if w["availability"] == "free"]
     free.sort(key=lambda w: (w["git"]["dirty"] or 0))
     wt = free[0]["name"] if free else None
-    accounts = [(a, d) for a, d in limits.items() if not d["exhausted"]]
+    excl = set(CFG.get("exclude_accounts") or [])
+    accounts = [(a, d) for a, d in limits.items() if not d["exhausted"] and a not in excl]
     accounts.sort(key=lambda x: -(x[1]["headroom"] or 0))
     acct = accounts[0][0] if accounts else None
     return wt, acct
@@ -1157,11 +1160,20 @@ def _route_with_claude(mission, on_text=None):
                       "exhausted_limits": ex_map.get(a, [])}
                      for a, d in limits.items()],
     }
+    # The router runs `claude -p` under some account's config dir. Never let it
+    # touch an excluded account (e.g. ~/.claude) — a stale token there could
+    # hijack a browser session. A fixed router_home removes the rotation risk.
     router_home = None
-    ok_accounts = sorted((d["headroom"] or 0, a) for a, d in limits.items() if not d["exhausted"])
-    if ok_accounts:
-        router_home = next((h for h in claude_homes()
-                            if account_label(h) == ok_accounts[-1][1]), None)
+    if CFG.get("router_home"):
+        rh = Path(CFG["router_home"]).expanduser()
+        router_home = rh if (rh / "projects").is_dir() else None
+    if router_home is None:
+        excl = set(CFG.get("exclude_accounts") or [])
+        ok_accounts = sorted((d["headroom"] or 0, a) for a, d in limits.items()
+                             if not d["exhausted"] and a not in excl)
+        if ok_accounts:
+            router_home = next((h for h in claude_homes()
+                                if account_label(h) == ok_accounts[-1][1]), None)
     prompt = (
         "You route work across git worktrees and Claude accounts. You do NOT "
         "rewrite the mission — the author's text is passed to the agent "
