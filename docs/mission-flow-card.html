@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>fleetboard mission flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --bg:#0d0d0d; --bg-2:#111111; --surface:#161616; --surface-2:#1c1c1c;
+  --border:#2a2a2a; --border-2:#3a3a3a;
+  --fg:#e8e6e3; --muted:#8a8784; --muted-2:#6a6764;
+  --accent:#d97757; --accent-2:#e8a87c; --green:#87b386; --cyan:#7fb3c8; --yellow:#d4b06a;
+  --accent-glow:rgba(217,119,87,.25);
+  --mono:"JetBrains Mono", ui-monospace, Menlo, monospace;
+  --sans:"Inter", ui-sans-serif, system-ui, sans-serif;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html,body { width:1400px; height:560px; overflow:hidden; }
+body {
+  font-family:var(--sans); color:var(--fg);
+  background:
+    radial-gradient(1000px 480px at 85% -8%, rgba(217,119,87,.10), transparent 60%),
+    var(--bg);
+  position:relative; padding:44px 52px;
+}
+body::before {
+  content:""; position:absolute; inset:0;
+  background-image:radial-gradient(rgba(232,230,227,.045) 1px, transparent 1px);
+  background-size:26px 26px;
+  mask-image:linear-gradient(180deg, transparent 10%, black 55%);
+  -webkit-mask-image:linear-gradient(180deg, transparent 10%, black 55%);
+}
+.head { position:relative; z-index:2; margin-bottom:30px; }
+.prompt { font-family:var(--mono); font-size:15px; color:var(--muted); }
+.prompt .u { color:var(--accent); font-weight:700; } .prompt .p { color:var(--cyan); }
+h1 { font-size:33px; font-weight:800; letter-spacing:-0.02em; margin-top:12px; }
+h1 .a { color:var(--accent); }
+.lead { color:var(--muted); font-size:16px; margin-top:8px; max-width:900px; line-height:1.5; }
+.lead b { color:var(--fg); font-weight:700; }
+
+.flow { position:relative; z-index:2; display:flex; align-items:stretch; gap:0; margin-top:34px; }
+.step { flex:1; background:var(--surface); border:1.5px solid var(--border); border-radius:13px;
+  padding:16px 17px; position:relative; box-shadow:0 14px 34px rgba(0,0,0,.4); }
+.step.you  { border-color:var(--border-2); }
+.step.route{ border-color:var(--accent); box-shadow:0 0 0 1px var(--accent-glow), 0 14px 34px rgba(0,0,0,.4); }
+.step.run  { border-color:var(--border-2); }
+.step.board{ border-color:var(--green); }
+.step .n { font-family:var(--mono); font-size:12px; font-weight:800; color:var(--muted-2); letter-spacing:.12em; }
+.step .t { font-size:16px; font-weight:800; margin-top:7px; }
+.step .t .ic { margin-right:6px; }
+.step .d { color:var(--muted); font-size:13px; line-height:1.5; margin-top:8px; }
+.step .d b { color:var(--fg); font-weight:600; }
+.chiprow { display:flex; flex-wrap:wrap; gap:6px; margin-top:11px; }
+.chip { font-family:var(--mono); font-size:11px; font-weight:700; border:1px solid; border-radius:5px; padding:3px 7px; }
+.chip.cy { color:var(--cyan); border-color:var(--cyan); }
+.chip.gn { color:var(--green); border-color:var(--green); }
+.chip.am { color:var(--accent-2); border-color:var(--accent-2); }
+.chip.yl { color:var(--yellow); border-color:var(--yellow); }
+.arrow { display:flex; align-items:center; justify-content:center; width:52px; color:var(--accent);
+  font-family:var(--mono); font-size:26px; font-weight:800; flex-shrink:0; }
+.verbatim { position:relative; z-index:2; margin-top:22px; text-align:center; color:var(--muted-2);
+  font-size:13px; font-family:var(--mono); }
+.verbatim b { color:var(--accent-2); }
+</style>
+</head>
+<body>
+  <div class="head">
+    <div class="prompt"><span class="u">you@fleet</span><span class="p">:~</span><span class="u">$</span> ./fleetboard — one door into the whole fleet</div>
+    <h1>Type what to build. <span class="a">fleetboard routes it.</span></h1>
+    <div class="lead">No more picking a worktree, checking which account has usage left, opening a terminal, and choosing a model by hand — the <b>🚀 new mission</b> box does all of it.</div>
+  </div>
+
+  <div class="flow">
+    <div class="step you">
+      <div class="n">① YOU</div>
+      <div class="t"><span class="ic">🚀</span>describe the mission</div>
+      <div class="d">One text box. Write the feature or task in your own words — that's the whole input.</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="step route">
+      <div class="n">② ROUTER · claude haiku, one call</div>
+      <div class="t">picks where it runs</div>
+      <div class="d">Reads live fleet state — free worktrees, per-account headroom &amp; reserves — and chooses:</div>
+      <div class="chiprow">
+        <span class="chip cy">worktree</span><span class="chip cy">account</span>
+        <span class="chip gn">model</span><span class="chip am">effort</span><span class="chip yl">branch</span>
+      </div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="step run">
+      <div class="n">③ LAUNCH · tmux</div>
+      <div class="t">agent starts working</div>
+      <div class="d">A <b>tmux-hosted</b> agent boots on the chosen account, gets the branch + kickoff, and begins — attachable from any terminal.</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="step board">
+      <div class="n">④ BOARD</div>
+      <div class="t">watch · chat · steer</div>
+      <div class="d">It appears as a card like any other agent. Chat with it, resume it when limits reset, jump to its terminal.</div>
+    </div>
+  </div>
+
+  <div class="verbatim">your mission text reaches the agent <b>verbatim</b> — the router only decides routing, it never rewrites what you wrote</div>
+</body>
+</html>

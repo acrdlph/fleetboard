@@ -56,6 +56,7 @@ HEAD_BYTES = 16 * 1024
 STATE_TTL_S = 4.0              # cache collector output between requests
 _cache = {"t": 0.0, "state": None}
 DEMO = False
+CONFIG_PATH = None             # the config file in effect (for live edits)
 
 
 def load_config(argv=None):
@@ -72,6 +73,7 @@ def load_config(argv=None):
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)
 
+    global CONFIG_PATH
     candidates = [Path(args.config)] if args.config else [
         HERE / "fleetboard.config.json", Path.cwd() / "fleetboard.config.json"]
     for p in candidates:
@@ -80,7 +82,10 @@ def load_config(argv=None):
                 CFG.update(json.loads(p.read_text()))
             except (ValueError, OSError) as e:
                 sys.exit(f"fleetboard: bad config {p}: {e}")
+            CONFIG_PATH = p
             break
+    if CONFIG_PATH is None:  # where a UI edit will create/persist config
+        CONFIG_PATH = Path(args.config) if args.config else HERE / "fleetboard.config.json"
     if os.environ.get("FLEETBOARD_PORT"):
         CFG["port"] = int(os.environ["FLEETBOARD_PORT"])
     if args.root: CFG["roots"] = args.root
@@ -862,7 +867,9 @@ def cached_limits(refresh=False):
     data["fetched_at"] = now
     for acc in data.get("accounts", []):
         if acc.get("config_dir"):
-            r = account_reserve(account_label(Path(acc["config_dir"])))
+            label = account_label(Path(acc["config_dir"]))
+            r = account_reserve(label)
+            acc["fb_label"] = label   # fleetboard's label (cclimits slug may differ)
             acc["reserve_percent"] = r
             acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
     _limits["data"], _limits["t"] = data, now
@@ -876,6 +883,41 @@ def account_reserve(label):
     if not isinstance(rp, dict):
         return 0
     return rp.get(label, rp.get("*", 0)) or 0
+
+
+def set_reserve(label, percent):
+    """Set an account's reserve buffer from the UI: update CFG, persist to the
+    config file, and re-apply to the cached limits so it takes effect at once."""
+    if not label:
+        return {"ok": False, "error": "no account"}
+    try:
+        percent = max(0, min(95, int(percent)))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "percent must be a number"}
+    rp = dict(CFG.get("reserve_percent") or {})
+    if percent == 0:
+        rp.pop(label, None)
+    else:
+        rp[label] = percent
+    CFG["reserve_percent"] = rp
+    # persist: merge into the on-disk config (create if missing)
+    try:
+        disk = {}
+        if CONFIG_PATH and CONFIG_PATH.is_file():
+            disk = json.loads(CONFIG_PATH.read_text())
+        disk["reserve_percent"] = rp
+        CONFIG_PATH.write_text(json.dumps(disk, indent=2) + "\n")
+    except (OSError, ValueError) as e:
+        return {"ok": False, "error": f"couldn't write config: {e}"}
+    # re-enrich cached limits so the change shows without a refetch
+    data = _limits.get("data")
+    if data and data.get("accounts"):
+        for acc in data["accounts"]:
+            if acc.get("config_dir"):
+                r = account_reserve(account_label(Path(acc["config_dir"])))
+                acc["reserve_percent"] = r
+                acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
+    return {"ok": True, "label": label, "percent": percent}
 
 
 def limits_by_account():
@@ -1479,7 +1521,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(n).decode() or "{}")
         except (ValueError, OSError):
             payload = {}
-        if self.path.startswith("/api/send"):
+        if self.path.startswith("/api/reserve"):
+            result = set_reserve(payload.get("account"), payload.get("percent"))
+        elif self.path.startswith("/api/send"):
             result = send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
         elif self.path.startswith("/api/dispatch"):
             result = start_dispatch(

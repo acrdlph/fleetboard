@@ -58,6 +58,14 @@ hosting app (`⌖ 38627 ttys024 Terminal`); click it and that window jumps to
 the front (AppleScript for Terminal.app/iTerm2; editors get activated with a
 pointer to the tty; tmux agents get the attach command).
 
+**One door into the fleet — the 🚀 new mission button.** Instead of picking a
+worktree, checking which account has usage left, opening a terminal, and
+choosing a model by hand, you type what to build and fleetboard routes it:
+
+![mission dispatch flow](docs/mission-flow.png)
+
+(Details in [Acting on the fleet](#acting-on-the-fleet) below.)
+
 ### ⌁ Map — where every branch really is
 
 ![the branch map](docs/map.png)
