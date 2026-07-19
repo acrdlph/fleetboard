@@ -97,6 +97,15 @@ g.branchg:hover .bline { stroke-opacity:1; }
   padding:10px 13px; font-size:var(--fs-sm); line-height:1.55; color:var(--fg);
   box-shadow:0 12px 34px rgba(0,0,0,.55);
 }
+#tip.pinned { pointer-events:auto; border-color:var(--accent); }
+.tipacts { display:flex; gap:8px; margin-top:9px; }
+.tipacts button {
+  font:inherit; font-size:var(--fs-2xs); font-weight:600; color:var(--muted);
+  background:var(--bg-2); border:1px solid var(--border-2); border-radius:5px;
+  padding:3px 9px; cursor:pointer; transition:all .15s var(--ease);
+}
+.tipacts button:hover { color:var(--fg); border-color:var(--accent); }
+.tipacts button.armed { color:var(--green); border-color:var(--green); }
 #tip .hd { font-weight:600; font-size:var(--fs-md); }
 #tip .br { color:var(--cyan); }
 #tip .mut { color:var(--muted); }
@@ -125,6 +134,7 @@ g.branchg:hover .bline { stroke-opacity:1; }
   <a href="/"><span class="g">⌗</span>board</a>
   <a href="/map" class="active"><span class="g">⌁</span>map</a>
   <a href="/limits"><span class="g">◔</span>limits</a>
+  <a href="/guide"><span class="g">?</span>guide</a>
 </nav>
 
 <div class="wrap content">
@@ -134,7 +144,7 @@ g.branchg:hover .bline { stroke-opacity:1; }
     <span class="chip t">◆ YOUR TURN</span>
     <span class="chip l">⛔ LIMIT</span>
     <span class="chip f">◇ FREE</span>
-    <span class="hint">time runs log-scaled into “now” → · ⌖ click a node to jump to its terminal</span>
+    <span class="hint">time runs log-scaled into “now” → · click a node for actions (⌖ focus · ✓ finish)</span>
   </div>
   <div id="viz"></div>
 </div>
@@ -216,16 +226,23 @@ function render() {
     const branches = g.branches.filter(b => b.ahead > 0).sort((a,b) => a.fork_ts - b.fork_ts);
     const riders   = g.branches.filter(b => b.ahead === 0).sort((a,b) => a.tip_ts - b.tip_ts);
     const trunkY = y + TOP_PAD + branches.length * LANE_H + 26;
-    // x-aware label stagger: each rider takes the first row with >=180px clearance
-    const rowsX = [];
+    // label stagger: place each rider's label interval (its real extent, in
+    // its real anchor direction — near the right edge labels flip leftward)
+    // into the first row it doesn't collide with
+    const rowsEnd = [];
     const riderPlace = riders.map(b => {
       const rx = x(b.tip_ts);
-      let row = rowsX.findIndex(lx => rx - lx >= 180);
-      if (row === -1) row = rowsX.length;
-      rowsX[row] = rx;
+      const st = statusOf(byName[b.worktree]);
+      const info = `on trunk${b.behind ? ` · ↓${b.behind} behind tip` : " · at tip"}${b.dirty ? ` · Δ${b.dirty}` : ""}`;
+      const lw = Math.max(b.worktree.length * 6.6 + 12 + (st.word.length + 2) * 6,
+                          info.length * 6) + 24;
+      const x0 = rx > W - 300 ? rx - lw : rx;   // label spans [x0, x0+lw]
+      let row = rowsEnd.findIndex(end => x0 >= end + 18);
+      if (row === -1) row = rowsEnd.length;
+      rowsEnd[row] = x0 + lw;
       return row;
     });
-    const gh = TOP_PAD + branches.length * LANE_H + 26 + (riders.length ? 30 + rowsX.length * 32 + 16 : 40);
+    const gh = TOP_PAD + branches.length * LANE_H + 26 + (riders.length ? 30 + rowsEnd.length * 32 + 16 : 40);
     groupsG.push({ g, branches, riders, riderPlace, top:y, trunkY, h:gh });
     y += gh;
   }
@@ -330,7 +347,9 @@ function tipHTML(b) {
   return h;
 }
 
+let pinnedKey = null;
 document.addEventListener("mousemove", (ev) => {
+  if (pinnedKey) return;                     // a pinned panel stays put
   const g = ev.target.closest ? ev.target.closest(".hit") : null;
   const tip = $("tip");
   if (g && lookup[g.dataset.key] && topo) {
@@ -349,19 +368,55 @@ function toast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { t.style.display = "none"; }, 6000);
 }
-document.addEventListener("click", async (ev) => {
+function unpinTip() {
+  pinnedKey = null;
+  const tip = $("tip");
+  tip.classList.remove("pinned");
+  tip.style.display = "none";
+}
+async function tipFocus(wtName) {
+  const wt = byName[wtName];
+  if (!wt || !wt.live_procs.length) { toast(`${wtName}: no live process to focus`); return; }
+  const pid = wt.live_procs[0].pid;
+  toast(`⌖ locating pid ${pid}…`);
+  try {
+    const r = await fetch(`/api/focus?pid=${pid}`);
+    const res = await r.json();
+    toast((res.ok ? "" : "✗ ") + res.message);
+  } catch (e) { toast("✗ focus request failed"); }
+}
+async function tipFinish(btn, wtName) {
+  if (!btn.classList.contains("armed")) {           // first click arms it
+    btn.classList.add("armed"); btn.textContent = "✓ confirm";
+    return;
+  }
+  unpinTip();
+  toast(`✓ finishing ${wtName}…`);
+  try {
+    const r = await fetch("/api/finish", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ worktree: wtName }) });
+    const d = await r.json();
+    toast((d.ok ? "✓ " : "✗ ") + d.message);
+  } catch (e) { toast("✗ finish request failed"); }
+}
+document.addEventListener("click", (ev) => {
+  if (ev.target.closest && ev.target.closest("#tip")) return;  // panel clicks
   const g = ev.target.closest ? ev.target.closest(".hit") : null;
-  if (!g || !lookup[g.dataset.key]) return;
-  const wt = byName[lookup[g.dataset.key].worktree];
-  if (wt && wt.live_procs.length) {
-    const pid = wt.live_procs[0].pid;
-    toast(`⌖ locating pid ${pid}…`);
-    try {
-      const r = await fetch(`/api/focus?pid=${pid}`);
-      const res = await r.json();
-      toast((res.ok ? "" : "✗ ") + res.message);
-    } catch (e) { toast("✗ focus request failed"); }
-  } else toast(`${lookup[g.dataset.key].worktree}: no live process — free for a new agent`);
+  if (!g || !lookup[g.dataset.key]) { unpinTip(); return; }
+  const b = lookup[g.dataset.key];
+  pinnedKey = g.dataset.key;
+  const tip = $("tip");
+  tip.innerHTML = tipHTML(b) + `<div class="tipacts">
+    <button onclick="tipFocus('${esc(b.worktree)}')">⌖ focus</button>
+    <button onclick="tipFinish(this, '${esc(b.worktree)}')"
+      title="close out: agent lands the branch, terminal closes, node goes free">✓ finish</button>
+    <button onclick="unpinTip()">✕</button></div>`;
+  tip.classList.add("pinned");
+  tip.style.display = "block";
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  tip.style.left = Math.min(ev.clientX + 16, window.innerWidth - tw - 12) + "px";
+  tip.style.top  = Math.min(ev.clientY + 16, window.innerHeight - th - 12) + "px";
 });
 
 // ---- data loop ------------------------------------------------------------

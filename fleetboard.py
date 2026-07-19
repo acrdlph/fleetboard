@@ -1184,6 +1184,77 @@ def send_to_process(pid, text):
             f"{proc['host'] or 'unknown host'} terminals can't be scripted — focus it instead"}
 
 
+# ------------------------------------------------------------- finish
+
+# The closeout brief. ✓ finish never touches git itself — it hands this to an
+# agent: the live one if a terminal exists, a freshly dispatched one if not.
+CLOSEOUT_TEXT = (
+    "Close out this worktree now: "
+    "1) wait for (or stop) any background agents and workflows you started; "
+    "2) commit remaining meaningful work — drop scratch files; "
+    "3) land the branch: merge {trunk} into it, resolve any conflicts, push "
+    "the branch, then push it to the trunk and verify with "
+    "`git merge-base --is-ancestor HEAD {trunk}`; "
+    "4) switch this worktree to the trunk branch and pull, so it starts the "
+    "next mission clean; "
+    "5) reply with a one-line summary of what landed."
+)
+
+
+def _reachable(p):
+    return bool(p.get("tmux_target")) or (
+        p.get("host") in ("Terminal", "iTerm2") and p.get("tty"))
+
+
+def start_finish(wt_name):
+    """One button, three behaviors, always through a terminal:
+    live agent -> type the closeout brief at it; no terminal -> dispatch a
+    closeout agent; everything landed and an agent idling -> type /exit."""
+    if DEMO:
+        return {"ok": False, "message": "demo mode — nothing to finish"}
+    wt = next((w for w in discover_worktrees() if w["name"] == wt_name), None)
+    if not wt:
+        return {"ok": False, "message": f"unknown worktree '{wt_name}'"}
+    path, git_root = wt["path"], wt["git"]
+    trunk = _base_ref(git_root)
+    if not trunk:
+        return {"ok": False, "message": "no trunk ref found for this repo"}
+    run(["git", "fetch", "--quiet", "origin"], cwd=git_root, timeout=30)
+    landed = run(["git", "merge-base", "--is-ancestor", "HEAD", trunk],
+                 cwd=git_root)[0] == 0
+    dirty = bool(run(["git", "status", "--porcelain"], cwd=git_root)[1].strip())
+    mine = [p for p in claude_processes() if p.get("cwd")
+            and (p["cwd"] == path or p["cwd"].startswith(path + os.sep))]
+    live = next((p for p in mine if _reachable(p)), None)
+    if live:
+        if landed and not dirty:
+            res = send_to_process(live["pid"], "/exit")
+            return {"ok": res["ok"], "mode": "exit", "message":
+                    "already landed — sent /exit to close the terminal"
+                    if res["ok"] else res["message"]}
+        res = send_to_process(live["pid"], CLOSEOUT_TEXT.format(trunk=trunk))
+        return {"ok": res["ok"], "mode": "brief", "message":
+                "closeout brief sent to the live agent — once it reports "
+                "landed, ✓ finish again to close the terminal"
+                if res["ok"] else res["message"]}
+    if mine:
+        return {"ok": False, "message":
+                "a live process exists but its terminal can't be scripted — "
+                "finish from that terminal, or close it and ✓ finish again"}
+    if landed and not dirty:
+        branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                     cwd=git_root)[1].strip()
+        if branch == trunk.split("/", 1)[-1]:
+            return {"ok": True, "mode": "noop",
+                    "message": "already landed and clean — nothing to finish"}
+    out = start_dispatch(CLOSEOUT_TEXT.format(trunk=trunk), worktree=wt_name)
+    out.setdefault("ok", True)
+    out["mode"] = "dispatch"
+    out.setdefault("message",
+                   "no live terminal — dispatched a closeout agent")
+    return out
+
+
 # ------------------------------------------------------------- chat reader
 
 def read_chat(account, sid, limit=40):
@@ -1585,6 +1656,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/limits"):
             body = (HERE / "limits.html").read_bytes()
             ctype = "text/html; charset=utf-8"
+        elif self.path.startswith("/guide"):
+            body = (HERE / "guide.html").read_bytes()
+            ctype = "text/html; charset=utf-8"
         else:
             self.send_error(404)
             return
@@ -1605,6 +1679,8 @@ class Handler(BaseHTTPRequestHandler):
             result = set_reserve(payload.get("account"), payload.get("percent"))
         elif self.path.startswith("/api/send"):
             result = send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
+        elif self.path.startswith("/api/finish"):
+            result = start_finish(payload.get("worktree") or "")
         elif self.path.startswith("/api/dispatch"):
             result = start_dispatch(
                 payload.get("mission"), payload.get("worktree") or None,

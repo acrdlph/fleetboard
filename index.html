@@ -311,6 +311,7 @@ header {
   <a href="/" class="active"><span class="g">⌗</span>board</a>
   <a href="/map"><span class="g">⌁</span>map</a>
   <a href="/limits"><span class="g">◔</span>limits</a>
+  <a href="/guide"><span class="g">?</span>guide</a>
 </nav>
 
 <div class="wrap content">
@@ -421,13 +422,16 @@ function render(st) {
         ${pend}
       </div>`;
     }).join("");
+    const finArmed = window._armFinish && window._armFinish.wt === w.name && Date.now() < window._armFinish.until;
     return `<div class="card ${w.availability === "attention" ? "attention" : ""}">
       <div class="card-head">
         <span class="badge ${w.availability}">${AVAIL[w.availability]}</span>
         <span class="name">${esc(w.name)}</span>
         <span class="procs">${w.live_procs.length
           ? w.live_procs.map(p => `<button class="pidbtn" onclick="focusPid(${p.pid})" title="jump to this terminal">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button>`).join("")
-          : `<span class="noproc">no live proc</span>`}</span>
+          : `<span class="noproc">no live proc</span>`}
+          <button class="abtn finish ${finArmed ? "armed" : ""}" data-wt="${esc(w.name)}"
+            title="close out: agent lands the branch, terminal closes, card goes free">${finArmed ? "✓ confirm" : "✓ finish"}</button></span>
       </div>
       <div class="gitline"><span class="branch">${esc(g.branch || "?")}</span>${dirty}${sync}</div>
       <div class="commit" title="${esc(g.commit ? g.commit.subject : "")}">${commit}</div>
@@ -538,6 +542,44 @@ async function sendChat() {
   $("dbody").scrollTop = $("dbody").scrollHeight;
   const res = await sendToPid(pid, text);
   toast((res.ok ? "✓ " : "✗ ") + res.message);
+}
+
+// ---- finish: one button hands closeout to an agent -------------------------
+document.addEventListener("click", async (ev) => {
+  const b = ev.target.closest ? ev.target.closest(".finish") : null;
+  if (!b) return;
+  const wt = b.dataset.wt;
+  const armed = window._armFinish && window._armFinish.wt === wt && Date.now() < window._armFinish.until;
+  if (!armed) {
+    window._armFinish = { wt, until: Date.now() + 6000 };
+    b.classList.add("armed"); b.textContent = "✓ confirm";
+    setTimeout(() => { if (lastState) render(lastState); }, 6200);
+    return;
+  }
+  window._armFinish = null;
+  toast(`✓ finishing ${wt}…`);
+  try {
+    const r = await fetch("/api/finish", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ worktree: wt }) });
+    const d = await r.json();
+    toast((d.ok ? "✓ " : "✗ ") + d.message);
+    if (d.job) pollFinishJob(d.job);
+  } catch (e) { toast("✗ finish request failed"); }
+  if (lastState) render(lastState);
+});
+function pollFinishJob(job) {
+  const t = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/dispatch/status?job=${job}`);
+      const s = await r.json();
+      if (s.ok && s.done) {
+        clearInterval(t);
+        const d = s.result;
+        toast((d && d.ok ? "✓ closeout agent running — " : "✗ ") + (d ? d.message : "done"));
+      }
+    } catch (e) { clearInterval(t); }
+  }, 1500);
 }
 
 // ---- resume: arm the button when a session limit has reset -----------------

@@ -353,6 +353,21 @@ class TestHTTPSmoke(ConfigGuard):
         self.assertEqual(self._get("/api/limits")[0], 200)
         self.assertEqual(self._get("/api/topology")[0], 200)
 
+    def test_guide_served(self):
+        status, body = self._get("/guide")
+        self.assertEqual(status, 200)
+        self.assertIn(b"closing out a mission", body)
+
+    def test_finish_endpoint_refuses_in_demo(self):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/finish",
+            data=json.dumps({"worktree": "orbital-api"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.loads(r.read())
+        self.assertFalse(d["ok"])
+        self.assertIn("demo", d["message"])
+
     def test_unknown_path_404(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self._get("/nope")

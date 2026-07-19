@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fleetboard — guide</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2224%22 fill=%22%230d0d0d%22/><text x=%2250%22 y=%2272%22 font-size=%2260%22 text-anchor=%22middle%22 fill=%22%23d97757%22 font-family=%22monospace%22>⌁</text></svg>" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+/* type system — one face, two voices (full spec in index.html): Plex Mono
+   everywhere; the human voice (--sans, sentences) is currently also Plex
+   Mono, kept as a separate token so a reading face can be swapped back in.
+   Scale 10/11/12/13/14/18/26 · weights 400/500/600/700. */
+:root {
+  --bg:#0d0d0d; --bg-2:#111111; --surface:#161616; --surface-2:#1c1c1c;
+  --border:#2a2a2a; --border-2:#3a3a3a;
+  --fg:#e8e6e3; --muted:#8a8784; --muted-2:#6a6764;
+  --accent:#d97757; --accent-2:#e8a87c; --green:#87b386; --cyan:#7fb3c8; --yellow:#d4b06a;
+  --accent-glow:rgba(217,119,87,.25);
+  --mono:"IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans:"IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --fs-2xs:10px; --fs-xs:11px; --fs-sm:12px; --fs-md:13px; --fs-lg:14px;
+  --fs-xl:18px; --fs-2xl:26px;
+  --track:.08em;
+  --ease:cubic-bezier(0.22,1,0.36,1);
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html { background:var(--bg); }
+body {
+  font-family:var(--mono); font-size:var(--fs-md); line-height:1.5; color:var(--fg);
+  background:
+    radial-gradient(1100px 480px at 80% -10%, rgba(217,119,87,.05), transparent 60%),
+    var(--bg);
+  min-height:100vh; padding-bottom:80px; -webkit-font-smoothing:antialiased;
+}
+.wrap { max-width:1500px; margin-inline:auto; padding-inline:22px; }
+header {
+  position:sticky; top:0; z-index:10;
+  background:color-mix(in oklab, var(--bg) 86%, transparent);
+  backdrop-filter:blur(8px); border-bottom:1px solid var(--border);
+}
+.nav { display:flex; align-items:center; justify-content:space-between; height:52px; gap:16px; }
+.brand { font-weight:600; white-space:nowrap; }
+.brand .prompt { color:var(--accent); }
+.brand .path { color:var(--cyan); }
+
+.side { position:fixed; left:0; top:52px; bottom:0; width:118px; z-index:9;
+  padding:16px 10px; display:flex; flex-direction:column; gap:5px;
+  border-right:1px solid var(--border); background:var(--bg-2); }
+.side a { color:var(--muted); text-decoration:none; font-size:var(--fs-sm); font-weight:500;
+  padding:8px 12px; border-radius:7px; display:flex; gap:9px; align-items:baseline;
+  transition:color .2s var(--ease), background .2s var(--ease); }
+.side a .g { color:var(--muted-2); }
+.side a:hover { color:var(--fg); background:var(--surface); }
+.side a.active { color:var(--fg); background:var(--surface); box-shadow:inset 2px 0 0 var(--accent); }
+.side a.active .g { color:var(--accent); }
+.content { margin-left:118px; }
+@media (max-width:860px) {
+  .side { position:static; width:auto; flex-direction:row; border-right:none;
+    border-bottom:1px solid var(--border); padding:8px 22px; }
+  .content { margin-left:0; }
+}
+
+/* ---- guide prose (the human voice) ---- */
+.doc { max-width:860px; padding-top:26px; font-family:var(--sans); }
+.doc h1 { font-size:var(--fs-xl); font-weight:600; margin-bottom:6px; }
+.doc .lede { color:var(--muted); font-size:var(--fs-md); line-height:1.7; margin-bottom:28px; }
+.doc h2 { font-size:var(--fs-lg); font-weight:600; margin:34px 0 10px;
+  padding-top:18px; border-top:1px solid var(--border); }
+.doc h2 .g { color:var(--accent); margin-right:6px; }
+.doc p { color:var(--muted); font-size:var(--fs-md); line-height:1.7; margin:10px 0; }
+.doc p b, .doc li b { color:var(--fg); font-weight:600; }
+.doc code, .doc kbd {
+  font-family:var(--mono); font-size:.95em; color:var(--cyan);
+  background:var(--surface); border:1px solid var(--border); border-radius:5px;
+  padding:1px 6px; white-space:nowrap;
+}
+.doc ol, .doc ul { margin:10px 0 10px 22px; }
+.doc li { color:var(--muted); font-size:var(--fs-md); line-height:1.7; margin:8px 0; }
+.doc ol.steps { list-style:none; margin-left:0; counter-reset:step; }
+.doc ol.steps > li { counter-increment:step; position:relative; padding:12px 16px 12px 52px;
+  background:var(--surface); border:1px solid var(--border); border-radius:10px; margin:10px 0; }
+.doc ol.steps > li::before { content:counter(step); position:absolute; left:16px; top:12px;
+  font-family:var(--mono); font-weight:600; font-size:var(--fs-lg); color:var(--accent); }
+.doc ol.steps > li > b:first-child { display:block; color:var(--fg); margin-bottom:2px; }
+
+table.vocab { border-collapse:collapse; width:100%; margin:12px 0; }
+table.vocab td { border-top:1px solid var(--border); padding:8px 14px 8px 0;
+  font-size:var(--fs-md); line-height:1.6; color:var(--muted); vertical-align:top; }
+table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size:var(--fs-sm);
+  letter-spacing:var(--track); white-space:nowrap; padding-right:22px; }
+.c-green { color:var(--green); } .c-accent { color:var(--accent); }
+.c-yellow { color:var(--yellow); } .c-cyan { color:var(--cyan); }
+.c-accent2 { color:var(--accent-2); } .c-mut { color:var(--muted-2); }
+
+.callout { background:var(--surface); border:1px solid var(--yellow); border-radius:10px;
+  padding:12px 16px; margin:14px 0; font-size:var(--fs-md); line-height:1.7; color:var(--muted); }
+.callout b { color:var(--yellow); }
+
+.doc details { background:var(--surface); border:1px solid var(--border); border-radius:10px;
+  padding:10px 16px; margin:14px 0; }
+.doc summary { cursor:pointer; color:var(--muted); font-size:var(--fs-md); line-height:1.6; }
+.doc summary:hover { color:var(--fg); }
+.doc details[open] summary { color:var(--fg); margin-bottom:4px; }
+</style>
+</head>
+<body>
+<header><div class="wrap nav">
+  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./fleetboard --help</div>
+</div></header>
+
+<nav class="side">
+  <a href="/"><span class="g">⌗</span>board</a>
+  <a href="/map"><span class="g">⌁</span>map</a>
+  <a href="/limits"><span class="g">◔</span>limits</a>
+  <a href="/guide" class="active"><span class="g">?</span>guide</a>
+</nav>
+
+<div class="wrap content"><div class="doc">
+  <h1>⌁ running a fleet — the runbook</h1>
+  <p class="lede">fleetboard is an agent harness — a <b>read-only observer with
+  an opt-in control plane</b>: watching never touches your sessions; acting
+  (chat, resume, dispatch, finish) only happens on an explicit click, and
+  always by talking to a terminal. This page is the operating manual — what
+  the statuses mean, how a mission flows, and how to close one out cleanly.</p>
+
+  <h2><span class="g">§1</span> reading the board</h2>
+  <p>A worktree card is <b class="c-cyan">◇ FREE</b> when it has no live
+  process and no session written to recently — that's the whole definition.
+  There is no button that frees a worktree; it happens by itself when the
+  conditions are met. <b class="c-green">BUSY</b> means something is actively
+  working; <b class="c-accent">NEEDS YOU</b> means at least one session wants
+  a human.</p>
+  <table class="vocab">
+    <tr><td class="c-green">● WORKING</td><td>the transcript — <b>or a background
+      subagent's</b> — was written seconds ago. The agent may look idle at its
+      prompt while subagents still run; the board is not wrong, look for the
+      <span class="c-green">⚙ subagents running</span> tag.</td></tr>
+    <tr><td class="c-accent">▲ NEEDS ANSWER</td><td>a live process has a question
+      waiting for you. Open <b>✉ chat</b> and answer it.</td></tr>
+    <tr><td class="c-yellow">⛔ LIMIT HIT</td><td>parked on an exhausted account —
+      the binding limit and reset countdown are shown. <b>▶ resume</b> arms itself
+      when the limit resets.</td></tr>
+    <tr><td class="c-yellow">■ BLOCKED</td><td>a live process is stuck on an
+      unresolved tool call (usually a permission prompt in its terminal).</td></tr>
+    <tr><td class="c-accent2">◆ YOUR TURN</td><td>the turn is finished and the
+      agent sits idle at its prompt. Read the result, then continue it or close
+      it out.</td></tr>
+    <tr><td class="c-mut">○ ENDED</td><td>no live process, transcript quiet.
+      Hidden by default — toggle “show ended sessions”.</td></tr>
+  </table>
+
+  <h2><span class="g">§2</span> launching a mission</h2>
+  <p><b>🚀 new mission</b> dispatches a tmux-hosted agent. Your text reaches the
+  agent verbatim; the optional router only picks <i>where</i> it runs — worktree
+  and account default to the best free / most-headroom picks, respecting each
+  account's <b>reserve buffer</b> (set on the limits page). Dispatched sessions
+  are named <code>mission-&lt;worktree&gt;-&lt;time&gt;</code> on the
+  <code>fleet</code> tmux socket: <code>tmux -L fleet ls</code> shows them,
+  <code>tmux -L fleet attach -t &lt;name&gt;</code> gives you the real terminal.</p>
+
+  <h2><span class="g">§3</span> while it runs</h2>
+  <p>The board refreshes every 5 s and sorts by attention. <b>✉ chat</b> shows
+  the transcript and types straight into the agent's terminal — it is exactly
+  as if you typed there yourself. <b>⌖ pid</b> jumps to the terminal window.
+  On the map, a pulsing node is working; click any node for actions
+  (<b>⌖ focus</b> · <b>✓ finish</b>).</p>
+  <div class="callout"><b>gotcha:</b> the map's click-toast says “no live
+  process — free for a new agent” whenever the directory has no process. A
+  session can still be <span class="c-green">● WORKING</span> through
+  background subagents writing transcripts. When the two disagree, trust the
+  status, not the toast.</div>
+
+  <h2><span class="g">§4</span> closing out a mission</h2>
+  <p>One button: <b>✓ finish</b> — on every worktree card, and in a map node's
+  panel (click the node). It arms on the first click and runs on the second,
+  so a stray click does nothing. Like every fleetboard action, it works by
+  talking to a terminal:</p>
+  <ul>
+    <li><b>agent alive</b> → it receives the closeout brief: land the branch
+      on the trunk, tidy the worktree, report back. Once it reports landed,
+      <b>✓ finish</b> again closes its terminal.</li>
+    <li><b>terminal already gone</b> → a small closeout agent is dispatched
+      into the worktree to do the same.</li>
+    <li><b>everything landed, agent idle</b> → <kbd>/exit</kbd> is typed and
+      the terminal closes.</li>
+  </ul>
+  <p>Then wait a few seconds — the session flips to
+  <span class="c-mut">○ ENDED</span> and the card returns to
+  <span class="c-cyan">◇ FREE</span> by itself; free is a state the board
+  observes, not one you set.</p>
+  <details>
+    <summary>what the closeout brief asks the agent to do — the manual runbook</summary>
+    <ol class="steps">
+      <li><b>Settle background work.</b> Wait for (or stop) any background
+        agents and workflows — they keep writing transcripts after the prompt
+        goes idle, which keeps the card honestly
+        <span class="c-green">● WORKING</span>.</li>
+      <li><b>Commit what matters.</b> Commit remaining meaningful work; drop
+        scratch files.</li>
+      <li><b>Land the branch.</b> Merge the trunk into the branch, resolve any
+        conflicts, push the branch, then push the result to the trunk.
+        Pushing a feature branch only backs it up — work reaches the trunk
+        through a merge. Check:
+        <code>git merge-base --is-ancestor HEAD origin/main && echo landed</code>.</li>
+      <li><b>Reset the worktree.</b> <code>git switch main && git pull</code>,
+        so the next mission starts from a fresh trunk.</li>
+      <li><b>Report.</b> One line on what landed. Doing it all by hand instead:
+        after these steps, end the session with <kbd>/exit</kbd> or
+        <code>tmux -L fleet kill-session -t mission-&lt;worktree&gt;-&lt;time&gt;</code>.</li>
+    </ol>
+  </details>
+
+  <h2><span class="g">§5</span> limits &amp; accounts</h2>
+  <p>The limits page shows every account's headroom; bars show <b>used</b>
+  capacity. A <b>reserve buffer</b> keeps that percentage of the weekly limit
+  free from auto-dispatch — hand-picked launches can still use it. A session
+  parked on <span class="c-yellow">⛔ LIMIT HIT</span> shows the binding limit
+  and its reset time; the <b>▶ resume</b> button on its row arms itself when
+  the reset passes and types <code>continue</code> into its terminal.</p>
+</div></div>
+<script>
+fetch("/api/state").then(r => r.json())
+  .then(s => { document.getElementById("brandUser").textContent = `${s.user || "you"}@fleet`; })
+  .catch(() => {});
+</script>
+</body>
+</html>
