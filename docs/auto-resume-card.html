@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>orchestr auto-resume</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --bg:#0d0d0d; --bg-2:#111111; --surface:#161616; --surface-2:#1c1c1c;
+  --border:#2a2a2a; --border-2:#3a3a3a;
+  --fg:#e8e6e3; --muted:#8a8784; --muted-2:#6a6764;
+  --accent:#d97757; --accent-2:#e8a87c; --green:#87b386; --cyan:#7fb3c8; --yellow:#d4b06a;
+  --accent-glow:rgba(217,119,87,.25); --green-glow:rgba(135,179,134,.2);
+  --mono:"JetBrains Mono", ui-monospace, Menlo, monospace;
+  --sans:"Inter", ui-sans-serif, system-ui, sans-serif;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html,body { width:1400px; height:560px; overflow:hidden; }
+body {
+  font-family:var(--sans); color:var(--fg);
+  background:
+    radial-gradient(1000px 480px at 85% -8%, rgba(212,176,106,.10), transparent 60%),
+    var(--bg);
+  position:relative; padding:44px 52px;
+}
+body::before {
+  content:""; position:absolute; inset:0;
+  background-image:radial-gradient(rgba(232,230,227,.045) 1px, transparent 1px);
+  background-size:26px 26px;
+  mask-image:linear-gradient(180deg, transparent 10%, black 55%);
+  -webkit-mask-image:linear-gradient(180deg, transparent 10%, black 55%);
+}
+.head { position:relative; z-index:2; margin-bottom:30px; }
+.prompt { font-family:var(--mono); font-size:15px; color:var(--muted); }
+.prompt .u { color:var(--accent); font-weight:700; } .prompt .p { color:var(--cyan); }
+h1 { font-size:33px; font-weight:800; letter-spacing:-0.02em; margin-top:12px; }
+h1 .a { color:var(--yellow); }
+.lead { color:var(--muted); font-size:16px; margin-top:8px; max-width:940px; line-height:1.5; }
+.lead b { color:var(--fg); font-weight:700; }
+
+.flow { position:relative; z-index:2; display:flex; align-items:stretch; gap:0; margin-top:48px; }
+.step { flex:1; background:var(--surface); border:1.5px solid var(--border); border-radius:13px;
+  padding:16px 17px; position:relative; box-shadow:0 14px 34px rgba(0,0,0,.4); }
+.step.you    { border-color:var(--border-2); }
+.step.armed  { border-color:var(--yellow); }
+.step.verify { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent-glow), 0 14px 34px rgba(0,0,0,.4); }
+.step.resume { border-color:var(--green); box-shadow:0 0 0 1px var(--green-glow), 0 14px 34px rgba(0,0,0,.4); }
+.step .n { font-family:var(--mono); font-size:12px; font-weight:800; color:var(--muted-2); letter-spacing:.12em; }
+.step .t { font-size:16px; font-weight:800; margin-top:7px; }
+.step .t .ic { margin-right:6px; }
+.step .d { color:var(--muted); font-size:13px; line-height:1.5; margin-top:8px; }
+.step .d b { color:var(--fg); font-weight:600; }
+.step .d code { font-family:var(--mono); font-size:12px; color:var(--cyan); }
+.chiprow { display:flex; flex-wrap:wrap; gap:6px; margin-top:11px; }
+.chip { font-family:var(--mono); font-size:11px; font-weight:700; border:1px solid; border-radius:5px; padding:3px 7px; }
+.chip.mut { color:var(--muted); border-color:var(--border-2); background:var(--bg-2); }
+.chip.yl { color:var(--yellow); border-color:var(--yellow); }
+.chip.gn { color:var(--green); border-color:var(--green); }
+.chip.cy { color:var(--cyan); border-color:var(--cyan); }
+.arrow { display:flex; align-items:center; justify-content:center; width:52px; color:var(--yellow);
+  font-family:var(--mono); font-size:26px; font-weight:800; flex-shrink:0; }
+.verbatim { position:relative; z-index:2; margin-top:32px; text-align:center; color:var(--muted-2);
+  font-size:13px; font-family:var(--mono); }
+.verbatim b { color:var(--accent-2); }
+</style>
+</head>
+<body>
+  <div class="head">
+    <div class="prompt"><span class="u">you@fleet</span><span class="p">:~</span><span class="u">$</span> ./orchestr — limits reset at 3am. you don't have to.</div>
+    <h1>Agent hit a limit? <span class="a">Schedule the resume.</span></h1>
+    <div class="lead">One click on <b>⏱ auto</b> arms the resume for <b>1 minute after the reset</b> — or pick a delay, or an exact time. Then close the laptop: the board wakes the agent, not you.</div>
+  </div>
+
+  <div class="flow">
+    <div class="step you">
+      <div class="n">① YOU · one click</div>
+      <div class="t"><span class="ic">⏱</span>arm it on the row</div>
+      <div class="d">Every <b>⛔ LIMIT HIT</b> session grows a <b>⏱ auto</b> button. Click it — the armed chip shows when it fires.</div>
+      <div class="chiprow">
+        <span class="chip mut">▶ resume in 2h5m</span><span class="chip gn">⏱ 04:31</span>
+      </div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="step armed">
+      <div class="n">② ARMED · server-side</div>
+      <div class="t">survives everything</div>
+      <div class="d">Persisted to <code>resume.schedule.json</code> — close the browser, restart the server; a due time that passed while it was down fires on the next boot.</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="step verify">
+      <div class="n">③ VERIFY · at the armed time</div>
+      <div class="t">did the limit really lift?</div>
+      <div class="d">A fresh cclimits check first. Still exhausted — stale countdown, lagging cache — it <b>re-arms for the new reset</b> instead of wasting the shot.</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="step resume">
+      <div class="n">④ RESUME · typed at the agent</div>
+      <div class="t">the agent continues</div>
+      <div class="d"><code>continue</code> goes into the session's <b>own</b> terminal. No scriptable window (Cursor/VS Code, or it's gone)? Reopened in tmux via <code>claude --resume</code>.</div>
+    </div>
+  </div>
+
+  <div class="verbatim">default: reset + 1 minute · session caps at 3am and weekly caps days out are <b>equally schedulable</b></div>
+</body>
+</html>

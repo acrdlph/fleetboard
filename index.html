@@ -163,9 +163,12 @@ header .wrap { max-width:none; }
   background:var(--bg-2); border:1px solid var(--border-2); border-radius:5px;
   padding:2px 8px; cursor:pointer; transition:all .15s var(--ease);
 }
-.abtn:hover { color:var(--fg); border-color:var(--accent); }
+.abtn:hover:not(:disabled) { color:var(--fg); border-color:var(--accent); }
 .abtn:disabled { opacity:.45; cursor:default; }
 .abtn.armed { color:var(--green); border-color:var(--green); animation:pulse 1.6s var(--ease) infinite; }
+/* an armed auto-resume is calm certainty, not an alert — green, no pulse */
+.abtn.sched { color:var(--green); border-color:var(--green); }
+.abtn.sched.bad { color:var(--accent); border-color:var(--accent); }
 #missionBtn {
   font:inherit; font-size:var(--fs-sm); font-weight:600; color:var(--accent);
   background:var(--bg-2); border:1px solid var(--accent); border-radius:7px;
@@ -206,13 +209,14 @@ header .wrap { max-width:none; }
 .msg.agent::before { content:"⏎ "; color:var(--green); }
 .dfoot { border-top:1px solid var(--border); padding:12px 14px; background:var(--surface);
   display:flex; flex-direction:column; gap:8px; }
-.dfoot textarea, .dfoot input[type=text] {
+.dfoot textarea, .dfoot input[type=text], .dfoot input[type=datetime-local] {
   font-family:var(--sans); font-size:var(--fs-md); line-height:1.55;
   color:var(--fg); background:var(--bg);
   border:1px solid var(--border-2); border-radius:8px; padding:9px 11px; width:100%;
   resize:vertical; min-height:38px;
 }
 .dfoot textarea:focus, .dfoot select:focus { outline:1px solid var(--accent); }
+.dfoot input[type=datetime-local] { color-scheme:dark; }
 .dfoot select {
   font:inherit; font-size:var(--fs-xs); color:var(--muted); background:var(--bg);
   border:1px solid var(--border-2); border-radius:7px; padding:6px 8px;
@@ -406,9 +410,11 @@ function maybeBell(attn) {
 }
 
 const REG = {};
+let SCHED = {};   // armed auto-resumes, keyed `worktree|sid` (from /api/state)
 function render(st) {
   const now = st.generated_at;
   $("brandUser").textContent = `${st.user || "you"}@fleet`;
+  SCHED = st.resumes || {};
   for (const w of st.worktrees)
     for (const s of w.sessions)
       REG[`${w.name}|${s.sid}`] = { s, procs: w.live_procs, wt: w.name };
@@ -428,7 +434,7 @@ function render(st) {
     <div class="tile ${attn ? "attn" : ""}"><div class="k">▲ need you</div><div class="v">${attn}</div>
       <div class="sub">${c.needs_input} question · ${c.blocked} blocked · ${c.waiting} idle</div></div>
     <div class="tile"><div class="k">⛔ waiting on limits</div><div class="v">${c.limit || 0}</div>
-      <div class="sub">${resets.length ? "next reset in " + rel(Math.min(...resets)) : "agents resume on reset"}</div></div>
+      <div class="sub">${resets.length ? "next reset in " + rel(Math.min(...resets)) : "agents resume on reset"}${(n => n ? " · ⏱ " + n + " armed" : "")(Object.values(SCHED).filter(r => r.status === "pending").length)}</div></div>
     <div class="tile free"><div class="k">◇ free worktrees</div><div class="v">${freeNames.length}</div>
       <div class="sub" title="${esc(freeNames.join(", "))}">${esc(freeNames.join(", ") || "none — everything busy")}</div></div>
     <div class="tile"><div class="k">⌁ live agents</div><div class="v">${st.worktrees.reduce((n,w)=>n+w.live_procs.length,0) + st.other_procs.length}</div>
@@ -465,6 +471,7 @@ function render(st) {
             ${sessProc(w, s)}
             ${s.status === "limit" && s.limit && s.limit.group === "session" && s.limit.resets_at
               ? `<button class="abtn resume" data-key="${esc(w.name)}|${esc(s.sid)}" data-until="${s.limit.resets_at}">▶ resume</button>` : ""}
+            ${s.status === "limit" && !s.handed_to ? schedControls(w, s) : ""}
             <button class="abtn" onclick="openChat('${esc(w.name)}|${esc(s.sid)}')">✉ chat</button>
           </span>
         </div>
@@ -496,6 +503,10 @@ function render(st) {
       <div class="sessions">${rows || `<div class="none">${w.sessions.length ? w.sessions.length + " ended session(s) hidden" : "no recent sessions"}</div>`}</div>
     </div>`;
   }).join("");
+
+  // stamp countdown state on the fresh buttons NOW — waiting for the 1s
+  // ticker flashed them clickable ("▶ resume") for up to a second per refresh
+  document.querySelectorAll(".resume").forEach(setResumeState);
 
   $("other").innerHTML = st.other_procs.length
     ? `<h3>other live agents (outside watched worktrees)</h3>` +
@@ -661,14 +672,132 @@ document.addEventListener("click", async (ev) => {
   const res = await sendToPid((own || procs[0]).pid, "continue");
   toast((res.ok ? "✓ resumed — " : "✗ ") + res.message);
 });
-setInterval(() => {
-  const now = Date.now() / 1000;
-  document.querySelectorAll(".resume").forEach(b => {
-    const left = parseFloat(b.dataset.until) - now;
-    if (left <= 0) { b.disabled = false; b.classList.add("armed"); b.textContent = "▶ resume now"; }
-    else { b.disabled = true; b.classList.remove("armed"); b.textContent = "▶ resume in " + rel(left); }
-  });
-}, 1000);
+// Every render rebuilds the buttons in their neutral "▶ resume" state, so the
+// countdown must be stamped on synchronously (render calls this) — leaving it
+// to the 1s ticker alone made every refresh flash the wrong, clickable state.
+function setResumeState(b) {
+  const left = parseFloat(b.dataset.until) - Date.now() / 1000;
+  if (left <= 0) { b.disabled = false; b.classList.add("armed"); b.textContent = "▶ resume now"; }
+  else { b.disabled = true; b.classList.remove("armed"); b.textContent = "▶ resume in " + rel(left); }
+}
+setInterval(() => document.querySelectorAll(".resume").forEach(setResumeState), 1000);
+
+// ---- auto-resume: schedule the continue instead of waiting up for it -------
+function clock(ts) {
+  const d = new Date(ts * 1000);
+  const t = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString() ? t
+    : d.toLocaleDateString([], { weekday: "short" }) + " " + t;
+}
+// The ⏱ controls on a limit-stuck row. One click arms the default (1 minute
+// after the reset); the armed chip opens the drawer to adjust or disarm; a
+// failed attempt stays visible here instead of vanishing.
+function schedControls(w, s) {
+  const key = `${w.name}|${s.sid}`;
+  const r = SCHED[key];
+  if (r && r.status === "pending")
+    return `<button class="abtn sched" onclick="openResumeDrawer('${esc(key)}')"
+      title="auto-resume armed — click to adjust or disarm">⏱ ${clock(r.due_at)}</button>`;
+  if (r && r.status === "failed")
+    return `<button class="abtn sched bad" onclick="openResumeDrawer('${esc(key)}')"
+      title="auto-resume failed — ${esc(r.message || "click for details")}">⚠ auto</button>`;
+  if (r)   // done, yet the session still reads limit — the message says why
+    return `<button class="abtn sched" onclick="openResumeDrawer('${esc(key)}')"
+      title="${esc(r.message || "auto-resume fired")}">✓ auto</button>`;
+  return `<button class="abtn" onclick="quickArm('${esc(key)}')"
+    title="arm auto-resume — 1 minute after the reset, 'continue' is typed into this agent's terminal">⏱ auto</button>`;
+}
+async function apiResume(path, body) {
+  try {
+    const r = await fetch(`/api/resume/${path}`, { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  } catch (e) {   // a pre-restart server has no /api/resume routes — say so
+    return { ok: false, message: `request failed (${e.message}) — the server ` +
+             `predates auto-resume; restart it with ./start.sh` };
+  }
+}
+function resumeBody(key) {
+  const r = REG[key];
+  return { worktree: r.wt, sid: r.s.sid, account: r.s.account,
+           model: r.s.model || null,
+           resets_at: (r.s.limit && r.s.limit.resets_at) || null };
+}
+async function quickArm(key) {
+  if (!REG[key]) return;
+  const res = await apiResume("schedule", resumeBody(key));
+  if (!res.ok && res.need_time) return openResumeDrawer(key);  // needs a time
+  toast((res.ok ? "⏱ " : "✗ ") + res.message);
+  tick();
+}
+async function disarmResume(key) {
+  const r = REG[key];
+  if (!r) return;
+  const res = await apiResume("cancel", { worktree: r.wt, sid: r.s.sid });
+  toast((res.ok ? "✓ " : "✗ ") + res.message);
+  closeDrawer();
+  tick();
+}
+function openResumeDrawer(key) {
+  const r = REG[key];
+  if (!r) return;
+  missionOpen = false; chatCtx = null; clearTimeout(chatTimer);
+  const s = r.s, sched = SCHED[key], lim = s.limit || {};
+  $("dtitle").textContent = `⏱ auto-resume · ${r.wt}`;
+  $("dsub").textContent = `[${s.account}]${lim.worst ? " · " + lim.worst + " limit" : ""}`
+    + (lim.resets_at ? ` · resets ${clock(lim.resets_at)}` : " · reset time unknown");
+  $("dbody").innerHTML = `
+    ${sched ? `<div class="dresult">${sched.status === "pending"
+      ? `⏱ armed for <code>${clock(sched.due_at)}</code>${sched.attempts ? ` · re-armed ${sched.attempts}×` : ""}${sched.message ? " — " + esc(sched.message) : ""}`
+      : `${sched.status === "done" ? "✓" : "✗"} ${esc(sched.message || sched.status)}`}</div>` : ""}
+    <div class="dnote">at the armed time the board re-checks the limit
+    (re-arming for the next reset if it still binds), then types
+    <b>continue</b> into this agent's terminal. if no terminal can be typed
+    into — Cursor/VS Code, or the window is gone — the conversation is
+    reopened in a fleet tmux session via <code>claude --resume</code> and
+    resumed there.</div>`;
+  const hasReset = !!lim.resets_at;
+  // exact-time input prefilled with reset+1m (or now+1h when no reset known)
+  const base = new Date((hasReset ? lim.resets_at + 60 : Date.now() / 1000 + 3600) * 1000);
+  const local = new Date(base.getTime() - base.getTimezoneOffset() * 60000)
+    .toISOString().slice(0, 16);
+  $("dfoot").innerHTML = `
+    <div class="row">
+      ${hasReset ? `<select id="rsWhen">
+        <option value="60">1m after reset — default</option>
+        <option value="300">5m after reset</option>
+        <option value="900">15m after reset</option>
+        <option value="3600">1h after reset</option>
+        <option value="at">at an exact time…</option></select>` : ""}
+      <input type="datetime-local" id="rsAt" value="${local}"
+        style="display:${hasReset ? "none" : "block"}">
+    </div>
+    <div class="row">
+      <button class="send" onclick="armFromDrawer('${esc(key)}')">⏱ ${sched && sched.status === "pending" ? "re-arm" : "arm"} auto-resume</button>
+      ${sched && sched.status === "pending"
+        ? `<button class="abtn" onclick="disarmResume('${esc(key)}')">✕ disarm</button>` : ""}
+    </div>
+    ${hasReset ? "" : `<div class="dnote">this limit carries no reset timestamp — the time is yours to pick</div>`}`;
+  const sel = $("rsWhen");
+  if (sel) sel.onchange = () =>
+    { $("rsAt").style.display = sel.value === "at" ? "block" : "none"; };
+  $("drawer").classList.remove("wide");
+  $("drawer").classList.add("open");
+}
+async function armFromDrawer(key) {
+  if (!REG[key]) return;
+  const body = resumeBody(key);
+  const sel = $("rsWhen");
+  if (!sel || sel.value === "at") {
+    if (!$("rsAt").value) { toast("✗ pick a time"); return; }
+    body.due_at = new Date($("rsAt").value).getTime() / 1000;
+  } else body.delay_s = parseFloat(sel.value);
+  const res = await apiResume("schedule", body);
+  toast((res.ok ? "⏱ " : "✗ ") + res.message);
+  if (res.ok) closeDrawer();
+  tick();
+}
 
 // ---- mission composer ------------------------------------------------------
 let LIMITS = null;

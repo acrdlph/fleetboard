@@ -110,11 +110,25 @@ refetch". Nothing polls the Anthropic API on a timer.
 - **▶ resume** — a session-limit-stuck agent gets a button with a live
   countdown that **arms itself the moment the limit resets**, then types
   `continue`. Weekly limits never show it — they won't heal soon.
+- **⏱ auto** — or don't wait up for the reset at all: one click **schedules
+  the resume** for 1 minute after the limit resets (the armed chip opens a
+  drawer to pick another delay, an exact time, or disarm). At the armed
+  moment the server re-checks the limit via cclimits — still exhausted →
+  it re-arms for the fresh reset; clear → it types `continue` into the
+  session's own terminal, and when no terminal can be scripted (Cursor/
+  VS Code, or the window is gone) it reopens the conversation in a fleet
+  tmux session via `claude --resume` and resumes it there. Schedules live
+  in `resume.schedule.json`, so they survive a server restart — resets at
+  3am and weekly limits days out are equally fine.
+
+  ![auto-resume flow: one click arms it, the schedule survives restarts, the reset is verified, the agent continues](docs/auto-resume.png)
 - **✓ finish** — one click, exactly as much closeout as is left: an unlanded
   branch gets the full closeout brief (typed at the live agent, or run by a
   one-shot closeout agent that frees the card by itself); an already-landed
   one gets a slim brief — or no agent at all: orchestr parks the worktree
-  back on the trunk itself. See *Closing out a mission* below.
+  back on the trunk itself. A brief typed at a live agent flips the button
+  to **✕ close** — the explicit second step that verifies the landing and
+  exits the agent. See *Closing out a mission* below.
 - **🚀 new mission** — describe a feature; orchestr picks the worktree and
   account **deterministically** — the cleanest free worktree, the account
   with the most headroom that can run your model — no AI in the routing loop,

@@ -151,7 +151,8 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
       waiting for you. Open <b>✉ chat</b> and answer it.</td></tr>
     <tr><td class="c-yellow">⛔ LIMIT HIT</td><td>parked on an exhausted account —
       the binding limit and reset countdown are shown. <b>▶ resume</b> arms itself
-      when the limit resets.</td></tr>
+      when the limit resets; <b>⏱ auto</b> schedules the resume so you don't
+      have to wait up for it.</td></tr>
     <tr><td class="c-yellow">■ BLOCKED</td><td>a live process is stuck on an
       unresolved tool call (usually a permission prompt in its terminal).</td></tr>
     <tr><td class="c-accent2">◆ YOUR TURN</td><td>the turn is finished and the
@@ -252,6 +253,18 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
   parked on <span class="c-yellow">⛔ LIMIT HIT</span> shows the binding limit
   and its reset time; the <b>▶ resume</b> button on its row arms itself when
   the reset passes and types <code>continue</code> into its terminal.</p>
+  <p>Better: click <b>⏱ auto</b> on that row and stop watching the clock. One
+  click arms an auto-resume for <b>1 minute after the reset</b>; the armed
+  chip (<b>⏱ 04:31</b>) opens a drawer to pick a different delay, an exact
+  time, or disarm. At the armed moment the server re-checks the limit —
+  still exhausted, it re-arms for the fresh reset (a lagging cache can't
+  waste the attempt); clear, it types <code>continue</code> into the
+  session's own terminal. When no terminal can be scripted — Cursor/VS Code
+  embeds, or the window is gone — it reopens the conversation in a fleet
+  tmux session (<code>claude --resume</code>) and resumes it there; the old
+  terminal can simply be closed. Schedules persist in
+  <code>resume.schedule.json</code> across server restarts, and one whose
+  time passed while the server was down fires on the next boot.</p>
 </div></div>
 <script>
 fetch("/api/state").then(r => r.json())

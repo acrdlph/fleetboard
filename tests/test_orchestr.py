@@ -742,6 +742,326 @@ class TestCloseoutShell(unittest.TestCase):
         self.assertNotIn("--model", resume[0])
 
 
+# --------------------------------------------------------- scheduled resumes
+
+class ResumeGuard(ConfigGuard):
+    """Isolate the auto-resume registry and its on-disk state file."""
+    def setUp(self):
+        super().setUp()
+        fb.DEMO = False
+        self.tmpdir = tempfile.mkdtemp(prefix="fb-resume-")
+        self._state_path = fb.RESUME_STATE
+        fb.RESUME_STATE = Path(self.tmpdir) / "resume.schedule.json"
+        self._resumes = dict(fb._resumes)
+        fb._resumes.clear()
+
+    def tearDown(self):
+        fb._resumes.clear()
+        fb._resumes.update(self._resumes)
+        fb.RESUME_STATE = self._state_path
+        import shutil as _sh
+        _sh.rmtree(self.tmpdir, ignore_errors=True)
+        super().tearDown()
+
+
+class TestScheduleResume(ResumeGuard):
+    def test_due_is_reset_plus_default_delay(self):
+        import time as _t
+        reset = _t.time() + 1000
+        out = fb.schedule_resume("wt", "s1", "account2", resets_at=reset)
+        self.assertTrue(out["ok"])
+        self.assertAlmostEqual(out["due_at"], reset + 60, delta=1)
+        r = fb._resumes["wt|s1"]
+        self.assertEqual(r["status"], "pending")
+        self.assertTrue(fb.RESUME_STATE.exists())     # persisted at once
+
+    def test_custom_delay_and_exact_time(self):
+        import time as _t
+        reset = _t.time() + 1000
+        out = fb.schedule_resume("wt", "s1", "account2",
+                                 resets_at=reset, delay_s=300)
+        self.assertAlmostEqual(out["due_at"], reset + 300, delta=1)
+        # an explicit due time wins over reset+delay
+        at = _t.time() + 7200
+        out = fb.schedule_resume("wt", "s1", "account2",
+                                 resets_at=reset, due_at=at)
+        self.assertAlmostEqual(out["due_at"], at, delta=1)
+
+    def test_delay_clamped_to_a_day(self):
+        import time as _t
+        reset = _t.time() + 1000
+        out = fb.schedule_resume("wt", "s1", "account2",
+                                 resets_at=reset, delay_s=999999)
+        self.assertAlmostEqual(out["due_at"], reset + 86400, delta=1)
+
+    def test_past_reset_fires_on_next_pass(self):
+        import time as _t
+        out = fb.schedule_resume("wt", "s1", "account2",
+                                 resets_at=_t.time() - 500)
+        self.assertTrue(out["ok"])
+        self.assertAlmostEqual(out["due_at"], _t.time() + 5, delta=2)
+
+    def test_refuses_without_any_reset_time(self):
+        fb._limits["data"] = None       # nothing known about the account
+        out = fb.schedule_resume("wt", "s1", "account2")
+        self.assertFalse(out["ok"])
+        self.assertTrue(out.get("need_time"))
+
+    def test_falls_back_to_server_side_reset_lookup(self):
+        # client sent no resets_at, but the limits cache knows the account
+        import time as _t
+        now = _t.time()
+        fb._limits["data"] = {"available": True, "fetched_at": now, "accounts": [
+            acc("/h/.claude-account2", headroom=0,
+                limits=[lim("Session", 100, exhausted=True, resets_in=3600)])]}
+        out = fb.schedule_resume("wt", "s1", "account2")
+        self.assertTrue(out["ok"])
+        self.assertAlmostEqual(out["due_at"], now + 3600 + 60, delta=2)
+
+    def test_demo_refuses(self):
+        fb.DEMO = True
+        self.assertFalse(fb.schedule_resume("wt", "s1", "a")["ok"])
+
+    def test_cancel(self):
+        import time as _t
+        fb.schedule_resume("wt", "s1", "account2", resets_at=_t.time() + 100)
+        self.assertTrue(fb.cancel_resume("wt", "s1")["ok"])
+        self.assertNotIn("wt|s1", fb._resumes)
+        self.assertFalse(fb.cancel_resume("wt", "s1")["ok"])   # nothing armed
+
+    def test_persistence_roundtrip(self):
+        import time as _t
+        fb.schedule_resume("wt", "s1", "account2", resets_at=_t.time() + 100)
+        saved = fb._resumes.pop("wt|s1")
+        fb.load_resumes()
+        self.assertEqual(fb._resumes["wt|s1"]["account"], saved["account"])
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "pending")
+
+
+class TestLimitActiveUntil(ResumeGuard):
+    """Fire-time verification: a schedule must not type at an agent whose
+    account is still exhausted — and must not be fooled by a stale cache
+    whose reset time already passed."""
+
+    def setUp(self):
+        super().setUp()
+        self._cl = fb.cached_limits
+        fb.cached_limits = lambda refresh=False: fb._limits["data"]
+
+    def tearDown(self):
+        fb.cached_limits = self._cl
+        super().tearDown()
+
+    def _data(self, limits, fetched):
+        fb._limits["data"] = {"available": True, "fetched_at": fetched,
+                              "accounts": [acc("/h/.claude-account2",
+                                               headroom=0, limits=limits)]}
+
+    def test_account_wide_block_returns_future_reset(self):
+        import time as _t
+        now = _t.time()
+        self._data([lim("Session", 100, exhausted=True, resets_in=3600)], now)
+        self.assertAlmostEqual(
+            fb._limit_active_until("account2", "opus-4-8", now),
+            now + 3600, delta=1)
+
+    def test_clear_account_returns_none(self):
+        import time as _t
+        now = _t.time()
+        self._data([lim("Session", 20)], now)
+        self.assertIsNone(fb._limit_active_until("account2", "opus-4-8", now))
+
+    def test_stale_past_reset_is_treated_as_clear(self):
+        # cclimits still says exhausted, but its reset time already passed —
+        # a lagging upstream must not delay the resume forever
+        import time as _t
+        now = _t.time()
+        self._data([lim("Session", 100, exhausted=True, resets_in=3600)],
+                   now - 7200)
+        self.assertIsNone(fb._limit_active_until("account2", "opus-4-8", now))
+
+    def test_scoped_limit_blocks_only_its_own_model(self):
+        import time as _t
+        now = _t.time()
+        self._data([lim("Session", 10),
+                    lim("Fable", 100, model_scoped=True, exhausted=True,
+                        resets_in=3600)], now)
+        self.assertAlmostEqual(
+            fb._limit_active_until("account2", "fable-5", now),
+            now + 3600, delta=1)
+        self.assertIsNone(fb._limit_active_until("account2", "opus-4-8", now))
+        # model unknown -> count the scoped cap: a late resume beats a wasted one
+        self.assertAlmostEqual(
+            fb._limit_active_until("account2", None, now), now + 3600, delta=1)
+
+    def test_unreadable_limits_verify_as_clear(self):
+        fb._limits["data"] = {"available": False}
+        self.assertIsNone(fb._limit_active_until("account2", "opus-4-8", 0))
+
+
+class TestFireResume(ResumeGuard):
+    """The armed moment's decision tree."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved = {n: getattr(fb, n) for n in
+                       ("cached_state", "send_to_process", "_tmux_resume",
+                        "_limit_active_until", "discover_worktrees",
+                        "claude_homes")}
+        fb.discover_worktrees = lambda: [
+            {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
+        fb.claude_homes = lambda: [Path("/h/.claude-account2")]
+        fb._limit_active_until = lambda account, model, now: None
+        self.sent, self.tmuxed = [], []
+        fb.send_to_process = lambda pid, text: (
+            self.sent.append((pid, text)) or {"ok": True, "message": "sent via tmux"})
+        fb._tmux_resume = lambda wt, cwd, home, sid: (
+            self.tmuxed.append((wt, cwd, str(home), sid))
+            or {"ok": True, "message": "resumed in tmux"})
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(fb, n, f)
+        super().tearDown()
+
+    def board(self, status="limit", pid=None, reachable=True, handed=None,
+              present=True, loose_pid=None):
+        sess = {"sid": "s1", "status": status, "pid": pid, "cwd": "/w/wt/sub",
+                "handed_to": handed}
+        procs = [{"pid": pid, "reachable": reachable}] if pid else []
+        if loose_pid:   # someone ELSE's live terminal in the same worktree
+            procs.append({"pid": loose_pid, "reachable": True})
+        fb.cached_state = lambda: {"worktrees": [
+            {"name": "wt", "sessions": [sess] if present else [],
+             "live_procs": procs}]}
+
+    def arm(self):
+        import time as _t
+        fb.schedule_resume("wt", "s1", "account2", model="opus-4-8",
+                           resets_at=_t.time() - 100)
+        return "wt|s1"
+
+    def test_already_resumed_session_is_left_alone(self):
+        self.board(status="working", pid=9)
+        fb.fire_resume(self.arm())
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.tmuxed, [])
+
+    def test_handed_off_session_is_left_alone(self):
+        self.board(handed="account5")
+        fb.fire_resume(self.arm())
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+        self.assertIn("account5", fb._resumes["wt|s1"]["message"])
+        self.assertEqual(self.sent, [])
+
+    def test_still_limited_rearms_for_the_fresh_reset(self):
+        import time as _t
+        self.board()
+        until = _t.time() + 5000
+        fb._limit_active_until = lambda account, model, now: until
+        key = self.arm()
+        fb.fire_resume(key)
+        r = fb._resumes[key]
+        self.assertEqual(r["status"], "pending")       # not failed — re-armed
+        self.assertEqual(r["attempts"], 1)
+        self.assertAlmostEqual(r["due_at"], until + 60, delta=1)
+        self.assertEqual(self.sent, [])
+
+    def test_rearm_gives_up_after_max_attempts(self):
+        import time as _t
+        self.board()
+        fb._limit_active_until = lambda account, model, now: _t.time() + 5000
+        key = self.arm()
+        fb._resumes[key]["attempts"] = fb.RESUME_MAX_ATTEMPTS - 1
+        fb.fire_resume(key)
+        self.assertEqual(fb._resumes[key]["status"], "failed")
+
+    def test_clear_limit_types_into_the_sessions_own_terminal(self):
+        self.board(pid=42)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.sent, [(42, "continue")])
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+        self.assertEqual(self.tmuxed, [])
+
+    def test_never_borrows_another_sessions_terminal(self):
+        # unlike the manual button, the unattended path must not type
+        # 'continue' at whatever other agent happens to live in the worktree
+        self.board(pid=None, loose_pid=77)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.tmuxed), 1)   # targeted at the sid instead
+
+    def test_unreachable_terminal_falls_back_to_tmux_resume(self):
+        # the Cursor case: a live process exists but can't be scripted
+        self.board(pid=42, reachable=False)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.tmuxed, [("wt", "/w/wt/sub", "/h/.claude-account2", "s1")])
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+
+    def test_failed_send_falls_back_to_tmux_resume(self):
+        fb.send_to_process = lambda pid, text: {"ok": False, "message": "no automation"}
+        self.board(pid=42)
+        fb.fire_resume(self.arm())
+        self.assertEqual(len(self.tmuxed), 1)
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+
+    def test_vanished_session_still_resumes_via_tmux(self):
+        # aged out of the 48h window — the transcript is still resumable
+        self.board(present=False)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.tmuxed[0][3], "s1")
+        self.assertEqual(self.tmuxed[0][1], "/w/wt")   # falls back to the worktree path
+
+    def test_tmux_failure_is_reported_not_swallowed(self):
+        fb._tmux_resume = lambda *a: {"ok": False, "message": "tmux failed"}
+        self.board()
+        fb.fire_resume(self.arm())
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "failed")
+        self.assertIn("tmux", fb._resumes["wt|s1"]["message"])
+
+    def test_cancelled_schedule_never_fires(self):
+        self.board(pid=42)
+        key = self.arm()
+        fb.cancel_resume("wt", "s1")
+        fb.fire_resume(key)
+        self.assertEqual(self.sent, [])
+
+
+class TestDeliverText(unittest.TestCase):
+    """Enter is pressed until the send is proven, then stops."""
+
+    def setUp(self):
+        self._run, self._sleep = fb.run, fb.time.sleep
+        fb.time.sleep = lambda s: None
+        self.calls = []
+        self.panes = ["❯ [Pasted text #1] still in the composer", "❯ \n"]
+
+        def fake_run(cmd, **kw):
+            self.calls.append(cmd)
+            if "capture-pane" in cmd:
+                return 0, self.panes.pop(0)
+            return 0, ""
+        fb.run = fake_run
+
+    def tearDown(self):
+        fb.run, fb.time.sleep = self._run, self._sleep
+
+    def test_enters_until_sent(self):
+        self.assertTrue(fb.deliver_text("sess", "continue"))
+        enters = [c for c in self.calls if c[-1:] == ["Enter"]]
+        self.assertEqual(len(enters), 2)      # unsent once, proven on the second
+        pastes = [c for c in self.calls if "paste-buffer" in c]
+        self.assertEqual(len(pastes), 1)      # pasted atomically, exactly once
+
+    def test_gives_up_after_three_enters(self):
+        self.panes = ["❯ stuck", "❯ stuck", "❯ stuck"]
+        self.assertFalse(fb.deliver_text("sess", "continue"))
+        enters = [c for c in self.calls if c[-1:] == ["Enter"]]
+        self.assertEqual(len(enters), 3)
+
+
 # --------------------------------------------------------- demo integration
 
 class TestDemoState(ConfigGuard):
@@ -801,6 +1121,22 @@ class TestHTTPSmoke(ConfigGuard):
         status, body = self._get("/guide")
         self.assertEqual(status, 200)
         self.assertIn(b"closing out a mission", body)
+
+    def test_state_carries_resume_schedules(self):
+        _, body = self._get("/api/state")
+        st = json.loads(body)
+        self.assertIn("resumes", st)
+        self.assertTrue(all("due_at" in r for r in st["resumes"].values()))
+
+    def test_resume_schedule_refuses_in_demo(self):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/resume/schedule",
+            data=json.dumps({"worktree": "w", "sid": "s", "account": "a"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.loads(r.read())
+        self.assertFalse(d["ok"])
+        self.assertIn("demo", d["message"])
 
     def test_finish_endpoint_refuses_in_demo(self):
         req = urllib.request.Request(

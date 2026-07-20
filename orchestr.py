@@ -52,6 +52,8 @@ CFG = {
     "max_sessions": 6,         # per worktree card
     "exclude_accounts": [],    # account labels never AUTO-picked for dispatch
     "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)
+    "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
+    "resume_message": "continue",  # what auto-resume types at the stalled agent
 }
 
 TAIL_BYTES = 128 * 1024
@@ -911,8 +913,12 @@ def demo_state():
     """Fictional data with the exact shape of collect_state(), for screenshots."""
     now = time.time()
 
-    def sess(status, acct, model, age, topic, said, subdir=None, pend=None):
-        return {"id": "demo0000", "account": acct, "status": status, "age_s": age,
+    seq = [0]
+
+    def sess(status, acct, model, age, topic, said, subdir=None, pend=None, sid=None):
+        seq[0] += 1
+        return {"id": "demo0000", "sid": sid or f"demo-{seq[0]}",
+                "account": acct, "status": status, "age_s": age,
                 "cwd": "/demo", "subdir": subdir, "branch": None, "model": model,
                 "pending_tools": pend or [], "topic": topic, "last_assistant": said}
 
@@ -944,8 +950,10 @@ def demo_state():
              "fix(cart): serialize checkout mutations", [
                  dict(sess("limit", "work", "opus-4-8", 3900,
                       "The checkout button double-fires on slow connections — find and fix the race",
-                      "I'll continue once usage is available again."),
-                      limit={"worst": "Session", "resets_in": 7560}),
+                      "I'll continue once usage is available again.",
+                      sid="demo-limit-1"),
+                      limit={"worst": "Session", "group": "session",
+                             "resets_in": 7560, "resets_at": now + 7560}),
                  sess("waiting", "personal", "fable-5", 2100,
                       "Audit the cart telemetry events for double-counting",
                       "Fixed and verified — the mutation is now idempotent and the test suite passes. Ready for review.")], [41567]),
@@ -1642,6 +1650,24 @@ def kickoff_sent(pane):
     return bool(prompts) and prompts[-1] in ("❯", ">")
 
 
+def deliver_text(name, text):
+    """Put `text` into a fleet tmux session's claude composer and press Enter
+    until the send is proven (see kickoff_sent). Pasting atomically (bracketed,
+    via a tmux buffer) sidesteps the CLI's paste heuristic, which chops a rapid
+    send-keys burst into '[Pasted text #N]' chips that swallow the Enter."""
+    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestr-kickoff", text])
+    run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
+         "-b", "orchestr-kickoff", "-t", name])
+    time.sleep(1)
+    for _ in range(3):
+        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
+        time.sleep(2)
+        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+        if kickoff_sent(pane):
+            return True
+    return False
+
+
 def _run_dispatch(job, mission, worktree, account, model, effort,
                   closeout_trunk=None):
     def finish(result):
@@ -1738,23 +1764,7 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
             keys("Escape")
             time.sleep(1)
     _log(job, "⑤ sending kickoff brief…")
-    # send-keys -l delivers the brief as one rapid keystroke burst; the CLI's
-    # paste heuristic chops it into "[Pasted text #N]" chips and an Enter sent
-    # on its heels is swallowed by that ingestion — the brief then sits in the
-    # composer unsent while the board claims a launch. Paste atomically
-    # (bracketed, no heuristics), then press Enter until the send is proven.
-    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestr-kickoff", brief])
-    run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
-         "-b", "orchestr-kickoff", "-t", name])
-    time.sleep(1)
-    kick_sent = False
-    for _ in range(3):
-        keys("Enter")
-        time.sleep(2)
-        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
-        if kickoff_sent(pane):
-            kick_sent = True
-            break
+    kick_sent = deliver_text(name, brief)
     _log(job, "  kickoff " + ("sent ✓" if kick_sent
                               else "UNCONFIRMED ⚠ — attach and press Enter"))
 
@@ -1791,12 +1801,272 @@ def dispatch_status(job_id):
                 "done": job["done"], "result": job["result"]}
 
 
+# -------------------------------------------------------- scheduled resumes
+
+# A limit-stuck agent needs exactly one keystroke ("continue") typed at it
+# once its limit resets — but resets land at 3am, or days out on a weekly cap.
+# Arming a schedule hands that keystroke to the board: at the armed time it
+# verifies the limit really lifted (re-arming for the next reset if not), then
+# types the resume message into the session's own terminal — or, when no
+# terminal can be scripted (Cursor/VS Code, or the window is gone), relaunches
+# the conversation in a fleet tmux session via `claude --resume`.
+#
+# Schedules survive both the browser and this server: every mutation is
+# persisted to resume.schedule.json, and pending entries whose time passed
+# while the server was down fire on the first loop pass after boot.
+
+RESUME_STATE = HERE / "resume.schedule.json"
+RESUME_POLL_S = 5.0
+RESUME_MAX_ATTEMPTS = 10       # re-arms on "still limited" before giving up
+_resumes = {}                  # "worktree|sid" -> schedule dict
+_resumes_lock = threading.Lock()
+
+
+def save_resumes():
+    with _resumes_lock:
+        snap = json.dumps({"schedules": list(_resumes.values())}, indent=1)
+    try:
+        RESUME_STATE.write_text(snap + "\n")
+    except OSError:
+        pass
+
+
+def load_resumes():
+    try:
+        data = json.loads(RESUME_STATE.read_text())
+    except (OSError, ValueError):
+        return
+    with _resumes_lock:
+        for r in data.get("schedules", []):
+            if r.get("worktree") and r.get("sid"):
+                _resumes[f"{r['worktree']}|{r['sid']}"] = r
+
+
+def _resume_set(key, **updates):
+    with _resumes_lock:
+        r = _resumes.get(key)
+        if r:
+            r.update(updates)
+    save_resumes()
+
+
+def resume_public():
+    """The schedules, shaped for the board (rides along on /api/state)."""
+    if DEMO:
+        return demo_resumes()
+    with _resumes_lock:
+        return {k: dict(r) for k, r in _resumes.items()}
+
+
+def demo_resumes():
+    return {"orbital-web|demo-limit-1": {
+        "worktree": "orbital-web", "sid": "demo-limit-1", "account": "work",
+        "model": "opus-4-8", "delay_s": 60, "status": "pending",
+        "due_at": time.time() + 7620, "attempts": 0, "message": None}}
+
+
+def schedule_resume(worktree, sid, account, model=None, delay_s=None,
+                    resets_at=None, due_at=None):
+    """Arm (or re-arm) an auto-resume. The due time is `due_at` when given
+    (the user picked an exact time), else the limit reset + delay. Refuses —
+    asking for an exact time — when no reset timestamp is known."""
+    if DEMO:
+        return {"ok": False, "message": "demo mode — nothing to schedule"}
+    if not (worktree and sid and account):
+        return {"ok": False, "message": "need worktree, sid and account"}
+    now = time.time()
+    try:
+        delay = float(delay_s if delay_s is not None
+                      else CFG.get("resume_delay_s", 60))
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "delay must be a number of seconds"}
+    delay = max(0.0, min(86400.0, delay))
+    if due_at is not None:
+        try:
+            due = float(due_at)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": "bad due time"}
+    else:
+        if resets_at is None:
+            # the client normally sends the reset it displays; recompute as a
+            # fallback so the API stands on its own
+            al = limits_by_account().get(account) or {}
+            resets_at = al.get("resets_at") if al.get("exhausted") else None
+            if resets_at is None:
+                resets_at = min((sx["resets_at"] for sx in
+                                 al.get("scoped_exhausted", [])
+                                 if sx.get("resets_at")), default=None)
+        try:
+            resets_at = float(resets_at) if resets_at is not None else None
+        except (TypeError, ValueError):
+            resets_at = None
+        if resets_at is None:
+            return {"ok": False, "need_time": True, "message":
+                    "no known reset time for this limit — pick an exact time"}
+        due = resets_at + delay
+    due = max(now + 5, due)   # a reset already past fires on the next pass
+    key = f"{worktree}|{sid}"
+    with _resumes_lock:
+        _resumes[key] = {
+            "worktree": worktree, "sid": sid, "account": account,
+            "model": model, "delay_s": delay, "resets_at": resets_at,
+            "due_at": due, "created_at": now, "attempts": 0,
+            "status": "pending", "message": None}
+    save_resumes()
+    return {"ok": True, "due_at": due, "message":
+            "auto-resume armed for " + time.strftime("%H:%M", time.localtime(due))}
+
+
+def cancel_resume(worktree, sid):
+    key = f"{worktree}|{sid}"
+    with _resumes_lock:
+        found = _resumes.pop(key, None)
+    save_resumes()
+    return {"ok": bool(found), "message":
+            "auto-resume disarmed" if found else "nothing armed for this session"}
+
+
+def _limit_active_until(account, model, now):
+    """The freshest word on whether `account` still blocks this session: a
+    future reset timestamp while it does, None once it's clear. Refetches
+    cclimits — the cached view predates the reset by design. An unreadable
+    account verifies as clear: the send costs nothing if the limit holds."""
+    data = cached_limits(refresh=True)
+    if not data or not data.get("available"):
+        return None
+    al = limits_by_account().get(account)
+    if not al:
+        return None
+    cands = []
+    if al.get("exhausted") and al.get("resets_at"):
+        cands.append(al["resets_at"])         # account-wide cap bites every model
+    for sx in al.get("scoped_exhausted", []):
+        if not sx.get("resets_at"):
+            continue
+        # a model-scoped cap only blocks a session running that model; with the
+        # model unknown, count it — a late resume beats a wasted one
+        if not model or (sx.get("label") or "").lower() in model.lower():
+            cands.append(sx["resets_at"])
+    future = [c for c in cands if c > now + 30]
+    return min(future) if future else None
+
+
+def _session_on_board(state, worktree, sid):
+    """(session, its own live proc) for a schedule key, from board state."""
+    card = next((w for w in state["worktrees"] if w["name"] == worktree), None)
+    if not card:
+        return None, None
+    s = next((x for x in card["sessions"] if x.get("sid") == sid), None)
+    proc = None
+    if s and s.get("pid"):
+        proc = next((p for p in card["live_procs"] if p["pid"] == s["pid"]), None)
+    return s, proc
+
+
+def _tmux_resume(worktree, cwd, home, sid):
+    """No terminal to type into — reopen the conversation in a fleet tmux
+    session (claude --resume <sid>) and send it the resume message there."""
+    name = ("resume-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower()
+            + time.strftime("-%H%M%S"))
+    shell = (f"export CLAUDE_CONFIG_DIR={shlex.quote(str(home))}\n"
+             f"exec claude --dangerously-skip-permissions --resume {shlex.quote(sid)}\n")
+    rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
+                   "-c", cwd, shell])
+    if rc != 0:
+        return {"ok": False,
+                "message": f"tmux failed: {out or 'is tmux installed?'}"}
+    time.sleep(8)   # --resume reloads the transcript; slower than a cold boot
+    sent = deliver_text(name, CFG.get("resume_message", "continue"))
+    attach = f"tmux -L {FLEET_SOCK} attach -t {name}"
+    return {"ok": True, "message":
+            f"no scriptable terminal — resumed in tmux · {attach}"
+            + ("" if sent else " · ⚠ message unconfirmed, attach and press Enter")}
+
+
+def fire_resume(key):
+    """The armed moment. Decision order: already moved on -> done; limit still
+    binds -> re-arm for the fresh reset; else type the resume message into the
+    session's OWN terminal, or reopen the session in tmux. Unlike the manual
+    button, this never borrows another session's terminal — unattended, a
+    'continue' typed at the wrong agent is an injected instruction, while the
+    tmux fallback targets the sid exactly."""
+    with _resumes_lock:
+        r = dict(_resumes.get(key) or {})
+    if not r or r.get("status") != "pending":
+        return
+    now = time.time()
+    if DEMO:
+        return _resume_set(key, status="failed", fired_at=now,
+                           message="demo mode")
+    worktree, sid, account = r["worktree"], r["sid"], r["account"]
+
+    state = cached_state()
+    s, proc = _session_on_board(state, worktree, sid)
+    if s and s.get("handed_to"):
+        return _resume_set(key, status="done", fired_at=now, message=
+                           f"work already continued by [{s['handed_to']}] — nothing sent")
+    if s and s["status"] != "limit":
+        return _resume_set(key, status="done", fired_at=now, message=
+                           f"session is {s['status']} — no resume needed")
+
+    until = _limit_active_until(account, r.get("model"), now)
+    if until:
+        attempts = int(r.get("attempts", 0)) + 1
+        if attempts >= RESUME_MAX_ATTEMPTS:
+            return _resume_set(key, status="failed", fired_at=now, message=
+                               f"still limited after {attempts} checks — gave up")
+        return _resume_set(key, due_at=until + float(r.get("delay_s") or 60),
+                           attempts=attempts, message=
+                           "still limited — re-armed for the next reset")
+
+    msg = CFG.get("resume_message", "continue")
+    if proc and proc.get("reachable"):
+        res = send_to_process(proc["pid"], msg)
+        if res.get("ok"):
+            return _resume_set(key, status="done", fired_at=now,
+                               message=f"sent '{msg}' — {res['message']}")
+    wt = next((w for w in discover_worktrees() if w["name"] == worktree), None)
+    home = next((h for h in claude_homes() if account_label(h) == account), None)
+    if not wt or not home:
+        return _resume_set(key, status="failed", fired_at=now, message=
+                           "worktree or account no longer known — nothing sent")
+    out = _tmux_resume(worktree, (s or {}).get("cwd") or wt["path"], home, sid)
+    return _resume_set(key, status="done" if out["ok"] else "failed",
+                       fired_at=now, message=out["message"])
+
+
+def resume_loop():
+    """Daemon: fire due schedules; prune finished ones after a day."""
+    while True:
+        time.sleep(RESUME_POLL_S)
+        now = time.time()
+        with _resumes_lock:
+            due = [k for k, r in _resumes.items()
+                   if r.get("status") == "pending" and r.get("due_at", 0) <= now]
+        for k in due:
+            try:
+                fire_resume(k)
+            except Exception as e:   # a broken fire must not kill the loop
+                _resume_set(k, status="failed", fired_at=now,
+                            message=f"internal error: {e}")
+        with _resumes_lock:
+            stale = [k for k, r in _resumes.items()
+                     if r.get("status") in ("done", "failed")
+                     and now - r.get("fired_at", now) > 86400]
+            for k in stale:
+                del _resumes[k]
+        if stale:
+            save_resumes()
+
+
 # ------------------------------------------------------------------- server
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/state"):
-            body = json.dumps(cached_state()).encode()
+            # schedules ride along so the board needs no second fetch
+            body = json.dumps({**cached_state(),
+                               "resumes": resume_public()}).encode()
             ctype = "application/json"
         elif self.path.startswith("/api/focus"):
             m = re.search(r"pid=(\d+)", self.path)
@@ -1854,6 +2124,14 @@ class Handler(BaseHTTPRequestHandler):
             payload = {}
         if self.path.startswith("/api/reserve"):
             result = set_reserve(payload.get("account"), payload.get("percent"))
+        elif self.path.startswith("/api/resume/schedule"):
+            result = schedule_resume(
+                payload.get("worktree"), payload.get("sid"),
+                payload.get("account"), model=payload.get("model"),
+                delay_s=payload.get("delay_s"),
+                resets_at=payload.get("resets_at"), due_at=payload.get("due_at"))
+        elif self.path.startswith("/api/resume/cancel"):
+            result = cancel_resume(payload.get("worktree"), payload.get("sid"))
         elif self.path.startswith("/api/send"):
             result = send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
         elif self.path.startswith("/api/finish"):
@@ -1884,6 +2162,9 @@ if __name__ == "__main__":
     if CFG["host"] not in ("127.0.0.1", "localhost", "::1"):
         print("orchestr: WARNING — binding beyond loopback serves your "
               "transcript text to the network", file=sys.stderr)
+    if not DEMO:
+        load_resumes()
+        threading.Thread(target=resume_loop, daemon=True).start()
     server = ThreadingHTTPServer((CFG["host"], CFG["port"]), Handler)
     mode = " (demo data)" if DEMO else ""
     print(f"orchestr up → http://{CFG['host']}:{CFG['port']}{mode}")
