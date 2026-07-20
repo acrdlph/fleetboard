@@ -202,8 +202,11 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
     <li><b>agent alive</b> → it receives the closeout brief: land the branch
       on the trunk, tidy the worktree, report back. Once it reports landed,
       <b>✓ finish</b> again closes its terminal.</li>
-    <li><b>terminal already gone</b> → a small closeout agent is dispatched
-      into the worktree to do the same.</li>
+    <li><b>terminal already gone</b> → a one-shot closeout agent (headless
+      <kbd>claude -p</kbd>) runs the same brief, then git verifies the
+      landing: clean → the process ends and the card frees itself, no second
+      click; anything else → the session reopens interactively and parks as
+      <i>needs you</i>, so a failed closeout never reads as free.</li>
     <li><b>everything landed, agent idle</b> → <kbd>/exit</kbd> is typed and
       the terminal closes.</li>
   </ul>

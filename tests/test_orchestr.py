@@ -11,6 +11,7 @@ it here does NOT start the server. Data-driven functions read module globals
 
 import importlib.util
 import json
+import shlex
 import tempfile
 import threading
 import unittest
@@ -424,6 +425,32 @@ class TestDispatchLog(ConfigGuard):
 
     def test_limit(self):
         self.assertEqual(len(fb.read_dispatch_log(limit=2)["entries"]), 2)
+
+
+# --------------------------------------------------------- one-shot closeout
+
+class TestCloseoutShell(unittest.TestCase):
+    def shell(self, model=None, brief="close out now", trunk="origin/main"):
+        return fb.closeout_shell(Path("/homes/acct 2"), model, brief, trunk)
+
+    def test_headless_then_verify_then_fallback(self):
+        sh = self.shell()
+        # order matters: headless run, git verification, interactive fallback
+        self.assertLess(sh.index(" -p "), sh.index("merge-base --is-ancestor"))
+        self.assertLess(sh.index("merge-base --is-ancestor"), sh.index("--continue"))
+        self.assertIn("git merge-base --is-ancestor HEAD origin/main", sh)
+        self.assertIn("exit 0", sh)                      # verified clean -> session dies
+        self.assertIn("exec claude", sh)                 # failure -> interactive resume
+        self.assertIn("--dangerously-skip-permissions", sh)
+
+    def test_quotes_survive_shell(self):
+        sh = self.shell(brief="don't break; rm -rf $(pwd)")
+        self.assertIn(shlex.quote("don't break; rm -rf $(pwd)"), sh)
+        self.assertIn(shlex.quote("/homes/acct 2"), sh)  # space in the home path
+
+    def test_model_flag_only_when_given(self):
+        self.assertIn("--model opus", self.shell(model="opus"))
+        self.assertNotIn("--model", self.shell())
 
 
 # --------------------------------------------------------- demo integration

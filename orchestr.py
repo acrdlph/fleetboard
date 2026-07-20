@@ -1311,15 +1311,34 @@ CLOSEOUT_TEXT = (
 )
 
 
+def closeout_shell(home, model, brief, trunk):
+    """The tmux command for a one-shot closeout: run claude headless, then let
+    git itself verify the landing. Verified clean -> exit, the tmux session
+    dies, the card reads FREE with no second ✓ finish. Anything else -> resume
+    the conversation interactively, so a failed closeout parks as needs-you
+    instead of masquerading as free."""
+    model_flag = f" --model {shlex.quote(model)}" if model else ""
+    return (
+        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(home))}\n"
+        f"claude --dangerously-skip-permissions{model_flag} -p {shlex.quote(brief)}\n"
+        f"if git merge-base --is-ancestor HEAD {shlex.quote(trunk)} 2>/dev/null "
+        '&& [ -z "$(git status --porcelain)" ]; then exit 0; fi\n'
+        "echo; echo '⚠ closeout could not verify a clean landing — resuming the session:'\n"
+        "exec claude --dangerously-skip-permissions --continue\n"
+    )
+
+
 def _reachable(p):
     return bool(p.get("tmux_target")) or (
         p.get("host") in ("Terminal", "iTerm2") and p.get("tty"))
 
 
 def start_finish(wt_name):
-    """One button, three behaviors, always through a terminal:
-    live agent -> type the closeout brief at it; no terminal -> dispatch a
-    closeout agent; everything landed and an agent idling -> type /exit."""
+    """One button, three behaviors:
+    live agent -> type the closeout brief at it; no terminal -> launch a
+    one-shot closeout agent (headless; frees the card itself, or parks as
+    needs-you if the landing doesn't verify); everything landed and an agent
+    idling -> type /exit."""
     if DEMO:
         return {"ok": False, "message": "demo mode — nothing to finish"}
     wt = next((w for w in discover_worktrees() if w["name"] == wt_name), None)
@@ -1357,11 +1376,13 @@ def start_finish(wt_name):
         if branch == trunk.split("/", 1)[-1]:
             return {"ok": True, "mode": "noop",
                     "message": "already landed and clean — nothing to finish"}
-    out = start_dispatch(CLOSEOUT_TEXT.format(trunk=trunk), worktree=wt_name)
+    out = start_dispatch(CLOSEOUT_TEXT.format(trunk=trunk), worktree=wt_name,
+                         closeout_trunk=trunk)
     out.setdefault("ok", True)
     out["mode"] = "dispatch"
     out.setdefault("message",
-                   "no live terminal — dispatched a closeout agent")
+                   "no live terminal — launched a one-shot closeout agent; "
+                   "the card frees itself once the landing verifies")
     return out
 
 
@@ -1558,10 +1579,13 @@ def _log(job, line):
 
 
 def start_dispatch(mission, worktree=None, account=None, use_router=False,
-                   model=None, effort=None, force_model=False):
+                   model=None, effort=None, force_model=False,
+                   closeout_trunk=None):
     """Kick a dispatch off in the background; return a job id to poll.
     If an explicit model has no account with enough headroom (above reserve),
-    return a needs_decision instead of launching — unless force_model."""
+    return a needs_decision instead of launching — unless force_model.
+    With closeout_trunk set the mission runs as a one-shot closeout (headless
+    claude that verifies its own landing against that trunk ref)."""
     if not DEMO and model and not force_model:
         cached_limits()
         cands = model_candidates(model, only_account=account)
@@ -1591,11 +1615,13 @@ def start_dispatch(mission, worktree=None, account=None, use_router=False,
         for old in list(_jobs)[:-20]:   # keep only the last 20 jobs
             del _jobs[old]
     threading.Thread(target=_run_dispatch, daemon=True, args=(
-        job, mission, worktree, account, use_router, model, effort)).start()
+        job, mission, worktree, account, use_router, model, effort,
+        closeout_trunk)).start()
     return {"job": job_id}
 
 
-def _run_dispatch(job, mission, worktree, account, use_router, model, effort):
+def _run_dispatch(job, mission, worktree, account, use_router, model, effort,
+                  closeout_trunk=None):
     def finish(result):
         with _jobs_lock:
             job["result"] = result
@@ -1650,6 +1676,36 @@ def _run_dispatch(job, mission, worktree, account, use_router, model, effort):
     home = next((h for h in claude_homes() if account_label(h) == account), None)
     if not home:
         return finish({"ok": False, "message": f"unknown account {account}"})
+
+    if closeout_trunk:
+        # One-shot closeout: no branch header (the branch IS the mission), no
+        # effort dance (a headless run takes no slash commands). The wrapper
+        # verifies the landing itself — see closeout_shell.
+        name = ("closeout-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree)
+                .strip("-").lower() + time.strftime("-%H%M%S"))
+        _log(job, f"② launching one-shot closeout {name}…")
+        rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
+                       "-c", wt["path"],
+                       closeout_shell(home, model, mission, closeout_trunk)])
+        if rc != 0:
+            return finish({"ok": False,
+                           "message": f"tmux failed: {out or 'is tmux installed?'}"})
+        try:
+            with open(DISPATCH_LOG, "a") as lf:
+                lf.write(json.dumps({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": name,
+                    "worktree": worktree, "account": account, "model": model,
+                    "closeout": True, "mission_original": mission,
+                    "kickoff": mission}) + "\n")
+        except OSError:
+            pass
+        _log(job, "✓ launched")
+        return finish({"ok": True, "message":
+                       f"one-shot closeout running in {worktree} on [{account}] — "
+                       "the card frees itself once the landing verifies; if it "
+                       "can't land, the session stays open and needs you",
+                       "session": name, "worktree": worktree, "account": account,
+                       "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
 
     header = (f"First check out a new branch {branch} from latest origin/main. "
               if branch else

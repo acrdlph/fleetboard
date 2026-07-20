@@ -112,8 +112,9 @@ refetch". Nothing polls the Anthropic API on a timer.
   `continue`. Weekly limits never show it — they won't heal soon.
 - **✓ finish** — one click hands closeout to an agent: the live one gets a
   closeout brief (land the branch, tidy up, report), a missing one is
-  replaced by a freshly dispatched closeout agent, and an idle agent whose
-  work already landed just gets `/exit`. See *Closing out a mission* below.
+  replaced by a one-shot closeout agent that frees the card by itself, and an
+  idle agent whose work already landed just gets `/exit`. See *Closing out a
+  mission* below.
 - **🚀 new mission** — describe a feature; orchestr picks the cleanest free
   worktree and the most-headroom account (or a one-shot
   `claude -p --model haiku` router picks them, plus a branch name), then
@@ -160,8 +161,11 @@ orchestr does — works by talking to a terminal:
 - **agent alive** → it receives a closeout brief: land the branch on the
   trunk (merge, resolve, push), tidy the worktree, report back. ✓ finish
   again once it's done closes the terminal.
-- **terminal already gone** → a small closeout agent is dispatched into the
-  worktree to do the same.
+- **terminal already gone** → a one-shot closeout agent (headless `claude -p`)
+  runs the same brief, then git itself verifies the landing: verified clean →
+  the process ends and the card frees itself, no second click; anything else →
+  the session reopens interactively and the card parks as *needs you* — a
+  failed closeout never masquerades as free.
 - **everything landed, agent idle** → `/exit` is typed and the terminal
   closes.
 
