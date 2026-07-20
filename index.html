@@ -829,8 +829,10 @@ function acctLabel(dir) {
 }
 // The worktree/account pickers are built from /api/state and /api/limits, which
 // can still be in flight when the composer opens (a cold state scan takes a few
-// seconds). So they rebuild themselves whenever fresh data lands — no waiting on
-// a timer, and no stale "none free" left sitting there.
+// seconds). So their OPTION LISTS refresh whenever fresh data lands — but the
+// select elements themselves are built once and never replaced: the old
+// rebuild-the-footer approach snapped any open dropdown shut on every 5s tick.
+// The rule: the refetch loop may swap data under a control, never the control.
 let missionOpen = false;
 // Routing is deterministic — mirror the backend rule exactly (least-dirty free
 // worktree, _pick_defaults) so the previewed name is the one that launches.
@@ -840,18 +842,40 @@ function ruleBasedAutoPick() {
   free.sort((a, b) => ((a.git && a.git.dirty) || 0) - ((b.git && b.git.dirty) || 0));
   return free.length ? free[0].name : null;
 }
-function missionPickersHtml() {
+// the two data-driven pickers as option lists ({v: value, t: label});
+// model & effort are static and never need refreshing
+function wtOptions() {
   const frees = lastState ? lastState.free_worktrees : [];
   const all = lastState ? lastState.worktrees.map(w => w.name) : [];
+  return [{ v: "", t: `worktree: auto (${ruleBasedAutoPick() || (lastState ? "none free" : "…")})` },
+    ...all.map(n => ({ v: n, t: n + (frees.includes(n) ? " · free" : "") }))];
+}
+function acctOptions() {
   const accts = LIMITS && LIMITS.accounts ? LIMITS.accounts.filter(a => a.ok) : [];
-  const loading = !lastState ? " — loading…" : "";
-  const wtAuto = `worktree: auto (${ruleBasedAutoPick() || (lastState ? "none free" : "…")})`;
+  return [{ v: "", t: "account: auto" + (lastState ? "" : " — loading…") },
+    ...accts.map(a => ({ v: acctLabel(a.config_dir),
+      t: `${acctLabel(a.config_dir)} · ${Math.round(a.headroom_percent ?? 0)}% left` }))];
+}
+function optionsHtml(opts) {
+  return opts.map(o => `<option value="${esc(o.v)}">${esc(o.t)}</option>`).join("");
+}
+// Update a select's options in place: only when the data actually changed,
+// and never while the user is in the control (replacing options under an
+// open dropdown closes it just like replacing the element would).
+function setOptions(sel, opts) {
+  const sig = JSON.stringify(opts);
+  if (sel.dataset.sig === sig || document.activeElement === sel) return;
+  const keep = sel.value;
+  sel.innerHTML = optionsHtml(opts);
+  sel.dataset.sig = sig;
+  // only restore a choice that still exists in the refreshed list
+  if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+}
+function missionPickersHtml() {
   return `
     <div class="row">
-      <select id="mWt"><option value="">${esc(wtAuto)}</option>
-        ${all.map(n => `<option value="${esc(n)}">${esc(n)}${frees.includes(n) ? " · free" : ""}</option>`).join("")}</select>
-      <select id="mAcct"><option value="">account: auto${esc(loading)}</option>
-        ${accts.map(a => `<option value="${esc(acctLabel(a.config_dir))}">${esc(acctLabel(a.config_dir))} · ${Math.round(a.headroom_percent ?? 0)}% left</option>`).join("")}</select>
+      <select id="mWt">${optionsHtml(wtOptions())}</select>
+      <select id="mAcct">${optionsHtml(acctOptions())}</select>
     </div>
     <div class="row">
       <select id="mModel"><option value="">model — pick one</option>
@@ -866,16 +890,12 @@ function missionPickersHtml() {
     <div class="row"><span class="dnote">model &amp; effort are your call — placement is deterministic</span>
       <button class="send" style="margin-left:auto" onclick="launchMission()">launch</button></div>`;
 }
-// rebuild the pickers in place, keeping whatever the user already picked
+// fresh data landed — swap option lists only; the footer DOM, the user's
+// picks, and any dropdown they're holding open all stay untouched
 function refreshMissionPickers() {
   if (!missionOpen || !$("mWt")) return;
-  const keep = ["mWt", "mAcct", "mModel", "mEffort"].map(k => [k, $(k).value]);
-  $("dfoot").innerHTML = missionPickersHtml();
-  keep.forEach(([k, v]) => {
-    const sel = $(k);
-    // only restore a choice that still exists in the refreshed list
-    if (sel && v && [...sel.options].some(o => o.value === v)) sel.value = v;
-  });
+  setOptions($("mWt"), wtOptions());
+  setOptions($("mAcct"), acctOptions());
 }
 function openMission() {
   chatCtx = null; clearTimeout(chatTimer);
