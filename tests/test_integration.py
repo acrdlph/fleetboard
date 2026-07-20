@@ -157,6 +157,26 @@ class TestCollectPipeline(unittest.TestCase):
         s = fb.collect_state()["worktrees"][0]["sessions"][0]
         self.assertEqual(s["pending_workflows"], 1)
 
+    def test_closeout_flag_rides_the_card_and_dies_with_the_terminal(self):
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("close it out"), assistant_msg(text="on it"), turn_end()])
+        fb._closeouts.clear()
+        fb._closeouts["myapp"] = ts = time.time() - 30
+        # terminal alive → the card advertises step two (✕ close)
+        fb.claude_processes = lambda: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": "claude --dangerously-skip-permissions",
+            "account": None, "tmux_target": "s:0", "shells": 0}]
+        fb._cache["state"] = None
+        card = fb.collect_state()["worktrees"][0]
+        self.assertEqual(card["closeout_sent"], ts)
+        # terminal gone → the flag dies; no stale ✕ close on a freed card
+        fb.claude_processes = lambda: []
+        fb._cache["state"] = None
+        card = fb.collect_state()["worktrees"][0]
+        self.assertNotIn("closeout_sent", card)
+        self.assertNotIn("myapp", fb._closeouts)
+
 
 @unittest.skipUnless(HAVE_GIT, "git not available")
 class TestTopologyPipeline(unittest.TestCase):

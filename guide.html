@@ -202,10 +202,14 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
   talking to a terminal:</p>
   <ul>
     <li><b>agent alive</b> → it receives the closeout brief: land the branch
-      on the trunk, tidy the worktree, report back. Once it reports landed,
-      <b>✓ finish</b> again closes its terminal. Merged from the terminal
-      yourself already? The brief shrinks to match — settle background work,
-      tidy scratch, park on the trunk; nothing merged is re-checked.</li>
+      on the trunk, tidy the worktree, report back — and the button flips to
+      <b>✕ close</b>, step two. Once the agent reports landed, ✕ close
+      verifies the landing (fetch · merge-base · clean tree) and types
+      <kbd>/exit</kbd>, closing its terminal; pressed early, it refuses and
+      names what's still unverified — it never re-types the brief at an
+      agent that may be mid-closeout. Merged from the terminal yourself
+      already? The brief shrinks to match — settle background work, tidy
+      scratch, park on the trunk; nothing merged is re-checked.</li>
     <li><b>terminal already gone</b> → a one-shot closeout agent (headless
       <kbd>claude -p --model haiku</kbd> — mechanical git work) runs the
       right-sized brief, then git verifies the landing: clean → the process

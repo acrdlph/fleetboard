@@ -175,10 +175,14 @@ orchestr does — works by talking to a terminal:
 ![one button lands it](docs/finish-flow.png)
 
 - **agent alive** → it receives a closeout brief: land the branch on the
-  trunk (merge, resolve, push), tidy the worktree, report back. ✓ finish
-  again once it's done closes the terminal. Merged to the trunk from the
-  terminal yourself already? The brief shrinks to match — settle background
-  work, tidy scratch, park on the trunk; nothing already merged is re-checked.
+  trunk (merge, resolve, push), tidy the worktree, report back — and the
+  button flips to **✕ close**, step two. Once the agent reports done,
+  ✕ close verifies the landing and types `/exit`, closing the terminal;
+  pressed early, it refuses and names what's still unverified — it never
+  re-types the brief at an agent that may be mid-closeout. Merged to the
+  trunk from the terminal yourself already? The brief shrinks to match —
+  settle background work, tidy scratch, park on the trunk; nothing already
+  merged is re-checked.
 - **terminal already gone** → a one-shot closeout agent (headless
   `claude -p --model haiku` — the work is mechanical git, no judgment needed)
   runs the right-sized brief, then git itself verifies the landing: verified

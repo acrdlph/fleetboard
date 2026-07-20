@@ -762,6 +762,15 @@ def collect_state():
     for c in cards:
         c["availability"] = card_availability(
             _attention_statuses(c["sessions"]), bool(c["live_procs"]))
+        # two-step finish: while a closeout brief is with this card's live
+        # agent, the button reads ✕ close. The flag dies with the terminal,
+        # so a card never offers to close an agent that no longer exists.
+        ts = _closeouts.get(c["name"])
+        if ts:
+            if c["live_procs"]:
+                c["closeout_sent"] = ts
+            else:
+                _closeouts.pop(c["name"], None)
 
     matched = {p["pid"] for c in cards for p in c["live_procs"]}
     other = [p for p in procs if p["pid"] not in matched]
@@ -1380,6 +1389,13 @@ SLIM_CLOSEOUT_TEXT = (
     "4) reply with one line saying what, if anything, was left to do."
 )
 
+# worktree name -> epoch seconds when a closeout brief was typed at its live
+# agent. Step two of ✓ finish: while this is set (and the terminal lives) the
+# board shows ✕ close instead — which only verifies the landing and /exits;
+# it never re-types the brief into a mid-closeout agent. The flag dies with
+# the terminal, so a fresh mission never inherits it.
+_closeouts = {}
+
 
 def _park_on_trunk(git_root, trunk):
     """Landed and clean: park the worktree on the trunk branch right here —
@@ -1447,19 +1463,39 @@ def start_finish(wt_name):
     if live:
         if landed and not porcelain:
             res = send_to_process(live["pid"], "/exit")
+            if res["ok"]:
+                _closeouts.pop(wt_name, None)
+                _cache["t"] = 0.0    # button reverts on the next poll
             return {"ok": res["ok"], "mode": "exit", "message":
                     "already landed — sent /exit to close the terminal"
                     if res["ok"] else res["message"]}
+        sent = _closeouts.get(wt_name)
+        if sent:
+            # step two (✕ close) — but the landing doesn't verify yet. Closing
+            # now would be a guess, and re-typing the brief would interrupt an
+            # agent that may be mid-closeout: report instead of acting.
+            left = (f"{len(porcelain)} leftover file(s)" if landed
+                    else f"branch not landed on {trunk}")
+            mins = int((time.time() - sent) // 60)
+            ago = f"{mins}m ago" if mins else "under a minute ago"
+            return {"ok": False, "mode": "pending", "message":
+                    f"can't close yet — {left}. The closeout brief went to "
+                    f"the agent {ago}; if it looks stuck, ✉ chat with it. "
+                    "✕ close works once the landing verifies."}
         brief = (SLIM_CLOSEOUT_TEXT if landed else CLOSEOUT_TEXT)
         res = send_to_process(live["pid"], brief.format(trunk=trunk))
         if not res["ok"]:
             return {"ok": False, "mode": "slim" if landed else "brief",
                     "message": res["message"]}
+        _closeouts[wt_name] = time.time()
+        _cache["t"] = 0.0            # show ✕ close on the next poll, not in 4s
         return {"ok": True, "mode": "slim" if landed else "brief", "message":
                 ("already landed — slim brief sent (tidy scratch and park, "
                  "no re-merge)" if landed else
                  "closeout brief sent to the live agent")
-                + " — once it reports done, ✓ finish again to close the terminal"}
+                + " — when it reports done, ✕ close verifies the landing "
+                  "and closes the terminal"}
+    _closeouts.pop(wt_name, None)    # no live agent — the two-step is moot
     if mine:
         return {"ok": False, "message":
                 "a live process exists but its terminal can't be scripted — "

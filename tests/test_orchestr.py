@@ -602,6 +602,7 @@ class TestStartFinish(ConfigGuard):
     def setUp(self):
         super().setUp()
         fb.DEMO = False
+        fb._closeouts.clear()
         self._saved = {n: getattr(fb, n) for n in
                        ("run", "discover_worktrees", "claude_processes",
                         "send_to_process", "_base_ref", "start_dispatch")}
@@ -648,6 +649,50 @@ class TestStartFinish(ConfigGuard):
         out = self.finish(landed=False)
         self.assertEqual(out["mode"], "brief")
         self.assertIn("merge-base --is-ancestor", self.sent[0])
+
+    # -- two-step: brief sent, then ✕ close ---------------------------------
+    def test_brief_send_marks_the_card_for_step_two(self):
+        self.live()
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "brief")
+        self.assertIn("wt", fb._closeouts)
+        self.assertIn("✕ close", out["message"])   # the toast teaches step two
+
+    def test_close_while_unverified_reports_instead_of_rebriefing(self):
+        # re-typing the brief would interrupt an agent mid-closeout; ✕ close
+        # must only ever verify + /exit, or say why it can't
+        self.live()
+        self.finish(landed=False)
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "pending")
+        self.assertFalse(out["ok"])
+        self.assertIn("not landed", out["message"])
+        self.assertEqual(len(self.sent), 1)        # the brief went exactly once
+
+    def test_close_pending_names_the_leftover_dirt(self):
+        self.live()
+        self.finish(landed=False)
+        out = self.finish(landed=True, porcelain=" M src/app.py\n?? tmp\n")
+        self.assertEqual(out["mode"], "pending")
+        self.assertIn("2 leftover file(s)", out["message"])
+
+    def test_close_exits_once_the_landing_verifies(self):
+        self.live()
+        self.finish(landed=False)
+        out = self.finish(landed=True)
+        self.assertEqual(out["mode"], "exit")
+        self.assertEqual(self.sent[-1], "/exit")
+        self.assertNotIn("wt", fb._closeouts)      # step two done — flag gone
+
+    def test_pending_close_dies_with_the_terminal(self):
+        # agent exited on its own (or was killed): the two-step is moot and
+        # finish drops to the normal no-terminal tiers, not a stale "pending"
+        self.live()
+        self.finish(landed=False)
+        fb.claude_processes = lambda: []
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "dispatch")
+        self.assertNotIn("wt", fb._closeouts)
 
     # -- no terminal, landed ------------------------------------------------
     def test_landed_clean_on_feature_branch_parks_without_agent(self):

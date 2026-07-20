@@ -495,8 +495,12 @@ function render(st) {
           if (loose.length) return loose.map(p => procChip(p, { title: "live terminal in this worktree — not tied to a session yet" })).join("");
           return w.live_procs.length ? "" : `<span class="noproc">no live proc</span>`;
         })()}
-          <button class="abtn finish ${finArmed ? "armed" : ""}" data-wt="${esc(w.name)}"
-            title="close out: whatever's left gets done — already-landed work is never re-checked; card goes free">${finArmed ? "✓ confirm" : "✓ finish"}</button></span>
+          <button class="abtn finish ${finArmed ? "armed" : ""}" data-wt="${esc(w.name)}" ${w.closeout_sent ? 'data-close="1"' : ""}
+            title="${w.closeout_sent
+              ? `step 2 of finish — closeout brief sent ${rel(Math.floor(Date.now() / 1000 - w.closeout_sent))} ago; once the agent reports done, this verifies the landing and /exits it (never re-sends the brief)`
+              : "close out: whatever's left gets done — already-landed work is never re-checked; card goes free"}">${
+            w.closeout_sent ? (finArmed ? "✕ confirm" : "✕ close")
+                            : (finArmed ? "✓ confirm" : "✓ finish")}</button></span>
       </div>
       <div class="gitline"><span class="branch">${esc(g.branch || "?")}</span>${dirty}${sync}</div>
       <div class="commit" title="${esc(g.commit ? g.commit.subject : "")}">${commit}</div>
@@ -627,14 +631,15 @@ document.addEventListener("click", async (ev) => {
   if (!b) return;
   const wt = b.dataset.wt;
   const armed = window._armFinish && window._armFinish.wt === wt && Date.now() < window._armFinish.until;
+  const closing = !!b.dataset.close;
   if (!armed) {
     window._armFinish = { wt, until: Date.now() + 6000 };
-    b.classList.add("armed"); b.textContent = "✓ confirm";
+    b.classList.add("armed"); b.textContent = closing ? "✕ confirm" : "✓ confirm";
     setTimeout(() => { if (lastState) render(lastState); }, 6200);
     return;
   }
   window._armFinish = null;
-  toast(`✓ finishing ${wt}…`);
+  toast(closing ? `✕ closing ${wt}…` : `✓ finishing ${wt}…`);
   try {
     const r = await fetch("/api/finish", { method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -643,7 +648,7 @@ document.addEventListener("click", async (ev) => {
     toast((d.ok ? "✓ " : "✗ ") + d.message);
     if (d.job) pollFinishJob(d.job);
   } catch (e) { toast("✗ finish request failed"); }
-  if (lastState) render(lastState);
+  tick();   // the server drops its state cache on finish — pick up ✓→✕ now
 });
 function pollFinishJob(job) {
   const t = setInterval(async () => {
