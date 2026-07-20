@@ -283,6 +283,36 @@ def _tmux_pane_map(sock_flag):
     return panes
 
 
+# The Bash tool wraps every command — foreground or run_in_background — in a
+# `zsh/bash -c` child of the claude process. The wrapper is recognisable by any
+# of: the shell-snapshot it sources, its setopt prelude, or the cwd file it
+# records into /tmp/claude-XXXX-cwd on exit.
+_BASH_WRAPPER = re.compile(
+    r"shell-snapshots/snapshot-|setopt NO_EXTENDED_GLOB|pwd -P >\| /tmp/claude-\w+-cwd")
+
+
+def shell_children(table, claude_pids):
+    """claude pid -> count of live Bash-tool shells running under it.
+
+    A live wrapper shell proves its claude is mid-tool even when the transcript
+    has gone quiet — a backgrounded build writes nothing to the transcript
+    until it exits, at which point the agent resumes on its own."""
+    counts = {}
+    for pid, (ppid, _tty, cmd) in table.items():
+        head = cmd.split(" ", 1)[0].rsplit("/", 1)[-1]
+        if head not in ("zsh", "bash", "sh") or not _BASH_WRAPPER.search(cmd):
+            continue
+        anc = ppid
+        for _ in range(6):  # observed depth is 1; allow a few wrapper hops
+            if anc in claude_pids:
+                counts[anc] = counts.get(anc, 0) + 1
+                break
+            anc = table.get(anc, (None,))[0]
+            if not anc or anc == 1:
+                break
+    return counts
+
+
 def claude_processes():
     """Live `claude` CLI processes with cwd, tty, and hosting terminal app."""
     rc, out = run(["ps", "-axo", "pid=,ppid=,tty=,pcpu=,etime=,command="])
@@ -296,6 +326,7 @@ def claude_processes():
         if cmd == "claude" or cmd.startswith("claude "):
             procs.append({"pid": int(pid), "cpu": float(cpu), "etime": etime,
                           "cmd": cmd, "tty": None if tty in ("??", "-") else tty})
+    shells = shell_children(table, {p["pid"] for p in procs})
     cwds = _pid_cwds([p["pid"] for p in procs])
     cfgdirs = _pid_config_dirs([p["pid"] for p in procs])
     # If the lookup came back empty for every process the mechanism itself
@@ -304,6 +335,7 @@ def claude_processes():
     env_readable = bool(cfgdirs)
     pane_maps = {}
     for p in procs:
+        p["shells"] = shells.get(p["pid"], 0)
         p["cwd"] = cwds.get(p["pid"])
         cfg = cfgdirs.get(p["pid"])
         # bare `claude` with no CLAUDE_CONFIG_DIR set is the default home
@@ -517,7 +549,7 @@ def match_worktree(proj_name, wt_prefixes):
 
 
 def classify_session(age_s, alive, pending_tools, pending_workflows,
-                     skip_perms, working_s):
+                     skip_perms, working_s, shells=0):
     """Base session status from observable signals (before limit/handoff
     overrides). Returns (status, tool_running)."""
     pend = pending_tools or []
@@ -527,6 +559,9 @@ def classify_session(age_s, alive, pending_tools, pending_workflows,
         return "needs_input", False
     if alive and pending_workflows:          # delegated to its own workflows
         return "working", False
+    if alive and shells:                     # a Bash shell is still running —
+        return "working", True               # backgrounded ones leave the
+                                             # transcript idle until they exit
     if alive and pend and skip_perms:        # long tool run, nothing to approve
         return "working", True
     if alive and pend:
@@ -613,19 +648,38 @@ def scan_sessions(worktrees, procs, now):
         for s in sessions:
             proc = owner.get(s["sid"])
             alive = proc is not None
+            shell_n = proc.get("shells", 0) if proc else 0
             s["pid"] = proc["pid"] if proc else None
             # only an account match is a real attribution; a fallback pairing is
             # a guess and must not be presented as one
             s["pid_certain"] = bool(proc and proc.get("account") == s["account"])
             status, tool_running = classify_session(
                 s["age_s"], alive, s["pending_tools"], s["pending_workflows"],
-                skip_perms, CFG["working_s"])
+                skip_perms, CFG["working_s"], shell_n)
             s["status"] = status
             if tool_running:
                 s["tool_running"] = True
+                if shell_n and not s["pending_tools"]:
+                    s["bg_shell"] = True     # transcript idle, shell alive
         sessions.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
         by_wt[wt] = sessions[: CFG["max_sessions"]]
     return by_wt
+
+
+def card_availability(st, has_live):
+    """Card-level triage from its sessions' statuses (post handoff filter)."""
+    if not (has_live or "working" in st):
+        return "free"          # safe to point a new agent here
+    if any(k in st for k in ("needs_input", "blocked")):
+        return "attention"     # hard blocker — needs you
+    if "waiting" in st and "working" not in st:
+        return "attention"     # everyone parked at the prompt — needs direction
+    if "limit" in st and "working" not in st:
+        # out of juice, not out of instructions — nothing you can do until the
+        # limit resets, so it is NOT "needs you". (This card-level "waiting" is
+        # unrelated to the session status "waiting" = idle at the prompt.)
+        return "waiting"
+    return "busy"              # something is actively working
 
 
 def collect_state():
@@ -704,16 +758,8 @@ def collect_state():
         })
 
     for c in cards:
-        st = _attention_statuses(c["sessions"])
-        if c["live_procs"] or "working" in st:
-            if any(k in st for k in ("needs_input", "blocked", "limit")):
-                c["availability"] = "attention"   # hard blocker — needs you
-            elif "waiting" in st and "working" not in st:
-                c["availability"] = "attention"   # everyone parked — needs direction
-            else:
-                c["availability"] = "busy"        # something is actively working
-        else:
-            c["availability"] = "free"            # safe to point a new agent here
+        c["availability"] = card_availability(
+            _attention_statuses(c["sessions"]), bool(c["live_procs"]))
 
     matched = {p["pid"] for c in cards for p in c["live_procs"]}
     other = [p for p in procs if p["pid"] not in matched]
@@ -721,10 +767,10 @@ def collect_state():
     def severity(c):
         st = _attention_statuses(c["sessions"])
         if "needs_input" in st: return 0
-        if "limit" in st: return 1
-        if "blocked" in st: return 2
-        if "waiting" in st and "working" not in st: return 3
-        if "working" in st: return 4
+        if "blocked" in st: return 1
+        if "waiting" in st and "working" not in st: return 2
+        if "working" in st: return 3
+        if "limit" in st: return 4   # un-actionable — parked behind the busy ones
         return 5
     cards.sort(key=lambda c: (severity(c), c["name"].lower()))
 
@@ -1586,6 +1632,16 @@ def start_dispatch(mission, worktree=None, account=None,
     return {"job": job_id}
 
 
+def kickoff_sent(pane):
+    """True once the composer no longer holds the brief: the CLI is visibly
+    mid-turn, or the input line at the bottom of the pane is bare again."""
+    if "esc to interrupt" in pane:
+        return True
+    prompts = [l.strip() for l in pane.splitlines()
+               if l.lstrip().startswith(("❯", ">"))]
+    return bool(prompts) and prompts[-1] in ("❯", ">")
+
+
 def _run_dispatch(job, mission, worktree, account, model, effort,
                   closeout_trunk=None):
     def finish(result):
@@ -1682,8 +1738,25 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
             keys("Escape")
             time.sleep(1)
     _log(job, "⑤ sending kickoff brief…")
-    keys("-l", brief)
-    keys("Enter")
+    # send-keys -l delivers the brief as one rapid keystroke burst; the CLI's
+    # paste heuristic chops it into "[Pasted text #N]" chips and an Enter sent
+    # on its heels is swallowed by that ingestion — the brief then sits in the
+    # composer unsent while the board claims a launch. Paste atomically
+    # (bracketed, no heuristics), then press Enter until the send is proven.
+    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestr-kickoff", brief])
+    run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
+         "-b", "orchestr-kickoff", "-t", name])
+    time.sleep(1)
+    kick_sent = False
+    for _ in range(3):
+        keys("Enter")
+        time.sleep(2)
+        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+        if kickoff_sent(pane):
+            kick_sent = True
+            break
+    _log(job, "  kickoff " + ("sent ✓" if kick_sent
+                              else "UNCONFIRMED ⚠ — attach and press Enter"))
 
     try:  # audit trail: every dispatch, with the author's original words
         with open(DISPATCH_LOG, "a") as lf:
@@ -1697,13 +1770,15 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
     effort_note = ""
     if effort:
         effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")
-    _log(job, "✓ launched")
+    kick_note = "" if kick_sent else \
+        " · ⚠ kickoff UNCONFIRMED — attach and press Enter"
+    _log(job, "✓ launched" if kick_sent else "⚠ launched, kickoff unconfirmed")
     finish({"ok": True,
             "message": f"launched {name} in {worktree} on [{account}]"
-                       + (f" · {model}" if model else "") + effort_note,
+                       + (f" · {model}" if model else "") + effort_note + kick_note,
             "session": name, "worktree": worktree, "account": account,
             "model": model, "effort": effort, "effort_confirmed": effort_confirmed,
-            "kickoff": kickoff,
+            "kickoff_sent": kick_sent, "kickoff": kickoff,
             "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
 
 

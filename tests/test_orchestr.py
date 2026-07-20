@@ -157,6 +157,123 @@ class TestClassifySession(unittest.TestCase):
     def test_not_alive_is_ended(self):
         self.assertEqual(fb.classify_session(200, False, [], 0, False, self.W)[0], "ended")
 
+    def test_live_shell_is_working_even_with_idle_transcript(self):
+        # the ConfidAI-ci-cleanup case: turn ended ("1 shell still running"),
+        # transcript untouched for minutes, but a backgrounded verify build is
+        # a live child of the claude process — the agent resumes on its own
+        st, tool = fb.classify_session(870, True, [], 0, False, self.W, shells=1)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+
+    def test_live_shell_beats_blocked(self):
+        st, _ = fb.classify_session(200, True, ["Bash"], 0, False, self.W, shells=1)
+        self.assertEqual(st, "working")
+
+    def test_pending_question_outranks_live_shell(self):
+        st, _ = fb.classify_session(200, True, ["AskUserQuestion"], 0, False, self.W, shells=1)
+        self.assertEqual(st, "needs_input")
+
+
+class TestShellChildren(unittest.TestCase):
+    """Attribute Bash-tool wrapper shells to their claude ancestor."""
+
+    # real wrapper shapes observed on macOS (2.1.215), one per variant
+    SNAP = ("/bin/zsh -c source /Users/x/.claude-account6/shell-snapshots/"
+            "snapshot-zsh-1784.sh 2>/dev/null || true && eval 'sleep 99' "
+            "< /dev/null && pwd -P >| /tmp/claude-4632-cwd")
+    BARE = ("/bin/zsh -c -l setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL "
+            "2>/dev/null || true && eval 'scripts/verify.sh' < /dev/null "
+            "&& pwd -P >| /tmp/claude-8a66-cwd")
+
+    def test_counts_wrappers_under_their_claude(self):
+        table = {
+            100: (1, "??", "claude --dangerously-skip-permissions"),
+            101: (100, "??", self.SNAP),
+            102: (100, "??", self.BARE),
+            200: (1, "??", "claude"),
+        }
+        self.assertEqual(fb.shell_children(table, {100, 200}), {100: 2})
+
+    def test_plain_shells_and_orphans_do_not_count(self):
+        table = {
+            100: (1, "??", "claude"),
+            101: (100, "??", "/bin/zsh -c ls"),          # not a Bash-tool wrapper
+            102: (1, "??", self.SNAP),                   # no claude ancestor
+            103: (100, "??", "-zsh"),                    # interactive login shell
+        }
+        self.assertEqual(fb.shell_children(table, {100}), {})
+
+    def test_walks_intermediate_wrappers(self):
+        table = {
+            100: (1, "??", "claude"),
+            150: (100, "??", "some-wrapper"),
+            151: (150, "??", self.BARE),
+        }
+        self.assertEqual(fb.shell_children(table, {100}), {100: 1})
+
+
+# -------------------------------------------------------- kickoff delivery
+
+class TestKickoffSent(unittest.TestCase):
+    """A dispatch must prove its brief left the composer — the observed
+    failure was paste chips sitting unsent while the board said launched."""
+
+    STUCK = ("│ /effort xhigh\n"
+             "│   Set effort level to xhigh (saved as your default)\n"
+             "────────────\n"
+             "❯ [Pasted text #1][Pasted text #2] the long term, we will need\n"
+             "  evals here. Just analyze it for now.\n"
+             "────────────\n"
+             "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n")
+
+    MID_TURN = ("⏺ I'll start by setting up a proper branch and orienting.\n"
+                "✽ Imagining… (30s · ↓ 1.4k tokens)\n"
+                "────────────\n"
+                "❯ \n"
+                "────────────\n"
+                "  ⏵⏵ bypass permissions on · esc to interrupt\n")
+
+    IDLE_EMPTY = ("⏺ Done.\n"
+                  "────────────\n"
+                  "❯ \n"
+                  "────────────\n"
+                  "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n")
+
+    def test_brief_still_in_composer_is_not_sent(self):
+        self.assertFalse(fb.kickoff_sent(self.STUCK))
+
+    def test_running_turn_proves_sent(self):
+        self.assertTrue(fb.kickoff_sent(self.MID_TURN))
+
+    def test_empty_composer_proves_sent(self):
+        self.assertTrue(fb.kickoff_sent(self.IDLE_EMPTY))
+
+    def test_blank_pane_is_not_sent(self):
+        self.assertFalse(fb.kickoff_sent(""))
+
+
+# ------------------------------------------------------- card availability
+
+class TestCardAvailability(unittest.TestCase):
+    """Limit-stuck cards read 'waiting', never 'needs you' — you can't act
+    on an exhausted account, only wait for its reset."""
+
+    def test_limit_only_is_waiting_not_attention(self):
+        self.assertEqual(fb.card_availability(["limit"], True), "waiting")
+
+    def test_idle_agent_next_to_limit_still_needs_direction(self):
+        self.assertEqual(fb.card_availability(["limit", "waiting"], True), "attention")
+
+    def test_limit_plus_working_is_busy(self):
+        self.assertEqual(fb.card_availability(["limit", "working"], True), "busy")
+
+    def test_question_or_blocked_beats_limit(self):
+        self.assertEqual(fb.card_availability(["needs_input", "limit"], True), "attention")
+        self.assertEqual(fb.card_availability(["blocked", "limit"], True), "attention")
+
+    def test_no_live_proc_is_free(self):
+        self.assertEqual(fb.card_availability(["ended"], False), "free")
+
 
 # ------------------------------------------------ session <-> terminal pairing
 

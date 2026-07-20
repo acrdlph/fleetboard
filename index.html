@@ -63,6 +63,9 @@ header {
   border-bottom:1px solid var(--border);
 }
 .nav { display:flex; align-items:center; justify-content:space-between; height:52px; gap:16px; }
+/* the bar spans the viewport — brand left-bound, controls at the right edge —
+   while the content below keeps its centered 1500px column */
+header .wrap { max-width:none; }
 .brand { font-weight:600; white-space:nowrap; overflow:hidden; }
 .brand .prompt { color:var(--accent); }
 .brand .path { color:var(--cyan); }
@@ -131,6 +134,7 @@ header {
 }
 .badge.free  { color:var(--cyan);   border-color:var(--cyan);   background:rgba(127,179,200,.12); }
 .badge.busy  { color:var(--green);  border-color:var(--green);  background:var(--green-glow); }
+.badge.waiting { color:var(--yellow); border-color:var(--yellow); background:rgba(212,176,106,.12); }
 .badge.attention { color:var(--accent); border-color:var(--accent); background:var(--accent-glow);
   animation:pulse 1.6s var(--ease) infinite; }
 @keyframes pulse { 50% { box-shadow:0 0 10px var(--accent-glow); } }
@@ -376,7 +380,7 @@ const STATUS = {
   waiting:     { glyph:"◆", label:"YOUR TURN · idle @ prompt" },
   ended:       { glyph:"○", label:"ENDED" },
 };
-const AVAIL = { free:"FREE", busy:"BUSY", attention:"NEEDS YOU" };
+const AVAIL = { free:"FREE", busy:"BUSY", attention:"NEEDS YOU", waiting:"WAITING" };
 
 function rel(s) {
   if (s == null) return "—";
@@ -409,15 +413,22 @@ function render(st) {
     for (const s of w.sessions)
       REG[`${w.name}|${s.sid}`] = { s, procs: w.live_procs, wt: w.name };
   const c = st.counts;
-  const attn = c.needs_input + c.blocked + c.waiting + (c.limit || 0);
+  // limit-stuck agents are NOT actionable — they never ring the bell or
+  // count as "need you"; they get their own tile with the next reset
+  const attn = c.needs_input + c.blocked + c.waiting;
   maybeBell(attn);
   document.title = attn > 0 ? `(${attn}!) orchestr` : "orchestr";
 
+  const resets = st.worktrees.flatMap(w => w.sessions)
+    .filter(s => s.status === "limit" && !s.handed_to && s.limit && s.limit.resets_in != null)
+    .map(s => s.limit.resets_in);
   const freeNames = st.free_worktrees || [];
   $("tiles").innerHTML = `
     <div class="tile ok"><div class="k">● working</div><div class="v">${c.working}</div><div class="sub">agents mid-turn</div></div>
     <div class="tile ${attn ? "attn" : ""}"><div class="k">▲ need you</div><div class="v">${attn}</div>
-      <div class="sub">${c.needs_input} question · ${c.limit || 0} ⛔ limit · ${c.blocked} blocked · ${c.waiting} idle</div></div>
+      <div class="sub">${c.needs_input} question · ${c.blocked} blocked · ${c.waiting} idle</div></div>
+    <div class="tile"><div class="k">⛔ waiting on limits</div><div class="v">${c.limit || 0}</div>
+      <div class="sub">${resets.length ? "next reset in " + rel(Math.min(...resets)) : "agents resume on reset"}</div></div>
     <div class="tile free"><div class="k">◇ free worktrees</div><div class="v">${freeNames.length}</div>
       <div class="sub" title="${esc(freeNames.join(", "))}">${esc(freeNames.join(", ") || "none — everything busy")}</div></div>
     <div class="tile"><div class="k">⌁ live agents</div><div class="v">${st.worktrees.reduce((n,w)=>n+w.live_procs.length,0) + st.other_procs.length}</div>
@@ -449,7 +460,7 @@ function render(st) {
           ${s.branch && s.branch !== g.branch ? `<span class="meta"> ${esc(s.branch)}</span>` : ""}
           ${s.subagents_active ? `<span class="subag">⚙ subagents running</span>`
             : s.pending_workflows ? `<span class="subag">⚙ awaiting ${s.pending_workflows} workflow${s.pending_workflows > 1 ? "s" : ""}</span>`
-            : s.tool_running ? `<span class="subag">⚙ running: ${esc((s.pending_tools[0] || "tool"))}</span>` : ""}
+            : s.tool_running ? `<span class="subag">⚙ running: ${esc(s.bg_shell ? "background shell" : (s.pending_tools[0] || "tool"))}</span>` : ""}
           <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
             ${sessProc(w, s)}
             ${s.status === "limit" && s.limit && s.limit.group === "session" && s.limit.resets_at
@@ -715,7 +726,8 @@ function missionPickersHtml() {
       <select id="mEffort"><option value="">effort — pick one</option>
         <option value="high">high — simple task</option>
         <option value="xhigh">xhigh — research / medium</option>
-        <option value="ultracode">ultracode — hard feature</option></select>
+        <option value="max">max — hard feature</option>
+        <option value="ultracode">ultracode — hard feature · long-running</option></select>
     </div>
     <div class="row"><span class="dnote">model &amp; effort are your call — placement is deterministic</span>
       <button class="send" style="margin-left:auto" onclick="launchMission()">launch</button></div>`;
@@ -870,7 +882,11 @@ async function pollDispatch(job) {
            attach: <code>${esc(d.attach)}</code> · appears on the board in ~30s</div>`
         : `<div class="dresult" style="margin-top:8px">✗ ${esc(d.message)}</div>`;
     }
-    $("mStatus").innerHTML = `<div class="proglive">${lines}${tail}</div>`;
+    // the dispatch thread's first progress line lands only after its worktree
+    // scan — until then keep the "▸ dispatching…" placeholder rather than
+    // overwriting it with an empty orange frame
+    if (lines || tail)
+      $("mStatus").innerHTML = `<div class="proglive">${lines}${tail}</div>`;
     if (s.done) {
       clearInterval(dispatchPoll);
       toast((d && d.ok ? "✓ " : "✗ ") + (d ? d.message : "done"));
