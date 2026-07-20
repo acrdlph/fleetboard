@@ -187,7 +187,9 @@ function render(d) {
   $("out").innerHTML = `<div class="grid">` + accounts.map(a => {
     if (!a.ok) return `<div class="acct"><div class="ahead"><span class="nm">${esc(a.slug)}</span>
       <span class="tag gone">✗ ERROR</span></div><div class="lims"><div class="lim"><span class="lab">${esc(a.error || "unreadable")}</span></div></div></div>`;
-    const exhausted = a.limits.some(l => l.exhausted_now);
+    // only account-wide caps (session / umbrella weekly) exhaust the whole
+    // account; a maxed model-scoped cap (e.g. Fable) is shown per-row below
+    const exhausted = a.limits.some(l => l.exhausted_now && !l.model_scoped);
     const hr = a.headroom_percent ?? 0;
     const rsv = reserveOf(a), rBlocked = reserveBlocked(a);
     const rows = a.limits.map(l => {

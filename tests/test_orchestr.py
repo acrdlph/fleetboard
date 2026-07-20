@@ -283,6 +283,80 @@ class TestLimitsByAccount(ConfigGuard):
         fb._limits["data"] = {"available": True, "accounts": [acc("/h/.claude", ok=False)]}
         self.assertEqual(fb.limits_by_account(), {})
 
+    def test_model_scoped_exhaustion_does_not_block_account(self):
+        """A maxed model-scoped cap (Fable) must NOT mark the whole account
+        exhausted while its all-model session/weekly still has headroom — the
+        account stays available for an Opus/Sonnet mission. Regression: the
+        model-blind exhausted flag wrote account8 (41% left, only Fable gone)
+        off wholesale, so the router reported it exhausted."""
+        fb.DEMO = False
+        fb.CFG["reserve_percent"] = {}
+        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+            acc("/h/.claude-account8", headroom=41, limits=[
+                lim("Session", 0),
+                lim("Weekly", 59),
+                lim("Fable", 100, model_scoped=True, exhausted=True, resets_in=144748)]),
+        ]}
+        out = fb.limits_by_account()["account8"]
+        self.assertFalse(out["exhausted"])       # Fable-only exhaustion ≠ account-wide
+        self.assertTrue(out["available"])        # still pickable
+        self.assertIsNone(out["worst"])          # no account-wide cap is the worst
+        # the model-scoped block is still reported, for the session-status join
+        self.assertEqual([s["label"] for s in out["scoped_exhausted"]], ["Fable"])
+        self.assertEqual(out["scoped_exhausted"][0]["resets_at"], 1000 + 144748)
+
+    def test_account_wide_exhaustion_still_blocks(self):
+        """The umbrella Weekly (non-model-scoped) being gone DOES take the whole
+        account out — every model shares that cap."""
+        fb.DEMO = False
+        fb.CFG["reserve_percent"] = {}
+        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+            acc("/h/.claude-account5", headroom=0, limits=[
+                lim("Weekly", 100, exhausted=True, resets_in=3600),
+                lim("Fable", 84, model_scoped=True)]),
+        ]}
+        out = fb.limits_by_account()["account5"]
+        self.assertTrue(out["exhausted"])
+        self.assertFalse(out["available"])
+        self.assertEqual(out["worst"], "Weekly")
+
+    def test_router_availability_survives_fleetwide_fable_exhaustion(self):
+        """The exact live fleet that produced 'every account is exhausted':
+        Fable maxed across most accounts, umbrella Weekly gone on a few.
+        Accounts that only lost Fable must stay available; only the
+        umbrella-Weekly ones drop out — and an Opus mission routes to the
+        most-headroom survivor rather than failing outright."""
+        fb.DEMO = False
+        fb.CFG["exclude_accounts"] = ["main"]
+        fb.CFG["reserve_percent"] = {}
+
+        def fable_gone(cd, hr, weekly_used):
+            return acc(cd, headroom=hr, limits=[
+                lim("Session", 0), lim("Weekly", weekly_used),
+                lim("Fable", 100, model_scoped=True, exhausted=True, resets_in=1)])
+
+        def weekly_gone(cd):
+            return acc(cd, headroom=0, limits=[
+                lim("Session", 0),
+                lim("Weekly", 100, exhausted=True, resets_in=1),
+                lim("Fable", 84, model_scoped=True)])
+
+        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+            weekly_gone("/h/.claude"),                  # main — excluded + umbrella gone
+            fable_gone("/h/.claude-account8", 41, 59),
+            fable_gone("/h/.claude-account4", 15, 85),
+            weekly_gone("/h/.claude-account5"),
+        ]}
+        lba = fb.limits_by_account()
+        avail = sorted(a for a, d in lba.items()
+                       if d["available"] and a not in fb.CFG["exclude_accounts"])
+        self.assertEqual(avail, ["account4", "account8"])   # not "every account is exhausted"
+        self.assertFalse(lba["account5"]["available"])      # umbrella weekly genuinely gone
+        # an Opus mission routes to the most-headroom survivor
+        best = fb.model_candidates("opus")[0]
+        self.assertEqual(best["label"], "account8")
+        self.assertTrue(best["ok"])
+
 
 # ---------------------------------------------------------- reserve persist
 

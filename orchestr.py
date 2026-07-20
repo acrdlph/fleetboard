@@ -645,13 +645,22 @@ def collect_state():
             if s["status"] not in ("needs_input", "blocked", "waiting"):
                 continue
             al = acct_limits.get(s["account"])
-            if al and al["exhausted"] and al["worst_scoped"] and \
-                    (al["worst"] or "").lower() not in (s["model"] or "").lower():
-                al = None  # limit is model-scoped and this session runs another model
+            smodel = (s["model"] or "").lower()
+            lim = None
             if al and al["exhausted"]:
+                # account-wide cap (session / umbrella weekly) — bites every model here
+                lim = {"worst": al["worst"], "group": al["group"],
+                       "resets_in": al["resets_in"], "resets_at": al["resets_at"]}
+            elif al:
+                # a model-scoped cap only strands a session running THAT model
+                hit = next((sx for sx in al.get("scoped_exhausted", [])
+                            if (sx["label"] or "").lower() in smodel), None)
+                if hit:
+                    lim = {"worst": hit["label"], "group": hit["group"],
+                           "resets_in": hit["resets_in"], "resets_at": hit["resets_at"]}
+            if lim:
                 s["status"] = "limit"
-                s["limit"] = {"worst": al["worst"], "group": al["group"],
-                              "resets_in": al["resets_in"], "resets_at": al["resets_at"]}
+                s["limit"] = lim
             elif limit_re.search(s["last_assistant"] or ""):
                 # the CLI wrote its limit notice into the transcript —
                 # trust it even when the cclimits cache is cold/stale
@@ -1063,35 +1072,51 @@ def set_reserve(label, percent):
 
 
 def limits_by_account():
-    """account label -> {exhausted, worst, resets_in, headroom, reserve, available}."""
+    """account label -> {exhausted, worst, resets_in, headroom, reserve, available,
+    scoped_exhausted}.
+
+    `exhausted`/`available` reflect only ACCOUNT-WIDE caps (session + umbrella
+    weekly). A maxed model-scoped cap (e.g. Fable) is a per-model constraint,
+    not an account-wide block — it lands in `scoped_exhausted` instead, so an
+    account whose Fable is gone but that still has 40% all-model headroom stays
+    pickable for an Opus/Sonnet mission. Collapsing every limit into one
+    exhausted flag wrote such accounts off wholesale."""
     data = _limits["data"] if not DEMO else demo_limits()
     if not data or not data.get("available"):
         return {}
+    fetched = (data.get("fetched_at") or time.time())
     out = {}
     for acc in data.get("accounts", []):
         if not acc.get("ok"):
             continue
         label = account_label(Path(acc["config_dir"]))
-        exhausted = [l for l in acc.get("limits", []) if l.get("exhausted_now")]
-        worst = min(exhausted, key=lambda l: l.get("resets_in_seconds") or 0) if exhausted else None
+        ex = [l for l in acc.get("limits", []) if l.get("exhausted_now")]
+        blocking = [l for l in ex if not l.get("model_scoped")]   # session / umbrella weekly
+        worst = min(blocking, key=lambda l: l.get("resets_in_seconds") or 0) if blocking else None
         resets_in = worst.get("resets_in_seconds") if worst else None
-        fetched = (data.get("fetched_at") or time.time())
         headroom = acc.get("headroom_percent")
         reserve = account_reserve(label)
         # reserve-blocked: less than the required buffer remains → treat as full
         reserve_blocked = reserve > 0 and headroom is not None and headroom < reserve
         out[label] = {
             "headroom": headroom,
-            "exhausted": bool(exhausted),
+            "exhausted": bool(blocking),
             "worst": worst["label"] if worst else None,
-            "worst_scoped": bool(worst.get("model_scoped")) if worst else False,
+            "worst_scoped": False,   # `worst` is always an account-wide cap now
             "group": worst.get("group") if worst else None,
             "resets_in": resets_in,
             "resets_at": fetched + resets_in if resets_in else None,
             "reserve": reserve,
             "reserve_blocked": reserve_blocked,
-            # usable for AUTO dispatch/router: has real headroom above its buffer
-            "available": (not exhausted) and not reserve_blocked,
+            # model-scoped caps that are used up — only strand a session
+            # actually running that model, not the whole account
+            "scoped_exhausted": [
+                {"label": l.get("label"), "group": l.get("group"),
+                 "resets_in": l.get("resets_in_seconds"),
+                 "resets_at": (fetched + l["resets_in_seconds"]) if l.get("resets_in_seconds") else None}
+                for l in ex if l.get("model_scoped")],
+            # usable for AUTO dispatch/router: real all-model headroom above its buffer
+            "available": (not blocking) and not reserve_blocked,
         }
     return out
 
