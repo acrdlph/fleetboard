@@ -427,6 +427,27 @@ class TestDispatchLog(ConfigGuard):
         self.assertEqual(len(fb.read_dispatch_log(limit=2)["entries"]), 2)
 
 
+# ------------------------------------------------------ deterministic dispatch
+
+class TestDispatchContract(ConfigGuard):
+    """Routing is deterministic and model + effort are the caller's job."""
+    def setUp(self):
+        super().setUp()
+        fb.DEMO = True   # a refusal must come back before any thread launches
+
+    def test_missing_model_or_effort_is_refused_cleanly(self):
+        for kw in ({}, {"model": "opus"}, {"effort": "high"}):
+            out = fb.start_dispatch("build the thing", **kw)
+            self.assertFalse(out.get("ok", True))
+            self.assertNotIn("job", out)
+            self.assertIn("model", out["message"])
+
+    def test_closeout_runs_without_model_or_effort(self):
+        out = fb.start_dispatch("close out", worktree="w",
+                                closeout_trunk="origin/main")
+        self.assertIn("job", out)   # not refused — closeouts pick nothing
+
+
 # --------------------------------------------------------- one-shot closeout
 
 class TestCloseoutShell(unittest.TestCase):
@@ -451,6 +472,14 @@ class TestCloseoutShell(unittest.TestCase):
     def test_model_flag_only_when_given(self):
         self.assertIn("--model opus", self.shell(model="opus"))
         self.assertNotIn("--model", self.shell())
+
+    def test_rescue_never_pins_the_model(self):
+        # a haiku closeout must escalate on failure: the --continue resume
+        # line carries no --model, so the account's default model takes over
+        resume = [l for l in self.shell(model="haiku").splitlines()
+                  if "--continue" in l]
+        self.assertEqual(len(resume), 1)
+        self.assertNotIn("--model", resume[0])
 
 
 # --------------------------------------------------------- demo integration

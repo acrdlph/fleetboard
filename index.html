@@ -661,6 +661,16 @@ setInterval(() => {
 
 // ---- mission composer ------------------------------------------------------
 let LIMITS = null;
+// A half-written mission must survive a closed drawer, tab, or browser —
+// localStorage keeps the draft until the moment it actually launches.
+const DRAFT_KEY = "orchestr-mission-draft";
+function saveMissionDraft(v) {
+  try { v ? localStorage.setItem(DRAFT_KEY, v) : localStorage.removeItem(DRAFT_KEY); }
+  catch (e) {}
+}
+function loadMissionDraft() {
+  try { return localStorage.getItem(DRAFT_KEY) || ""; } catch (e) { return ""; }
+}
 // ⌘Enter launches on mac, Ctrl+Enter everywhere else — one chord per platform,
 // so the hint never names a key the keyboard doesn't have.
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
@@ -677,43 +687,49 @@ function acctLabel(dir) {
 // seconds). So they rebuild themselves whenever fresh data lands — no waiting on
 // a timer, and no stale "none free" left sitting there.
 let missionOpen = false;
+// Routing is deterministic — mirror the backend rule exactly (least-dirty free
+// worktree, _pick_defaults) so the previewed name is the one that launches.
+function ruleBasedAutoPick() {
+  if (!lastState) return null;
+  const free = lastState.worktrees.filter(w => w.availability === "free");
+  free.sort((a, b) => ((a.git && a.git.dirty) || 0) - ((b.git && b.git.dirty) || 0));
+  return free.length ? free[0].name : null;
+}
 function missionPickersHtml() {
   const frees = lastState ? lastState.free_worktrees : [];
   const all = lastState ? lastState.worktrees.map(w => w.name) : [];
   const accts = LIMITS && LIMITS.accounts ? LIMITS.accounts.filter(a => a.ok) : [];
   const loading = !lastState ? " — loading…" : "";
+  const wtAuto = `worktree: auto (${ruleBasedAutoPick() || (lastState ? "none free" : "…")})`;
   return `
     <div class="row">
-      <select id="mWt"><option value="">worktree: auto (${esc(frees[0] || (lastState ? "none free" : "…"))})</option>
+      <select id="mWt"><option value="">${esc(wtAuto)}</option>
         ${all.map(n => `<option value="${esc(n)}">${esc(n)}${frees.includes(n) ? " · free" : ""}</option>`).join("")}</select>
       <select id="mAcct"><option value="">account: auto${esc(loading)}</option>
         ${accts.map(a => `<option value="${esc(acctLabel(a.config_dir))}">${esc(acctLabel(a.config_dir))} · ${Math.round(a.headroom_percent ?? 0)}% left</option>`).join("")}</select>
     </div>
     <div class="row">
-      <select id="mModel"><option value="">model: auto</option>
+      <select id="mModel"><option value="">model — pick one</option>
         <option value="fable">fable</option><option value="opus">opus</option>
         <option value="sonnet">sonnet</option><option value="haiku">haiku</option></select>
-      <select id="mEffort"><option value="">effort: auto</option>
+      <select id="mEffort"><option value="">effort — pick one</option>
         <option value="high">high — simple task</option>
         <option value="xhigh">xhigh — research / medium</option>
         <option value="ultracode">ultracode — hard feature</option></select>
     </div>
-    <div class="row"><label class="dnote" style="cursor:pointer">
-      <input type="checkbox" id="mRouter" checked> route &amp; brief with claude (haiku, one call)</label>
+    <div class="row"><span class="dnote">model &amp; effort are your call — placement is deterministic</span>
       <button class="send" style="margin-left:auto" onclick="launchMission()">launch</button></div>`;
 }
 // rebuild the pickers in place, keeping whatever the user already picked
 function refreshMissionPickers() {
   if (!missionOpen || !$("mWt")) return;
   const keep = ["mWt", "mAcct", "mModel", "mEffort"].map(k => [k, $(k).value]);
-  const router = $("mRouter") ? $("mRouter").checked : true;
   $("dfoot").innerHTML = missionPickersHtml();
   keep.forEach(([k, v]) => {
     const sel = $(k);
     // only restore a choice that still exists in the refreshed list
     if (sel && v && [...sel.options].some(o => o.value === v)) sel.value = v;
   });
-  if ($("mRouter")) $("mRouter").checked = router;
 }
 function openMission() {
   chatCtx = null; clearTimeout(chatTimer);
@@ -721,12 +737,14 @@ function openMission() {
   $("dtitle").textContent = "🚀 new mission";
   $("dsub").textContent = "dispatch a tmux-hosted agent into the fleet";
   $("dbody").innerHTML = `<div id="mSent"></div><div id="mStatus"></div>
-    <div class="dnote">describe the feature or task — your text
-    reaches the agent verbatim; the router only picks where it runs. worktree &amp;
-    account default to the best free/most-headroom picks. <b>${LAUNCH_CHORD}</b> launches.</div>
+    <div class="dnote">describe the feature or task — your text reaches the
+    agent verbatim. placement is deterministic: cleanest free worktree, the
+    account with the most headroom for your model. <b>${LAUNCH_CHORD}</b> launches.</div>
     <textarea id="mText" placeholder="what should be built?"
+      oninput="saveMissionDraft(this.value)"
       onkeydown="if(isLaunchChord(event)){event.preventDefault();launchMission();}"></textarea>
     <div id="mLog"></div>`;
+  $("mText").value = loadMissionDraft();
   renderInFlight();   // a dispatch still running stays visible across reopens
   loadDispatchLog();
   $("dfoot").innerHTML = missionPickersHtml();
@@ -774,8 +792,13 @@ async function launchMission(missionArg) {
   const mission = (missionArg !== undefined ? missionArg
                                             : $("mText").value.trim()) || inFlight;
   if (!mission) { toast("✗ empty mission"); return; }
+  // model & effort are the author's call now — refuse before touching the draft
+  if (!$("mModel").value || !$("mEffort").value) {
+    toast("✗ pick a model and an effort first"); return;
+  }
   inFlight = mission;
   $("mText").value = "";        // out of the input the instant you commit to it
+  saveMissionDraft("");         // launched missions live in the dispatch log
   renderInFlight();
   const st = $("mStatus");
   st.innerHTML = `<div class="proglive"><div class="progline">▸ dispatching…</div></div>`;
@@ -785,13 +808,16 @@ async function launchMission(missionArg) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mission, worktree: $("mWt").value, account: $("mAcct").value,
                              model: $("mModel").value, effort: $("mEffort").value,
-                             router: $("mRouter").checked,
                              force_model: !!window._forceModel }) });
     window._forceModel = false;
     const resp = await r.json();
     if (resp.needs_decision) { showModelDecision(resp); return; }
     const job = resp.job;
-    if (!job) { toast("✗ dispatch failed to start"); return; }
+    if (!job) {   // refused before a job existed — put the text back
+      toast("✗ " + (resp.message || "dispatch failed to start"));
+      failedMission = inFlight; reeditMission();
+      return;
+    }
     clearInterval(dispatchPoll);
     dispatchPoll = setInterval(() => pollDispatch(job), 1000);
     pollDispatch(job);
@@ -821,6 +847,7 @@ let failedMission = null;
 function reeditMission() {
   if (failedMission === null) return;
   $("mText").value = failedMission;
+  saveMissionDraft(failedMission);
   failedMission = null;
   inFlight = null;
   $("mSent").innerHTML = "";
@@ -852,6 +879,7 @@ async function pollDispatch(job) {
         $("mSent").innerHTML = "";     // it graduates into the dispatch list below
       } else if (inFlight) {
         failedMission = inFlight;
+        saveMissionDraft(inFlight);  // a tab closed on a failure keeps the text
         $("mSent").innerHTML = `<div class="sent bad">
           <div class="sentbar"><span class="sl">✗ not launched</span>
             <button class="abtn" onclick="reeditMission()">↩ edit again</button></div>
@@ -879,7 +907,7 @@ setInterval(primeLimits, 300000);
 // Opens immediately — the pickers fill themselves in as the fetches land, so
 // there's nothing to wait for and you can start typing straight away.
 const _mq = new URLSearchParams(location.search).get("mission");
-if (_mq !== null) { openMission(); if (_mq) $("mText").value = _mq; }
+if (_mq !== null) { openMission(); if (_mq) { $("mText").value = _mq; saveMissionDraft(_mq); } }
 </script>
 </body>
 </html>

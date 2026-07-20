@@ -115,19 +115,21 @@ refetch". Nothing polls the Anthropic API on a timer.
   replaced by a one-shot closeout agent that frees the card by itself, and an
   idle agent whose work already landed just gets `/exit`. See *Closing out a
   mission* below.
-- **🚀 new mission** — describe a feature; orchestr picks the cleanest free
-  worktree and the most-headroom account (or a one-shot
-  `claude -p --model haiku` router picks them, plus a branch name), then
-  launches a tmux-hosted agent: `tmux -L fleet attach -t mission-…` from any
-  terminal, and it appears on the board like any other agent. **Your mission
-  text is never rewritten** — the router only makes routing decisions; the
-  agent receives a deterministic operational header (branch, commit
-  discipline) followed by the author's words verbatim. Every dispatch is
-  logged to `dispatch.log.jsonl` (gitignored) for auditing.
-  **Model & effort** are selectable (or "auto": the router matches them to the
-  mission — ultracode for hard features, xhigh for research, high for simple
-  tasks — and avoids models whose model-scoped limit is exhausted on the
-  chosen account). Picking a specific model checks that model's *own* limit
+- **🚀 new mission** — describe a feature; orchestr picks the worktree and
+  account **deterministically** — the cleanest free worktree, the account
+  with the most headroom that can run your model — no AI in the routing loop,
+  so the auto preview always names the worktree that actually launches, and
+  a busy worktree can never be picked. It then launches a tmux-hosted agent:
+  `tmux -L fleet attach -t mission-…` from any terminal, and it appears on
+  the board like any other agent. **Your mission text is never rewritten** —
+  the agent receives a deterministic operational header (branch, commit
+  discipline) followed by the author's words verbatim, and names its own
+  branch. Every dispatch is logged to `dispatch.log.jsonl` (gitignored) for
+  auditing.
+  **Model & effort are yours to pick** — judging a mission's difficulty is
+  the one thing rules can't do, so nothing guesses it for you; the composer
+  refuses to launch until both are chosen.
+  Picking a model checks that model's *own* limit
   per account (Fable can be gone while the weekly limit is fine); if no
   account clears its reserve buffer for it, the dispatch pauses with a dialog
   offering **Opus** instead (or use it anyway) rather than launching blindly.
@@ -161,11 +163,13 @@ orchestr does — works by talking to a terminal:
 - **agent alive** → it receives a closeout brief: land the branch on the
   trunk (merge, resolve, push), tidy the worktree, report back. ✓ finish
   again once it's done closes the terminal.
-- **terminal already gone** → a one-shot closeout agent (headless `claude -p`)
+- **terminal already gone** → a one-shot closeout agent (headless
+  `claude -p --model haiku` — the work is mechanical git, no judgment needed)
   runs the same brief, then git itself verifies the landing: verified clean →
   the process ends and the card frees itself, no second click; anything else →
-  the session reopens interactively and the card parks as *needs you* — a
-  failed closeout never masquerades as free.
+  the session reopens interactively **on the account's default model** (the
+  resume is deliberately unpinned, so failure escalates past haiku) and the
+  card parks as *needs you* — a failed closeout never masquerades as free.
 - **everything landed, agent idle** → `/exit` is typed and the terminal
   closes.
 

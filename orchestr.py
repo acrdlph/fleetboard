@@ -49,8 +49,7 @@ CFG = {
     "session_window_h": 48,    # ignore transcripts idle longer than this
     "working_s": 90,           # transcript written within this => working
     "max_sessions": 6,         # per worktree card
-    "exclude_accounts": [],    # account labels never AUTO-picked for dispatch/router
-    "router_home": None,       # fixed Claude home for the haiku router (else auto)
+    "exclude_accounts": [],    # account labels never AUTO-picked for dispatch
     "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)
 }
 
@@ -1115,7 +1114,7 @@ def limits_by_account():
                  "resets_in": l.get("resets_in_seconds"),
                  "resets_at": (fetched + l["resets_in_seconds"]) if l.get("resets_in_seconds") else None}
                 for l in ex if l.get("model_scoped")],
-            # usable for AUTO dispatch/router: real all-model headroom above its buffer
+            # usable for AUTO dispatch: real all-model headroom above its buffer
             "available": (not blocking) and not reserve_blocked,
         }
     return out
@@ -1302,9 +1301,10 @@ CLOSEOUT_TEXT = (
     "Close out this worktree now: "
     "1) wait for (or stop) any background agents and workflows you started; "
     "2) commit remaining meaningful work — drop scratch files; "
-    "3) land the branch: merge {trunk} into it, resolve any conflicts, push "
-    "the branch, then push it to the trunk and verify with "
-    "`git merge-base --is-ancestor HEAD {trunk}`; "
+    "3) land the branch: merge {trunk} into it, resolve any conflicts — but "
+    "if a conflict needs real judgment about the code, stop and report it "
+    "instead of guessing — push the branch, then push it to the trunk and "
+    "verify with `git merge-base --is-ancestor HEAD {trunk}`; "
     "4) switch this worktree to the trunk branch and pull, so it starts the "
     "next mission clean; "
     "5) reply with a one-line summary of what landed."
@@ -1324,6 +1324,8 @@ def closeout_shell(home, model, brief, trunk):
         f"if git merge-base --is-ancestor HEAD {shlex.quote(trunk)} 2>/dev/null "
         '&& [ -z "$(git status --porcelain)" ]; then exit 0; fi\n'
         "echo; echo '⚠ closeout could not verify a clean landing — resuming the session:'\n"
+        # no --model here on purpose: the rescue resumes on the account's
+        # default (stronger) model, so a haiku closeout escalates on failure
         "exec claude --dangerously-skip-permissions --continue\n"
     )
 
@@ -1376,8 +1378,10 @@ def start_finish(wt_name):
         if branch == trunk.split("/", 1)[-1]:
             return {"ok": True, "mode": "noop",
                     "message": "already landed and clean — nothing to finish"}
+    # haiku is enough for the mechanical run — commit, merge, push, verify —
+    # and a failed landing escalates itself (see closeout_shell's rescue line)
     out = start_dispatch(CLOSEOUT_TEXT.format(trunk=trunk), worktree=wt_name,
-                         closeout_trunk=trunk)
+                         model="haiku", closeout_trunk=trunk)
     out.setdefault("ok", True)
     out["mode"] = "dispatch"
     out.setdefault("message",
@@ -1453,119 +1457,26 @@ def read_dispatch_log(limit=25):
     return {"entries": rows[-limit:][::-1]}
 
 
-def _pick_defaults(mission):
+def _pick_defaults(model=None):
+    """Deterministic auto-picks, no AI in the loop: the cleanest FREE worktree,
+    and the account with the most headroom that can actually run `model`
+    (falling back to overall headroom when none clears its reserve — that only
+    happens on a forced model, where the user already chose to push through)."""
     state = cached_state()
     cached_limits()  # ensure the account picker isn't working from a cold cache
     limits = limits_by_account()
     free = [w for w in state["worktrees"] if w["availability"] == "free"]
     free.sort(key=lambda w: (w["git"]["dirty"] or 0))
     wt = free[0]["name"] if free else None
-    excl = set(CFG.get("exclude_accounts") or [])
-    accounts = [(a, d) for a, d in limits.items() if d["available"] and a not in excl]
-    accounts.sort(key=lambda x: -(x[1]["headroom"] or 0))
-    acct = accounts[0][0] if accounts else None
-    return wt, acct
-
-
-def _route_with_claude(mission, on_text=None):
-    """One-shot routing call: haiku picks worktree/account/model/effort/branch.
-    If on_text is given, streams haiku's output through it as it generates."""
-    state = cached_state()
-    limits = limits_by_account()
-    ex_map = {}
-    for acc in (_limits["data"] or {}).get("accounts", []):
-        label = account_label(Path(acc["config_dir"]))
-        ex_map[label] = [l["label"] for l in acc.get("limits", []) if l.get("exhausted_now")]
-    fleet = {
-        "worktrees": [{"name": w["name"], "branch": w["git"]["branch"],
-                       "dirty": w["git"]["dirty"], "availability": w["availability"]}
-                      for w in state["worktrees"]],
-        "accounts": [{"label": a, "headroom_pct": d["headroom"],
-                      "exhausted": d["exhausted"] or d["reserve_blocked"],
-                      "exhausted_limits": ex_map.get(a, []),
-                      "reserve_pct": d["reserve"],
-                      "reserve_blocked": d["reserve_blocked"],
-                      "available": d["available"] and a not in (CFG.get("exclude_accounts") or [])}
-                     for a, d in limits.items()],
-    }
-    # The router runs `claude -p` under some account's config dir. Never let it
-    # touch an excluded account (e.g. ~/.claude) — a stale token there could
-    # hijack a browser session. A fixed router_home removes the rotation risk.
-    router_home = None
-    if CFG.get("router_home"):
-        rh = Path(CFG["router_home"]).expanduser()
-        router_home = rh if (rh / "projects").is_dir() else None
-    if router_home is None:
+    acct = None
+    if model:
+        acct = next((c["label"] for c in model_candidates(model) if c["ok"]), None)
+    if acct is None:
         excl = set(CFG.get("exclude_accounts") or [])
-        ok_accounts = sorted((d["headroom"] or 0, a) for a, d in limits.items()
-                             if d["available"] and a not in excl)
-        if ok_accounts:
-            router_home = next((h for h in claude_homes()
-                                if account_label(h) == ok_accounts[-1][1]), None)
-    prompt = (
-        "You route work across git worktrees and Claude accounts. You do NOT "
-        "rewrite the mission — the author's text is passed to the agent "
-        "verbatim; you only make routing decisions. Fleet state:\n"
-        + json.dumps(fleet) + "\n\nMission from the user:\n" + mission +
-        "\n\nPick a FREE worktree (prefer clean ones and a thematic fit with its "
-        "branch) and an account. ONLY choose an account whose \"available\" is "
-        "true — treat exhausted, reserve_blocked (its headroom is below the "
-        "reserve buffer it must keep free), or unavailable accounts as off "
-        "limits. Prefer the available account with the most headroom. Also pick "
-        "the model (fable > opus > sonnet by capability; NEVER a model listed "
-        "in that account's exhausted_limits — e.g. if 'Fable' is exhausted "
-        "there, pick opus or another account) and the reasoning effort: "
-        "'ultracode' for genuinely hard multi-step features, 'xhigh' for "
-        "research or medium tasks, 'high' for simple tasks. Finally suggest a "
-        "conventional branch name for this mission (feat/fix/docs/...), or "
-        "null if the worktree's current branch is clearly the right home. "
-        "Reply with ONLY this JSON, no fences:\n"
-        '{"worktree": "...", "account": "...", "model": "fable|opus|sonnet|haiku", '
-        '"effort": "high|xhigh|ultracode", "branch": "feat/...|null"}')
-    env = dict(os.environ)
-    if router_home:
-        env["CLAUDE_CONFIG_DIR"] = str(router_home)
-    # Non-streaming path (kept for callers without a progress sink).
-    if on_text is None:
-        try:
-            p = subprocess.run(["claude", "-p", "--model", "haiku", prompt],
-                               capture_output=True, text=True, timeout=120, env=env)
-            d = json.loads(re.search(r"\{.*\}", p.stdout, re.S).group(0))
-            if d.get("worktree") and d.get("account"):
-                return d
-        except Exception:
-            pass
-        return None
-    # Streaming path: forward haiku's text as it lands (for display), but parse
-    # the authoritative final text from the 'result' event.
-    streamed, result_text = [], None
-    try:
-        proc = subprocess.Popen(
-            ["claude", "-p", "--model", "haiku",
-             "--output-format", "stream-json", "--verbose", prompt],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env)
-        for line in proc.stdout:
-            try:
-                e = json.loads(line)
-            except ValueError:
-                continue
-            if e.get("type") == "assistant":
-                for b in (e.get("message") or {}).get("content") or []:
-                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
-                        streamed.append(b["text"]); on_text(b["text"])
-            elif e.get("type") == "result" and e.get("result"):
-                result_text = e["result"]
-        proc.wait(timeout=120)
-        text = result_text if result_text else "".join(streamed)
-        d = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
-        if d.get("worktree") and d.get("account"):
-            return d
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    return None
+        accounts = [(a, d) for a, d in limits.items() if d["available"] and a not in excl]
+        accounts.sort(key=lambda x: -(x[1]["headroom"] or 0))
+        acct = accounts[0][0] if accounts else None
+    return wt, acct
 
 
 _jobs = {}                 # job_id -> {progress, done, result}
@@ -1578,15 +1489,24 @@ def _log(job, line):
         job["progress"].append(line)
 
 
-def start_dispatch(mission, worktree=None, account=None, use_router=False,
+def start_dispatch(mission, worktree=None, account=None,
                    model=None, effort=None, force_model=False,
                    closeout_trunk=None):
     """Kick a dispatch off in the background; return a job id to poll.
-    If an explicit model has no account with enough headroom (above reserve),
-    return a needs_decision instead of launching — unless force_model.
+    Routing is deterministic — cleanest free worktree, most-headroom account
+    that can run the chosen model — and choosing model + effort is the
+    caller's job (only closeouts run without them). If the chosen model has
+    no account with enough headroom (above reserve), return a needs_decision
+    instead of launching — unless force_model.
     With closeout_trunk set the mission runs as a one-shot closeout (headless
     claude that verifies its own landing against that trunk ref)."""
-    if not DEMO and model and not force_model:
+    if not closeout_trunk and not (model and effort):
+        return {"ok": False, "message":
+                "pick a model and an effort first — routing is deterministic, "
+                "nothing is chosen for you"}
+    # closeouts skip the headroom dialog: ✓ finish must always just run, and
+    # _pick_defaults already prefers an account with headroom for the model
+    if not DEMO and model and not force_model and not closeout_trunk:
         cached_limits()
         cands = model_candidates(model, only_account=account)
         if not any(c["ok"] for c in cands):
@@ -1615,12 +1535,12 @@ def start_dispatch(mission, worktree=None, account=None, use_router=False,
         for old in list(_jobs)[:-20]:   # keep only the last 20 jobs
             del _jobs[old]
     threading.Thread(target=_run_dispatch, daemon=True, args=(
-        job, mission, worktree, account, use_router, model, effort,
+        job, mission, worktree, account, model, effort,
         closeout_trunk)).start()
     return {"job": job_id}
 
 
-def _run_dispatch(job, mission, worktree, account, use_router, model, effort,
+def _run_dispatch(job, mission, worktree, account, model, effort,
                   closeout_trunk=None):
     def finish(result):
         with _jobs_lock:
@@ -1633,39 +1553,11 @@ def _run_dispatch(job, mission, worktree, account, use_router, model, effort,
     if not mission:
         return finish({"ok": False, "message": "empty mission"})
 
-    routed = None
-    if use_router and not (worktree and account and model and effort):
-        _log(job, "① routing — asking claude (haiku) where this should run…")
-        buf = [""]
-
-        def on_text(t):  # stream haiku's output, line by line
-            buf[0] += t
-            while "\n" in buf[0]:
-                head, buf[0] = buf[0].split("\n", 1)
-                if head.strip():
-                    _log(job, "  haiku › " + head.strip()[:160])
-        routed = _route_with_claude(mission, on_text=on_text)
-        if buf[0].strip():
-            _log(job, "  haiku › " + buf[0].strip()[:160])
-        if not routed:
-            _log(job, "  router failed — falling back to rule-based picks")
-
-    branch = None
-    if routed:
-        worktree = worktree or routed["worktree"]
-        account = account or routed["account"]
-        model = model or routed.get("model")
-        effort = effort or routed.get("effort")
-        b = routed.get("branch")
-        branch = b if isinstance(b, str) and b and b.lower() != "null" else None
-        _log(job, f"✓ routed → {worktree} · [{account}]"
-                  + (f" · {model}" if model else "") + (f" · {effort}" if effort else "")
-                  + (f" · {branch}" if branch else ""))
-
     if not (worktree and account):
-        dw, da = _pick_defaults(mission)
+        dw, da = _pick_defaults(model)
         worktree, account = worktree or dw, account or da
-        _log(job, f"✓ picked → {worktree} · [{account}] (rules)")
+        _log(job, f"① picked → {worktree} · [{account}] "
+                  "(cleanest free worktree · most model headroom)")
     if not worktree:
         return finish({"ok": False, "message": "no free worktree available"})
     if not account:
@@ -1707,9 +1599,8 @@ def _run_dispatch(job, mission, worktree, account, use_router, model, effort,
                        "session": name, "worktree": worktree, "account": account,
                        "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
 
-    header = (f"First check out a new branch {branch} from latest origin/main. "
-              if branch else
-              "If this worktree's current branch is not the right home for this "
+    # branch naming is the agent's call — it reads the mission and knows best
+    header = ("If this worktree's current branch is not the right home for this "
               "work, check out an appropriately named new branch from latest "
               "origin/main first. ")
     kickoff = (header + "Commit as you go. Your mission, in the author's own "
@@ -1753,7 +1644,7 @@ def _run_dispatch(job, mission, worktree, account, use_router, model, effort,
             lf.write(json.dumps({
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": name,
                 "worktree": worktree, "account": account, "model": model,
-                "effort": effort, "routed": bool(routed),
+                "effort": effort,
                 "mission_original": mission, "kickoff": kickoff}) + "\n")
     except OSError:
         pass
@@ -1763,8 +1654,7 @@ def _run_dispatch(job, mission, worktree, account, use_router, model, effort,
     _log(job, "✓ launched")
     finish({"ok": True,
             "message": f"launched {name} in {worktree} on [{account}]"
-                       + (f" · {model}" if model else "") + effort_note
-                       + (" (routed by claude)" if routed else " (rule-picked)"),
+                       + (f" · {model}" if model else "") + effort_note,
             "session": name, "worktree": worktree, "account": account,
             "model": model, "effort": effort, "effort_confirmed": effort_confirmed,
             "kickoff": kickoff,
@@ -1850,7 +1740,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/dispatch"):
             result = start_dispatch(
                 payload.get("mission"), payload.get("worktree") or None,
-                payload.get("account") or None, bool(payload.get("router")),
+                payload.get("account") or None,
                 payload.get("model") or None, payload.get("effort") or None,
                 bool(payload.get("force_model")))
         else:
