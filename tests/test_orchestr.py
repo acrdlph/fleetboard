@@ -448,6 +448,149 @@ class TestDispatchContract(ConfigGuard):
         self.assertIn("job", out)   # not refused — closeouts pick nothing
 
 
+# ------------------------------------------------------------ finish tiers
+
+class FakeGit:
+    """Stand-in for fb.run that answers the git calls start_finish makes."""
+    def __init__(self, landed=True, porcelain="", branch="feat/x",
+                 switch_rc=0, pull_rc=0):
+        self.landed, self.porcelain, self.branch = landed, porcelain, branch
+        self.switch_rc, self.pull_rc = switch_rc, pull_rc
+        self.calls = []
+
+    def __call__(self, cmd, cwd=None, timeout=None, **kw):
+        self.calls.append(cmd)
+        if "fetch" in cmd:
+            return 0, ""
+        if "merge-base" in cmd:
+            return (0 if self.landed else 1), ""
+        if "status" in cmd:
+            return 0, self.porcelain
+        if "rev-parse" in cmd:
+            return 0, self.branch + "\n"
+        if "switch" in cmd:
+            return self.switch_rc, "" if self.switch_rc == 0 else "collision"
+        if "pull" in cmd:
+            return self.pull_rc, ""
+        raise AssertionError(f"unexpected git call: {cmd}")
+
+    def ran(self, word):
+        return any(word in c for c in self.calls)
+
+
+class TestStartFinish(ConfigGuard):
+    """The finish button must scale its work to what's actually left: a
+    landed branch never gets the full re-check treatment."""
+
+    def setUp(self):
+        super().setUp()
+        fb.DEMO = False
+        self._saved = {n: getattr(fb, n) for n in
+                       ("run", "discover_worktrees", "claude_processes",
+                        "send_to_process", "_base_ref", "start_dispatch")}
+        fb.discover_worktrees = lambda: [
+            {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
+        fb._base_ref = lambda root: "origin/main"
+        fb.claude_processes = lambda: []
+        self.sent = []
+        fb.send_to_process = lambda pid, text: (
+            self.sent.append(text) or {"ok": True})
+        self.dispatched = []
+        fb.start_dispatch = lambda brief, **kw: (
+            self.dispatched.append((brief, kw)) or {"ok": True, "job": "j1"})
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(fb, n, f)
+        super().tearDown()
+
+    def live(self):
+        fb.claude_processes = lambda: [
+            {"pid": 1, "cwd": "/w/wt", "tmux_target": "s:0"}]
+
+    def finish(self, **git):
+        fb.run = self.git = FakeGit(**git)
+        return fb.start_finish("wt")
+
+    # -- live terminal ------------------------------------------------------
+    def test_live_landed_clean_sends_exit(self):
+        self.live()
+        out = self.finish(landed=True)
+        self.assertEqual(out["mode"], "exit")
+        self.assertEqual(self.sent, ["/exit"])
+
+    def test_live_landed_dirty_gets_slim_brief(self):
+        self.live()
+        out = self.finish(landed=True, porcelain="?? scratch.txt\n")
+        self.assertEqual(out["mode"], "slim")
+        self.assertIn("already landed", self.sent[0])
+        self.assertNotIn("merge origin/main into it", self.sent[0])
+
+    def test_live_not_landed_gets_full_brief(self):
+        self.live()
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "brief")
+        self.assertIn("merge-base --is-ancestor", self.sent[0])
+
+    # -- no terminal, landed ------------------------------------------------
+    def test_landed_clean_on_feature_branch_parks_without_agent(self):
+        out = self.finish(landed=True, branch="feat/x")
+        self.assertEqual(out["mode"], "parked")
+        self.assertTrue(self.git.ran("switch"))
+        self.assertTrue(self.git.ran("pull"))
+        self.assertEqual(self.dispatched, [])   # no agent, no account usage
+
+    def test_landed_untracked_scratch_goes_to_the_slim_agent(self):
+        # cleaning is a judgment call — an agent decides what's droppable
+        out = self.finish(landed=True, porcelain="?? a.tmp\n?? b.tmp\n")
+        self.assertEqual(out["mode"], "dispatch")
+        self.assertIn("already landed", self.dispatched[0][0])
+        self.assertFalse(self.git.ran("switch"))   # parking is the agent's job now
+
+    def test_landed_clean_on_trunk_is_noop(self):
+        out = self.finish(landed=True, branch="main")
+        self.assertEqual(out["mode"], "noop")
+        self.assertEqual(self.dispatched, [])
+
+    def test_landed_tracked_dirt_dispatches_slim_closeout(self):
+        # a real leftover diff might be meaningful — an agent must judge it,
+        # but nothing already merged gets re-checked
+        out = self.finish(landed=True, porcelain=" M src/app.py\n")
+        self.assertEqual(out["mode"], "dispatch")
+        brief, kw = self.dispatched[0]
+        self.assertIn("already landed", brief)
+        self.assertEqual(kw["model"], "haiku")
+
+    def test_switch_failure_falls_back_to_agent(self):
+        out = self.finish(landed=True, switch_rc=1)
+        self.assertEqual(out["mode"], "dispatch")
+        self.assertIn("already landed", self.dispatched[0][0])
+
+    def test_pull_failure_still_parks_and_admits_it(self):
+        out = self.finish(landed=True, pull_rc=1)
+        self.assertEqual(out["mode"], "parked")
+        self.assertIn("pull failed", out["message"])
+
+    # -- no terminal, not landed -------------------------------------------
+    def test_not_landed_dispatches_full_closeout(self):
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "dispatch")
+        self.assertIn("merge-base --is-ancestor", self.dispatched[0][0])
+
+
+class TestCloseoutBriefs(unittest.TestCase):
+    def test_slim_brief_never_asks_for_a_merge(self):
+        slim = fb.SLIM_CLOSEOUT_TEXT.format(trunk="origin/main")
+        self.assertIn("already landed", slim)
+        self.assertNotIn("merge origin/main into it", slim)
+        self.assertNotIn("merge-base", slim)
+
+    def test_both_briefs_park_on_the_trunk(self):
+        for brief in (fb.CLOSEOUT_TEXT, fb.SLIM_CLOSEOUT_TEXT):
+            self.assertIn("switch this worktree to the trunk branch",
+                          brief.format(trunk="origin/main"))
+
+
 # --------------------------------------------------------- one-shot closeout
 
 class TestCloseoutShell(unittest.TestCase):

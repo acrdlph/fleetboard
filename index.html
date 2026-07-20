@@ -478,7 +478,7 @@ function render(st) {
           return w.live_procs.length ? "" : `<span class="noproc">no live proc</span>`;
         })()}
           <button class="abtn finish ${finArmed ? "armed" : ""}" data-wt="${esc(w.name)}"
-            title="close out: agent lands the branch, terminal closes, card goes free">${finArmed ? "✓ confirm" : "✓ finish"}</button></span>
+            title="close out: whatever's left gets done — already-landed work is never re-checked; card goes free">${finArmed ? "✓ confirm" : "✓ finish"}</button></span>
       </div>
       <div class="gitline"><span class="branch">${esc(g.branch || "?")}</span>${dirty}${sync}</div>
       <div class="commit" title="${esc(g.commit ? g.commit.subject : "")}">${commit}</div>

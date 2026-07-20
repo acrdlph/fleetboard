@@ -110,11 +110,11 @@ refetch". Nothing polls the Anthropic API on a timer.
 - **▶ resume** — a session-limit-stuck agent gets a button with a live
   countdown that **arms itself the moment the limit resets**, then types
   `continue`. Weekly limits never show it — they won't heal soon.
-- **✓ finish** — one click hands closeout to an agent: the live one gets a
-  closeout brief (land the branch, tidy up, report), a missing one is
-  replaced by a one-shot closeout agent that frees the card by itself, and an
-  idle agent whose work already landed just gets `/exit`. See *Closing out a
-  mission* below.
+- **✓ finish** — one click, exactly as much closeout as is left: an unlanded
+  branch gets the full closeout brief (typed at the live agent, or run by a
+  one-shot closeout agent that frees the card by itself); an already-landed
+  one gets a slim brief — or no agent at all: orchestr parks the worktree
+  back on the trunk itself. See *Closing out a mission* below.
 - **🚀 new mission** — describe a feature; orchestr picks the worktree and
   account **deterministically** — the cleanest free worktree, the account
   with the most headroom that can run your model — no AI in the routing loop,
@@ -162,14 +162,23 @@ orchestr does — works by talking to a terminal:
 
 - **agent alive** → it receives a closeout brief: land the branch on the
   trunk (merge, resolve, push), tidy the worktree, report back. ✓ finish
-  again once it's done closes the terminal.
+  again once it's done closes the terminal. Merged to the trunk from the
+  terminal yourself already? The brief shrinks to match — settle background
+  work, tidy scratch, park on the trunk; nothing already merged is re-checked.
 - **terminal already gone** → a one-shot closeout agent (headless
   `claude -p --model haiku` — the work is mechanical git, no judgment needed)
-  runs the same brief, then git itself verifies the landing: verified clean →
-  the process ends and the card frees itself, no second click; anything else →
-  the session reopens interactively **on the account's default model** (the
-  resume is deliberately unpinned, so failure escalates past haiku) and the
-  card parks as *needs you* — a failed closeout never masquerades as free.
+  runs the right-sized brief, then git itself verifies the landing: verified
+  clean → the process ends and the card frees itself, no second click;
+  anything else → the session reopens interactively **on the account's
+  default model** (the resume is deliberately unpinned, so failure escalates
+  past haiku) and the card parks as *needs you* — a failed closeout never
+  masquerades as free.
+- **terminal gone, branch already landed, worktree clean** → no agent at
+  all: orchestr switches the worktree back to the trunk and pulls. Two git
+  commands don't need an agent — the one place the board runs git write
+  commands itself, because a landed branch and a clean tree make them
+  provably safe. Any leftover file, even scratch, still goes to an agent:
+  whether it's droppable is a judgment call.
 - **everything landed, agent idle** → `/exit` is typed and the terminal
   closes.
 
