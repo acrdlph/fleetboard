@@ -1009,11 +1009,11 @@ class TestLimitActiveUntil(ResumeGuard):
 
     def setUp(self):
         super().setUp()
-        self._cl = fb.cached_limits
-        fb.cached_limits = lambda refresh=False: fb._limits["data"]
+        self._cl = fb.limits.cached_limits
+        fb.limits.cached_limits = lambda refresh=False: fb._limits["data"]
 
     def tearDown(self):
-        fb.cached_limits = self._cl
+        fb.limits.cached_limits = self._cl
         super().tearDown()
 
     def _data(self, limits, fetched):
@@ -1069,14 +1069,14 @@ class TestFireResume(ResumeGuard):
     def setUp(self):
         super().setUp()
         self._saved = {n: getattr(fb, n) for n in
-                       ("cached_state", "send_to_process", "_tmux_resume",
-                        "_limit_active_until")}
+                       ("cached_state", "send_to_process", "_tmux_resume")}
         self._saved_git = {"discover_worktrees": fb.gitrepo.discover_worktrees}
         self._saved_homes = fb.transcripts.claude_homes
+        self._saved_lau = fb.limits._limit_active_until
         fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.transcripts.claude_homes = lambda: [Path("/h/.claude-account2")]
-        fb._limit_active_until = lambda account, model, now: None
+        fb.limits._limit_active_until = lambda account, model, now: None
         self.sent, self.tmuxed = [], []
         fb.send_to_process = lambda pid, text: (
             self.sent.append((pid, text)) or {"ok": True, "message": "sent via tmux"})
@@ -1090,6 +1090,7 @@ class TestFireResume(ResumeGuard):
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
         fb.transcripts.claude_homes = self._saved_homes
+        fb.limits._limit_active_until = self._saved_lau
         super().tearDown()
 
     def board(self, status="limit", pid=None, reachable=True, handed=None,
@@ -1127,7 +1128,7 @@ class TestFireResume(ResumeGuard):
         import time as _t
         self.board()
         until = _t.time() + 5000
-        fb._limit_active_until = lambda account, model, now: until
+        fb.limits._limit_active_until = lambda account, model, now: until
         key = self.arm()
         fb.fire_resume(key)
         r = fb._resumes[key]
@@ -1139,7 +1140,7 @@ class TestFireResume(ResumeGuard):
     def test_rearm_gives_up_after_max_attempts(self):
         import time as _t
         self.board()
-        fb._limit_active_until = lambda account, model, now: _t.time() + 5000
+        fb.limits._limit_active_until = lambda account, model, now: _t.time() + 5000
         key = self.arm()
         fb._resumes[key]["attempts"] = fb.RESUME_MAX_ATTEMPTS - 1
         fb.fire_resume(key)

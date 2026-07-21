@@ -90,7 +90,7 @@ class TestCollectPipeline(unittest.TestCase):
                       ("roots", "homes", "pattern", "exclude_accounts", "reserve_percent")}
         self._demo, self._procs, self._cl = (fb.config.DEMO,
                                              fb.procs.claude_processes,
-                                             fb.cached_limits)
+                                             fb.limits.cached_limits)
         fb.config.DEMO = False
         fb.CFG["roots"] = [str(self.root)]
         fb.CFG["homes"] = [str(self.home)]
@@ -98,7 +98,7 @@ class TestCollectPipeline(unittest.TestCase):
         fb.CFG["exclude_accounts"] = []
         fb.CFG["reserve_percent"] = {}
         fb.procs.claude_processes = lambda: []                       # no live procs
-        fb.cached_limits = lambda refresh=False: {"available": False}
+        fb.limits.cached_limits = lambda refresh=False: {"available": False}
         fb._cache["state"] = None                              # bust the 4s cache
 
     def tearDown(self):
@@ -108,7 +108,7 @@ class TestCollectPipeline(unittest.TestCase):
             else:
                 fb.CFG[k] = v
         (fb.config.DEMO, fb.procs.claude_processes,
-         fb.cached_limits) = self._demo, self._procs, self._cl
+         fb.limits.cached_limits) = self._demo, self._procs, self._cl
         fb._cache["state"] = None
         shutil.rmtree(self.tmp, ignore_errors=True)
 
