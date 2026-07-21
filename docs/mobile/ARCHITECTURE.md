@@ -383,7 +383,7 @@ def migrate_stray_state():
     landed beside the code is moved back to ROOT, loudly."""
 ```
 
-Secrets leave `~/Downloads/orchestra` because that directory is commonly Dropbox/iCloud-synced
+Secrets leave `~/Downloads/orchestr` because that directory is commonly Dropbox/iCloud-synced
 and Time-Machined. The registry being hash-only makes its leak survivable; **the TLS private
 key is not hash-only** — with it an attacker stands up a listener presenting the pinned SPKI,
 the phone's pinning delegate accepts it by construction, and the next dispatch delivers the

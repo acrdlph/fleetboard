@@ -850,7 +850,7 @@ Rendered in the bottom accessory, never as a full-screen takeover.
 ║                                                    ║
 ║     On your Mac:                                   ║
 ║     ┌────────────────────────────────────────────┐ ║
-║     │  cd ~/Downloads/orchestra && ./start.sh     │ ║
+║     │  cd ~/Downloads/orchestr && ./start.sh     │ ║
 ║     └────────────────────────────────────────────┘ ║
 ║                              ‹Copy›                ║
 ║  —  /api/hello                        not reached  ║

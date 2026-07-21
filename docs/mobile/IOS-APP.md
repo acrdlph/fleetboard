@@ -1,6 +1,6 @@
 # orchestra for iOS — engineering plan
 
-Status: **plan**. Written against `/Users/achill/Downloads/orchestra/orchestra.py` at HEAD
+Status: **plan**. Written against `/Users/achill/Downloads/orchestr/orchestra.py` at HEAD
 (2302 lines). The client is built for the **versioned, op-addressed, SSE-streamed API** the
 backend ships first — `Orchestra-Api: 1.0`, served under `/api/v1/`. There is no legacy mode;
 see §5.6.

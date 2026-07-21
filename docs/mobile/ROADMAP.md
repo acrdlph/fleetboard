@@ -232,7 +232,7 @@ None.
 
 ### Backend
 
-- **Move mutable secret state out of the repo directory** to `~/Library/Application Support/orchestra/` (0700). `~/Downloads/orchestra` is commonly cloud-synced and Time-Machined, and it will hold a TLS private key.
+- **Move mutable secret state out of the repo directory** to `~/Library/Application Support/orchestra/` (0700). `~/Downloads/orchestr` is commonly cloud-synced and Time-Machined, and it will hold a TLS private key.
 - **Per-device bearer tokens.** `devices.json` storing only `sha256(token)`; `Authorization: Bearer`; loopback exempt so the desktop board is untouched. Scopes (`read` / `act` / `admin`) so a phone's background-readable token cannot dispatch.
 - **TLS.** `tailscale cert <magicdns>` + `ssl.SSLContext.wrap_socket` on the listener (~12 lines, stdlib). Dual-bind: loopback stays plain HTTP so `start.sh`'s hardcoded `http://127.0.0.1:$PORT` keeps working.
 - **`GET /api/hello`** — hostname, user, version, `capabilities[]`, and the config values the client needs to render honest empty states (`roots`, `pattern`, `session_window_h`, `exclude_accounts`, `reserve_percent`). `capabilities[]` is the version-skew mechanism; it replaces the hand-written *"the server predates auto-resume"* string in `index.html`.

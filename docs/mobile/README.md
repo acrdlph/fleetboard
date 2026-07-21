@@ -38,6 +38,15 @@ treat it as draft.
 > **`VERIFIED-FACTS.md` outranks every other document.** Its contents were measured, not
 > recalled. If a design doc contradicts it, the design doc is wrong.
 
+> **Naming note.** The *project* is `orchestra`; the *checkout directories* are still
+> `~/Downloads/orchestr` and `~/Downloads/orchestr-engine`. That is deliberate — a directory
+> name is invisible to git, to the config (which points at the parent, `~/Downloads`), and to
+> the code. Renaming them would break the `git worktree` link (absolute paths are baked into
+> `.git/worktrees/*/gitdir`) and would make Claude Code treat this as a brand-new project,
+> since session and memory directories are keyed by munged cwd — the same mechanic orchestra
+> itself uses to map transcripts to worktrees. Not worth it. Paths in these docs point at the
+> real directories.
+
 ---
 
 ## The problem, in one screen
