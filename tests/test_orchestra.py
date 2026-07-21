@@ -4,14 +4,14 @@
     python3 -m unittest discover -s tests        # from repo root
     python3 tests/test_orchestra.py             # or run directly
 
-orchestra.py is a script (guarded by `if __name__ == "__main__"`), so importing
-it here does NOT start the server. Data-driven functions read module globals
-(CFG, _limits, DEMO); tests set those and restore them.
+The server only starts from `python3 -m orchestra` (orchestra/__main__.py), so
+importing the package here does NOT start it. Data-driven functions read module
+globals (CFG, _limits, DEMO); tests set those and restore them.
 """
 
-import importlib.util
 import json
 import shlex
+import sys
 import tempfile
 import threading
 import unittest
@@ -19,11 +19,10 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-# ---- load orchestra.py by path (it's a script, not a package) --------------
+# ---- import the orchestra package from the repo root ----------------------
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("orchestra", ROOT / "orchestra.py")
-fb = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(fb)
+sys.path.insert(0, str(ROOT))
+import orchestra as fb  # noqa: E402
 
 
 def acc(config_dir, ok=True, headroom=None, limits=None):

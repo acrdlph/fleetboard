@@ -18,10 +18,10 @@ It's an agent **harness** with zero dependencies — one python3 stdlib file.
 
 ```bash
 git clone https://github.com/acrdlph/orchestra && cd orchestra
-python3 orchestra.py --root ~/code        # → http://127.0.0.1:4242
+python3 -m orchestra --root ~/code        # → http://127.0.0.1:4242
 ```
 
-Try it with nothing running: `python3 orchestra.py --demo` serves fictional
+Try it with nothing running: `python3 -m orchestra --demo` serves fictional
 data.
 
 ---
@@ -219,7 +219,7 @@ that, with `/proc`-based process detection. Optional: `tmux` (dispatch),
 `claude` on PATH (dispatch router).
 
 ```bash
-python3 orchestra.py [--root DIR]... [--pattern REGEX] [--home DIR]...
+python3 -m orchestra [--root DIR]... [--pattern REGEX] [--home DIR]...
                       [--port N] [--window-h H] [--demo]
 ./start.sh            # restart + open browser (extra args passed through)
 ```

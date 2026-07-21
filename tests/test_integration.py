@@ -11,20 +11,19 @@ a plain shell — it never launches `claude`.
     python3 -m unittest discover -s tests
 """
 
-import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("orchestra", ROOT / "orchestra.py")
-fb = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(fb)
+sys.path.insert(0, str(ROOT))
+import orchestra as fb  # noqa: E402
 
 HAVE_GIT = shutil.which("git") is not None
 HAVE_TMUX = shutil.which("tmux") is not None

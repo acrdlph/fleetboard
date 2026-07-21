@@ -17,8 +17,8 @@ the branch has already landed, finish skips the agent: it parks the worktree
 back on the trunk itself (switch + pull — the one provably-safe case where
 the board runs git write commands). Zero dependencies — python3 stdlib only.
 
-    python3 orchestra.py --root ~/code
-    python3 orchestra.py --demo          # fictional data, for screenshots
+    python3 -m orchestra --root ~/code
+    python3 -m orchestra --demo          # fictional data, for screenshots
 
 Configuration precedence: CLI flags > orchestra.config.json (next to this
 script, else cwd) > defaults. See README.md.
@@ -35,11 +35,11 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 HOME = Path.home()
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent  # package lives one level under the repo root
 
 CFG = {
     "host": "127.0.0.1",       # keep loopback: the board serves transcript text
@@ -2404,22 +2404,4 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *args):
-        pass
-
-
-if __name__ == "__main__":
-    args = load_config()
-    DEMO = args.demo
-    if CFG["host"] not in ("127.0.0.1", "localhost", "::1"):
-        print("orchestra: WARNING — binding beyond loopback serves your "
-              "transcript text to the network", file=sys.stderr)
-    if not DEMO:
-        load_resumes()
-        threading.Thread(target=resume_loop, daemon=True).start()
-    server = ThreadingHTTPServer((CFG["host"], CFG["port"]), Handler)
-    mode = " (demo data)" if DEMO else ""
-    print(f"orchestra up → http://{CFG['host']}:{CFG['port']}{mode}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
         pass
