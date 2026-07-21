@@ -639,11 +639,11 @@ class TestStartFinish(ConfigGuard):
         fb.config.DEMO = False
         fb._closeouts.clear()
         self._saved = {n: getattr(fb, n) for n in
-                       ("run", "send_to_process",
-                        "start_dispatch", "scan_sessions")}
+                       ("run", "send_to_process", "start_dispatch")}
         self._saved_git = {n: getattr(fb.gitrepo, n) for n in
                            ("discover_worktrees", "_base_ref")}
         self._saved_procs = fb.procs.claude_processes
+        self._saved_scan = fb.transcripts.scan_sessions
         fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.gitrepo._base_ref = lambda root: "origin/main"
@@ -661,6 +661,7 @@ class TestStartFinish(ConfigGuard):
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
         fb.procs.claude_processes = self._saved_procs
+        fb.transcripts.scan_sessions = self._saved_scan
         super().tearDown()
 
     def live(self):
@@ -726,7 +727,7 @@ class TestStartFinish(ConfigGuard):
         # instead of refusing forever
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
         self.finish(landed=True, porcelain=" M keep.py\n")   # arms _closeouts
         fb._closeouts["wt"] = _t.time() - 120                 # briefed 2m ago
@@ -741,7 +742,7 @@ class TestStartFinish(ConfigGuard):
     def test_nudge_lists_porcelain_and_truncates_past_five(self):
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
         porc = "".join(f"?? f{i}.tmp\n" for i in range(7))
         self.finish(landed=True, porcelain=porc)
@@ -758,7 +759,7 @@ class TestStartFinish(ConfigGuard):
         # a nudge would collide with the open question dialog — refuse to chat
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "needs_input"}]}
         self.finish(landed=False)
         fb._closeouts["wt"] = _t.time() - 120                 # past the guard
@@ -773,7 +774,7 @@ class TestStartFinish(ConfigGuard):
         # the agent may be mid-closeout — refuse regardless of the clock
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "working"}]}
         self.finish(landed=False)
         fb._closeouts["wt"] = _t.time() - 120
@@ -784,7 +785,7 @@ class TestStartFinish(ConfigGuard):
     def test_pending_refusal_carries_structured_fields(self):
         # under the 60s guard: refuse, but the frontend gets left/files/sent
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
         self.finish(landed=True, porcelain=" M a.py\n?? b\n")  # sent = now
         out = self.finish(landed=True, porcelain=" M a.py\n?? b\n")
@@ -1069,11 +1070,12 @@ class TestFireResume(ResumeGuard):
         super().setUp()
         self._saved = {n: getattr(fb, n) for n in
                        ("cached_state", "send_to_process", "_tmux_resume",
-                        "_limit_active_until", "claude_homes")}
+                        "_limit_active_until")}
         self._saved_git = {"discover_worktrees": fb.gitrepo.discover_worktrees}
+        self._saved_homes = fb.transcripts.claude_homes
         fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
-        fb.claude_homes = lambda: [Path("/h/.claude-account2")]
+        fb.transcripts.claude_homes = lambda: [Path("/h/.claude-account2")]
         fb._limit_active_until = lambda account, model, now: None
         self.sent, self.tmuxed = [], []
         fb.send_to_process = lambda pid, text: (
@@ -1087,6 +1089,7 @@ class TestFireResume(ResumeGuard):
             setattr(fb, n, f)
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
+        fb.transcripts.claude_homes = self._saved_homes
         super().tearDown()
 
     def board(self, status="limit", pid=None, reachable=True, handed=None,

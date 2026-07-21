@@ -35,7 +35,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-from . import config, shell, status, gitrepo, procs
+from . import config, shell, status, gitrepo, procs, transcripts
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO and
@@ -50,298 +50,23 @@ from .gitrepo import (munge, match_worktree, discover_worktrees, git_info,
                       cached_topology, TOPO_TTL_S, _topo)
 from .procs import (claude_processes, pair_sessions_with_procs, shell_children,
                     _pid_cwds, _pid_config_dirs, _host_of, _tmux_pane_map)
+from .transcripts import (claude_homes, _read_chunk, _clean, _real_prompt,
+                          session_topic, last_assistant_text, find_last_user,
+                          parse_session_tail, scan_sessions,
+                          TAIL_BYTES, HEAD_BYTES)
 
-TAIL_BYTES = 128 * 1024
-HEAD_BYTES = 16 * 1024
 STATE_TTL_S = 4.0              # cache collector output between requests
 _cache = {"t": 0.0, "state": None}
 
 
 # ---------------------------------------------------------------- collectors
 
-def claude_homes():
-    # Precedence: --home / config "homes" > CLAUDE_CONFIG_DIRS (colon-separated,
-    # same convention as cclimits) > auto-discover ~/.claude*
-    explicit = config.CFG["homes"] or [
-        h for h in os.environ.get("CLAUDE_CONFIG_DIRS", "").split(":") if h]
-    if explicit:
-        return [Path(h).expanduser() for h in explicit
-                if (Path(h).expanduser() / "projects").is_dir()]
-    homes = []
-    for p in sorted(config.HOME.iterdir()):
-        if (p.name == ".claude" or p.name.startswith(".claude-")) and (p / "projects").is_dir():
-            homes.append(p)
-    return homes
-
-
-def _read_chunk(fp, size, from_end):
-    try:
-        with open(fp, "rb") as f:
-            if from_end:
-                f.seek(0, 2)
-                n = f.tell()
-                f.seek(max(0, n - size))
-                data = f.read()
-                if n > size:  # drop leading partial line
-                    data = data.split(b"\n", 1)[-1]
-            else:
-                data = f.read(size)
-        return data.decode("utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def _clean(text, limit=240):
-    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
-    text = re.sub(r"<command-name>(.*?)</command-name>", r"\1", text, flags=re.S)
-    text = re.sub(r"<[^>]{1,80}>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[: limit - 1] + "…" if len(text) > limit else text
-
-
-_MACHINE_TEXT = re.compile(
-    r"<local-command-stdout>|<command-message>|<system-reminder>|"
-    r"task-notification|\btoolu_[A-Za-z0-9]|\[SYSTEM NOTIFICATION")
-
-
-def _real_prompt(text):
-    """A user text that describes the session (not a slash-command stub,
-    caveat, or harness-injected machine noise)."""
-    if _MACHINE_TEXT.search(text):
-        return None
-    t = _clean(text, 140)
-    if not t or t.startswith("/") or t.startswith("Caveat:"):
-        return None
-    return t
-
-
-def session_topic(fp):
-    """Label a session: compaction summary if present, else first real user prompt."""
-    for line in _read_chunk(fp, HEAD_BYTES, from_end=False).splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("type") == "summary" and e.get("summary"):
-            return _clean(e["summary"], 140)
-        if e.get("type") == "user" and not e.get("isMeta"):
-            c = e.get("message", {}).get("content")
-            texts = [c] if isinstance(c, str) else [
-                b.get("text", "") for b in c
-                if isinstance(b, dict) and b.get("type") == "text"] if isinstance(c, list) else []
-            for t in texts:
-                topic = _real_prompt(t)
-                if topic:
-                    return topic
-    return None
-
-
-def last_assistant_text(fp, size=TAIL_BYTES):
-    """Last assistant text in a transcript, no sidechain filter (for subagent
-    files, whose entries are all sidechain from the parent's perspective)."""
-    last = None
-    for line in _read_chunk(fp, size, from_end=True).splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("type") != "assistant":
-            continue
-        c = (e.get("message") or {}).get("content")
-        if isinstance(c, list):
-            for b in c:
-                if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
-                    last = _clean(b["text"])
-    return last
-
-
-def find_last_user(fp, size=1024 * 1024):
-    """Deeper backward search for the latest real user prompt (fallback when
-    the standard tail window is all tool traffic)."""
-    for line in reversed(_read_chunk(fp, size, from_end=True).splitlines()):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("isSidechain") or e.get("type") != "user" or e.get("isMeta"):
-            continue
-        c = e.get("message", {}).get("content")
-        texts = [c] if isinstance(c, str) else [
-            b.get("text", "") for b in c
-            if isinstance(b, dict) and b.get("type") == "text"] if isinstance(c, list) else []
-        for t in texts:
-            p = _real_prompt(t)
-            if p:
-                return p
-    return None
-
-
-def parse_session_tail(fp):
-    """Tail-parse a transcript: last activity, pending tools, last assistant text."""
-    entries = []
-    for line in _read_chunk(fp, TAIL_BYTES, from_end=True).splitlines():
-        try:
-            entries.append(json.loads(line))
-        except ValueError:
-            continue
-    main = [e for e in entries if isinstance(e, dict) and not e.get("isSidechain")]
-
-    out = {"cwd": None, "branch": None, "model": None, "pending_tools": [],
-           "last_assistant": None, "last_user": None, "pending_workflows": 0,
-           "pending_bg_agents": 0}
-    pending = {}  # tool_use id -> tool name
-    for e in main:
-        out["cwd"] = e.get("cwd") or out["cwd"]
-        out["branch"] = e.get("gitBranch") or out["branch"]
-        if e.get("type") == "system" and e.get("subtype") == "turn_duration":
-            # a turn that ended still awaiting workflows or background agents
-            # ("✻ Waiting for 1 background agent to finish") is NOT the user's
-            # turn — the harness resumes the session when they report back
-            out["pending_workflows"] = e.get("pendingWorkflowCount") or 0
-            out["pending_bg_agents"] = e.get("pendingBackgroundAgentCount") or 0
-        msg = e.get("message")
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if e.get("type") == "user" and not e.get("isMeta"):
-            texts = [content] if isinstance(content, str) else [
-                b.get("text", "") for b in content
-                if isinstance(b, dict) and b.get("type") == "text"] if isinstance(content, list) else []
-            for t in texts:
-                prompt = _real_prompt(t)
-                if prompt:
-                    out["last_user"] = prompt
-        if e.get("type") == "assistant":
-            model = msg.get("model")
-            if model and model != "<synthetic>":
-                out["model"] = model
-            if isinstance(content, list):
-                for b in content:
-                    if not isinstance(b, dict):
-                        continue
-                    if b.get("type") == "tool_use":
-                        pending[b.get("id")] = b.get("name", "?")
-                    elif b.get("type") == "text" and b.get("text", "").strip():
-                        out["last_assistant"] = _clean(b["text"])
-        elif e.get("type") == "user" and isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and b.get("type") == "tool_result":
-                    pending.pop(b.get("tool_use_id"), None)
-    out["pending_tools"] = sorted(set(pending.values()))
-    return out
-
-
-
-
-def scan_sessions(worktrees, all_procs, now):
-    """All recent sessions across every Claude home, mapped to worktrees.
-
-    `all_procs`, not `procs`: the module object of that name is what the
-    session↔process pairing now hangs off, and a parameter would shadow it.
-    Callers pass it positionally, so the name is local knowledge."""
-    by_wt = {w["path"]: [] for w in worktrees}
-    wt_prefixes = {w["path"]: gitrepo.munge(w["path"]) for w in worktrees}
-    window_s = config.CFG["session_window_h"] * 3600
-
-    for home in claude_homes():
-        acct = config.account_label(home)
-        for proj in (home / "projects").iterdir():
-            wt = gitrepo.match_worktree(proj.name, wt_prefixes)
-            if wt is None:
-                continue
-            for fp in proj.glob("*.jsonl"):
-                try:
-                    mtime = fp.stat().st_mtime
-                except OSError:
-                    continue
-                # Workflows/subagents write to <session-id>/**/*.jsonl while the
-                # main transcript sits untouched — count them toward activity.
-                sub_files = []
-                sub_dir = fp.with_suffix("")
-                if sub_dir.is_dir():
-                    for sf in sub_dir.rglob("*.jsonl"):
-                        try:
-                            sub_files.append((sf.stat().st_mtime, sf))
-                        except OSError:
-                            continue
-                sub_mtime = max((m for m, _ in sub_files), default=0.0)
-                # The newest thing the session "said" may be a subagent's
-                # report (Claude Code shows those in the terminal too).
-                subagent_said = None
-                if sub_mtime > mtime:
-                    for _, sf in sorted(sub_files, reverse=True)[:2]:
-                        subagent_said = last_assistant_text(sf)
-                        if subagent_said:
-                            break
-                age = now - max(mtime, sub_mtime)
-                if age > window_s:
-                    continue
-                tail = parse_session_tail(fp)
-                cwd = tail["cwd"] or wt
-                by_wt[wt].append({
-                    "id": fp.stem[:8],
-                    "sid": fp.stem,
-                    "account": acct,
-                    "age_s": int(age),
-                    "cwd": cwd,
-                    "subdir": os.path.relpath(cwd, wt) if cwd != wt else None,
-                    "branch": tail["branch"],
-                    "model": (tail["model"] or "").replace("claude-", ""),
-                    "pending_tools": tail["pending_tools"],
-                    "pending_workflows": tail["pending_workflows"],
-                    "pending_bg_agents": tail["pending_bg_agents"],
-                    "topic": session_topic(fp),
-                    "last_assistant": tail["last_assistant"],
-                    "last_user": tail["last_user"] or find_last_user(fp),
-                    "subagent_said": subagent_said,
-                    "subagents_active": bool(sub_mtime and now - sub_mtime < config.CFG["working_s"]),
-                })
-
-    rank = {"needs_input": 0, "blocked": 1, "working": 2, "waiting": 3, "ended": 4}
-    for wt, sessions in by_wt.items():
-        sessions.sort(key=lambda s: s["age_s"])
-        # A live process proves at most ONE session is really attended.
-        # N procs under a worktree vouch for its N freshest sessions —
-        # freshness beats cwd matching (recorded cwds drift as agents cd
-        # around, and a stale exact match must not outrank the live session).
-        wt_procs = [p for p in all_procs if p.get("cwd") and
-                    (p["cwd"] == wt or p["cwd"].startswith(wt + "/"))]
-        # With --dangerously-skip-permissions there are no approval prompts:
-        # an unresolved tool call means a long-running tool, not "blocked".
-        skip_perms = bool(wt_procs) and all(
-            "--dangerously-skip-permissions" in p["cmd"] for p in wt_procs)
-
-        owner = procs.pair_sessions_with_procs(sessions, wt_procs)
-        for s in sessions:
-            proc = owner.get(s["sid"])
-            alive = proc is not None
-            shell_n = proc.get("shells", 0) if proc else 0
-            s["pid"] = proc["pid"] if proc else None
-            # only an account match is a real attribution; a fallback pairing is
-            # a guess and must not be presented as one
-            s["pid_certain"] = bool(proc and proc.get("account") == s["account"])
-            # `sess_status`, not `status`: the module object of that name is
-            # what classify_session now hangs off, and a local would shadow it.
-            sess_status, tool_running = status.classify_session(
-                s["age_s"], alive, s["pending_tools"],
-                s["pending_workflows"] + s["pending_bg_agents"],
-                skip_perms, config.CFG["working_s"], shell_n)
-            s["status"] = sess_status
-            if tool_running:
-                s["tool_running"] = True
-                if shell_n and not s["pending_tools"]:
-                    s["bg_shell"] = True     # transcript idle, shell alive
-        sessions.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
-        by_wt[wt] = sessions[: config.CFG["max_sessions"]]
-    return by_wt
-
-
 def collect_state():
     now = time.time()
     worktrees = gitrepo.discover_worktrees()
     # `all_procs`, not `procs`: a local of that name would shadow the module.
     all_procs = procs.claude_processes()
-    sessions = scan_sessions(worktrees, all_procs, now)
+    sessions = transcripts.scan_sessions(worktrees, all_procs, now)
 
     # An agent parked at the prompt on an exhausted account isn't "your turn" —
     # it's out of juice. Joined from the cclimits cache (populated lazily by
@@ -1041,7 +766,7 @@ def start_finish(wt_name):
                     else f"branch not landed on {trunk}")
             files = porcelain[:5]          # ≤5 raw lines, for the agent + UI
             now = time.time()
-            sessions = scan_sessions([wt], mine, now).get(path, [])
+            sessions = transcripts.scan_sessions([wt], mine, now).get(path, [])
             paired = next((s for s in sessions
                            if s.get("pid") == live["pid"]), None)
             any_working = any(s.get("status") == "working" for s in sessions)
@@ -1135,14 +860,15 @@ def start_finish(wt_name):
 
 def read_chat(account, sid, limit=40):
     """Last conversation turns of a session, from its transcript."""
-    home = next((h for h in claude_homes() if config.account_label(h) == account), None)
+    home = next((h for h in transcripts.claude_homes()
+                 if config.account_label(h) == account), None)
     if not home:
         return {"ok": False, "error": f"unknown account {account}"}
     fp = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
     if not fp:
         return {"ok": False, "error": "transcript not found"}
     msgs = []
-    for line in _read_chunk(fp, 512 * 1024, from_end=True).splitlines():
+    for line in transcripts._read_chunk(fp, 512 * 1024, from_end=True).splitlines():
         try:
             e = json.loads(line)
         except ValueError:
@@ -1158,13 +884,14 @@ def read_chat(account, sid, limit=40):
                 b.get("text", "") for b in c
                 if isinstance(b, dict) and b.get("type") == "text"] if isinstance(c, list) else []
             for t in texts:
-                if _real_prompt(t):
-                    msgs.append({"role": "you", "text": _clean(t, 900), "ts": e.get("timestamp")})
+                if transcripts._real_prompt(t):
+                    msgs.append({"role": "you", "text": transcripts._clean(t, 900),
+                                 "ts": e.get("timestamp")})
         elif e.get("type") == "assistant" and isinstance(c, list):
             parts = [b["text"] for b in c
                      if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
             if parts:
-                msgs.append({"role": "agent", "text": _clean(" ".join(parts), 900),
+                msgs.append({"role": "agent", "text": transcripts._clean(" ".join(parts), 900),
                              "ts": e.get("timestamp")})
     return {"ok": True, "messages": msgs[-limit:]}
 
@@ -1346,7 +1073,8 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
     wt = next((w for w in gitrepo.discover_worktrees() if w["name"] == worktree), None)
     if not wt:
         return finish({"ok": False, "message": f"unknown worktree {worktree}"})
-    home = next((h for h in claude_homes() if config.account_label(h) == account), None)
+    home = next((h for h in transcripts.claude_homes()
+                 if config.account_label(h) == account), None)
     if not home:
         return finish({"ok": False, "message": f"unknown account {account}"})
 
@@ -1747,7 +1475,8 @@ def fire_resume(key):
             return _resume_set(key, status="done", fired_at=now,
                                message=f"sent '{msg}' — {res['message']}")
     wt = next((w for w in gitrepo.discover_worktrees() if w["name"] == worktree), None)
-    home = next((h for h in claude_homes() if config.account_label(h) == account), None)
+    home = next((h for h in transcripts.claude_homes()
+                 if config.account_label(h) == account), None)
     if not wt or not home:
         return _resume_set(key, status="failed", fired_at=now, message=
                            "worktree or account no longer known — nothing sent")
