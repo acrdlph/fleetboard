@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""orchestr — local mission control for parallel Claude Code agents.
+"""orchestra — local mission control for parallel Claude Code agents.
 
 Watches your git worktrees, your Claude Code home directories (multi-account
 setups included), and live `claude` processes; serves three views on
@@ -17,10 +17,10 @@ the branch has already landed, finish skips the agent: it parks the worktree
 back on the trunk itself (switch + pull — the one provably-safe case where
 the board runs git write commands). Zero dependencies — python3 stdlib only.
 
-    python3 orchestr.py --root ~/code
-    python3 orchestr.py --demo          # fictional data, for screenshots
+    python3 orchestra.py --root ~/code
+    python3 orchestra.py --demo          # fictional data, for screenshots
 
-Configuration precedence: CLI flags > orchestr.config.json (next to this
+Configuration precedence: CLI flags > orchestra.config.json (next to this
 script, else cwd) > defaults. See README.md.
 """
 
@@ -71,28 +71,28 @@ def load_config(argv=None):
     ap.add_argument("--pattern", metavar="REGEX", help="only watch dirs matching this regex (case-insensitive)")
     ap.add_argument("--home", action="append", metavar="DIR",
                     help="Claude home dir (repeatable; default: auto-discover ~/.claude*)")
-    ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTR_PORT)")
+    ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTRA_PORT)")
     ap.add_argument("--host", help="bind address (default 127.0.0.1 — the board serves your transcript text; do not expose it)")
     ap.add_argument("--window-h", type=float, help="ignore transcripts idle longer than this many hours (default 48)")
-    ap.add_argument("--config", metavar="FILE", help="path to a orchestr.config.json")
+    ap.add_argument("--config", metavar="FILE", help="path to a orchestra.config.json")
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)
 
     global CONFIG_PATH
     candidates = [Path(args.config)] if args.config else [
-        HERE / "orchestr.config.json", Path.cwd() / "orchestr.config.json"]
+        HERE / "orchestra.config.json", Path.cwd() / "orchestra.config.json"]
     for p in candidates:
         if p.is_file():
             try:
                 CFG.update(json.loads(p.read_text()))
             except (ValueError, OSError) as e:
-                sys.exit(f"orchestr: bad config {p}: {e}")
+                sys.exit(f"orchestra: bad config {p}: {e}")
             CONFIG_PATH = p
             break
     if CONFIG_PATH is None:  # where a UI edit will create/persist config
-        CONFIG_PATH = Path(args.config) if args.config else HERE / "orchestr.config.json"
-    if os.environ.get("ORCHESTR_PORT"):
-        CFG["port"] = int(os.environ["ORCHESTR_PORT"])
+        CONFIG_PATH = Path(args.config) if args.config else HERE / "orchestra.config.json"
+    if os.environ.get("ORCHESTRA_PORT"):
+        CFG["port"] = int(os.environ["ORCHESTRA_PORT"])
     if args.root: CFG["roots"] = args.root
     if args.pattern is not None: CFG["pattern"] = args.pattern
     if args.home: CFG["homes"] = args.home
@@ -1074,7 +1074,7 @@ def cached_limits(refresh=False):
         if acc.get("config_dir"):
             label = account_label(Path(acc["config_dir"]))
             r = account_reserve(label)
-            acc["fb_label"] = label   # orchestr's label (cclimits slug may differ)
+            acc["fb_label"] = label   # orchestra's label (cclimits slug may differ)
             acc["reserve_percent"] = r
             acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
     _limits["data"], _limits["t"] = data, now
@@ -1802,9 +1802,9 @@ def deliver_text(name, text):
     until the send is proven (see kickoff_sent). Pasting atomically (bracketed,
     via a tmux buffer) sidesteps the CLI's paste heuristic, which chops a rapid
     send-keys burst into '[Pasted text #N]' chips that swallow the Enter."""
-    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestr-kickoff", text])
+    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestra-kickoff", text])
     run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
-         "-b", "orchestr-kickoff", "-t", name])
+         "-b", "orchestra-kickoff", "-t", name])
     time.sleep(1)
     for _ in range(3):
         run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
@@ -2379,14 +2379,14 @@ if __name__ == "__main__":
     args = load_config()
     DEMO = args.demo
     if CFG["host"] not in ("127.0.0.1", "localhost", "::1"):
-        print("orchestr: WARNING — binding beyond loopback serves your "
+        print("orchestra: WARNING — binding beyond loopback serves your "
               "transcript text to the network", file=sys.stderr)
     if not DEMO:
         load_resumes()
         threading.Thread(target=resume_loop, daemon=True).start()
     server = ThreadingHTTPServer((CFG["host"], CFG["port"]), Handler)
     mode = " (demo data)" if DEMO else ""
-    print(f"orchestr up → http://{CFG['host']}:{CFG['port']}{mode}")
+    print(f"orchestra up → http://{CFG['host']}:{CFG['port']}{mode}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

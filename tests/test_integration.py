@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""orchestr integration tests — exercise the REAL pipeline against controlled
+"""orchestra integration tests — exercise the REAL pipeline against controlled
 fixtures (temp git repos, temp Claude homes with real transcripts, a real tmux
 session), not demo data. Deterministic: no dependency on the user's live fleet.
 
@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("orchestr", ROOT / "orchestr.py")
+_spec = importlib.util.spec_from_file_location("orchestra", ROOT / "orchestra.py")
 fb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fb)
 
@@ -86,7 +86,7 @@ class TestCollectPipeline(unittest.TestCase):
         git(self.repo, "commit", "-q", "-m", "initial commit")
         (self.repo / "dirtyfile").write_text("x\n")   # one uncommitted file
 
-        # point orchestr at the fixtures; neutralize live-system inputs
+        # point orchestra at the fixtures; neutralize live-system inputs
         self._save = {k: fb.CFG.get(k) for k in
                       ("roots", "homes", "pattern", "exclude_accounts", "reserve_percent")}
         self._demo, self._procs, self._cl = fb.DEMO, fb.claude_processes, fb.cached_limits
@@ -251,7 +251,7 @@ class TestTmuxActuation(unittest.TestCase):
     """The tmux plumbing dispatch/send rely on — real session, own socket,
     plain shell (never launches claude)."""
 
-    SOCK = "orchestr-test"
+    SOCK = "orchestra-test"
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="fb-tmux-"))
