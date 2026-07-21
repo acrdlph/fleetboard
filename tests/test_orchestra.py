@@ -638,7 +638,7 @@ class TestStartFinish(ConfigGuard):
         super().setUp()
         fb.config.DEMO = False
         fb._closeouts.clear()
-        self._saved = {n: getattr(fb, n) for n in ("run",)}
+        self._saved = {n: getattr(fb.shell, n) for n in ("run",)}
         self._saved_dispatch = fb.dispatch.start_dispatch
         self._saved_git = {n: getattr(fb.gitrepo, n) for n in
                            ("discover_worktrees", "_base_ref")}
@@ -658,7 +658,7 @@ class TestStartFinish(ConfigGuard):
 
     def tearDown(self):
         for n, f in self._saved.items():
-            setattr(fb, n, f)
+            setattr(fb.shell, n, f)
         fb.dispatch.start_dispatch = self._saved_dispatch
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
