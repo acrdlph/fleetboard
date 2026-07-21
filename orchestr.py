@@ -1686,6 +1686,18 @@ def kickoff_sent(pane):
     return bool(prompts) and prompts[-1] in ("❯", ">")
 
 
+def composer_idle(pane):
+    """True when the composer is bare with no turn or compaction in flight —
+    the only state where a paste reliably lands in the input line. Distinct
+    from kickoff_sent: there a bare prompt proves the brief LEFT the composer;
+    here it must prove the CLI is ready to RECEIVE, so any activity vetoes."""
+    if "esc to interrupt" in pane or "ompacting" in pane:
+        return False
+    prompts = [l.strip() for l in pane.splitlines()
+               if l.lstrip().startswith(("❯", ">"))]
+    return bool(prompts) and prompts[-1] in ("❯", ">")
+
+
 def deliver_text(name, text):
     """Put `text` into a fleet tmux session's claude composer and press Enter
     until the send is proven (see kickoff_sent). Pasting atomically (bracketed,
@@ -1999,9 +2011,62 @@ def _session_on_board(state, worktree, sid):
     return s, proc
 
 
+RESUME_READY_S = 420.0   # --resume on a fat session auto-compacts for minutes
+
+
+def _wait_composer_idle(name, timeout_s):
+    """Block until the reopened CLI can provably receive input: the composer
+    idle on two consecutive looks. One look lies — the CLI idles for a beat
+    between finishing its reload and starting the auto-compact."""
+    deadline = time.time() + timeout_s
+    streak = 0
+    while time.time() < deadline:
+        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+        streak = streak + 1 if composer_idle(pane) else 0
+        if streak >= 2:
+            return True
+        time.sleep(3)
+    return False
+
+
+def _proven_in_transcript(fp, offset, text, timeout_s=20.0):
+    """True once the session file gains a user entry carrying `text` beyond
+    `offset` — receipt at the source, not read off the screen."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with open(fp, "rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+        except OSError:
+            return False
+        for line in chunk.splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") != "user":
+                continue
+            content = (d.get("message") or {}).get("content")
+            if isinstance(content, list):
+                content = " ".join(x.get("text", "") for x in content
+                                   if isinstance(x, dict))
+            if isinstance(content, str) and text in content:
+                return True
+        time.sleep(2)
+    return False
+
+
 def _tmux_resume(worktree, cwd, home, sid):
     """No terminal to type into — reopen the conversation in a fleet tmux
-    session (claude --resume <sid>) and send it the resume message there."""
+    session (claude --resume <sid>) and send it the resume message there.
+
+    Reopening is the easy half. A fat transcript makes the CLI reload for
+    tens of seconds and then auto-compact for minutes, and a message pasted
+    into either phase vanishes — while the bare composer it leaves behind
+    reads as delivered. So the send waits out reload and compaction, and the
+    only accepted receipt is the session file gaining the message; anything
+    less retries, then reports failure with the attach command."""
     name = ("resume-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower()
             + time.strftime("-%H%M%S"))
     shell = (f"export CLAUDE_CONFIG_DIR={shlex.quote(str(home))}\n"
@@ -2011,12 +2076,27 @@ def _tmux_resume(worktree, cwd, home, sid):
     if rc != 0:
         return {"ok": False,
                 "message": f"tmux failed: {out or 'is tmux installed?'}"}
-    time.sleep(8)   # --resume reloads the transcript; slower than a cold boot
-    sent = deliver_text(name, CFG.get("resume_message", "continue"))
     attach = f"tmux -L {FLEET_SOCK} attach -t {name}"
-    return {"ok": True, "message":
-            f"no scriptable terminal — resumed in tmux · {attach}"
-            + ("" if sent else " · ⚠ message unconfirmed, attach and press Enter")}
+    where = f"no scriptable terminal — resumed in tmux · {attach}"
+    fp = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
+    msg = CFG.get("resume_message", "continue")
+    _wait_composer_idle(name, RESUME_READY_S)
+    for attempt in range(3):
+        if attempt:   # the last paste vanished — let the CLI settle, try again
+            _wait_composer_idle(name, 90.0)
+        try:
+            offset = fp.stat().st_size if fp else 0
+        except OSError:
+            fp, offset = None, 0
+        sent = deliver_text(name, msg)
+        if fp and _proven_in_transcript(fp, offset, msg):
+            return {"ok": True, "message": where}
+        if not fp and sent:
+            return {"ok": True, "message":
+                    where + " · ⚠ transcript not found — send unproven"}
+    return {"ok": False, "message":
+            f"reopened in tmux but '{msg}' never reached the conversation — "
+            f"attach and type it: {attach}"}
 
 
 def fire_resume(key):
@@ -2067,6 +2147,10 @@ def fire_resume(key):
         return _resume_set(key, status="failed", fired_at=now, message=
                            "worktree or account no longer known — nothing sent")
     out = _tmux_resume(worktree, (s or {}).get("cwd") or wt["path"], home, sid)
+    if out["ok"] and proc:
+        # the session's old window survives it — a frozen pre-resume view
+        out["message"] += (f" · the old {proc.get('host') or 'terminal'} window"
+                           " now shows a stale view — close it, don't type into it")
     return _resume_set(key, status="done" if out["ok"] else "failed",
                        fired_at=now, message=out["message"])
 

@@ -1045,6 +1045,13 @@ class TestFireResume(ResumeGuard):
         self.assertEqual(self.tmuxed, [("wt", "/w/wt/sub", "/h/.claude-account2", "s1")])
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
 
+    def test_tmux_fallback_flags_the_stale_window(self):
+        # the surviving Cursor window keeps showing the pre-resume state —
+        # the schedule's outcome must say so, or the user reads it as a no-op
+        self.board(pid=42, reachable=False)
+        fb.fire_resume(self.arm())
+        self.assertIn("stale view", fb._resumes["wt|s1"]["message"])
+
     def test_failed_send_falls_back_to_tmux_resume(self):
         fb.send_to_process = lambda pid, text: {"ok": False, "message": "no automation"}
         self.board(pid=42)
@@ -1105,6 +1112,130 @@ class TestDeliverText(unittest.TestCase):
         self.assertFalse(fb.deliver_text("sess", "continue"))
         enters = [c for c in self.calls if c[-1:] == ["Enter"]]
         self.assertEqual(len(enters), 3)
+
+
+class TestComposerIdle(unittest.TestCase):
+    """Readiness for the resume paste: a bare composer proves nothing while
+    the reopened CLI is reloading or compacting — the observed failure was
+    'continue' vanishing into the auto-compact while the bare prompt it left
+    behind read as delivered."""
+
+    def test_bare_composer_is_idle(self):
+        self.assertTrue(fb.composer_idle(TestKickoffSent.IDLE_EMPTY))
+
+    def test_running_turn_is_not_idle(self):
+        self.assertFalse(fb.composer_idle(TestKickoffSent.MID_TURN))
+
+    def test_compacting_is_not_idle(self):
+        pane = ("✻ Compacting conversation… (esc to interrupt)\n"
+                "────────────\n❯ \n────────────\n")
+        self.assertFalse(fb.composer_idle(pane))
+
+    def test_text_in_composer_is_not_idle(self):
+        self.assertFalse(fb.composer_idle(TestKickoffSent.STUCK))
+
+    def test_blank_pane_is_not_idle(self):
+        self.assertFalse(fb.composer_idle(""))
+
+
+class TestProvenInTranscript(unittest.TestCase):
+    """The only accepted receipt for a resume send: the session file itself."""
+
+    def setUp(self):
+        self._sleep = fb.time.sleep
+        fb.time.sleep = lambda s: None
+        self.tmp = tempfile.mkdtemp(prefix="fb-proof-")
+        self.fp = Path(self.tmp) / "s1.jsonl"
+        self.fp.write_text(json.dumps(
+            {"type": "user", "message": {"content": "continue"}}) + "\n")
+        self.offset = self.fp.stat().st_size
+
+    def tearDown(self):
+        fb.time.sleep = self._sleep
+
+    def append(self, entry):
+        with open(self.fp, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def test_message_past_offset_proves(self):
+        self.append({"type": "user", "message": {"content": "continue"}})
+        self.assertTrue(fb._proven_in_transcript(
+            self.fp, self.offset, "continue", timeout_s=0.1))
+
+    def test_pre_offset_message_does_not_prove(self):
+        # the transcript held a 'continue' from before the send — only bytes
+        # appended after it count
+        self.assertFalse(fb._proven_in_transcript(
+            self.fp, self.offset, "continue", timeout_s=0.1))
+
+    def test_assistant_text_does_not_prove(self):
+        self.append({"type": "assistant", "message":
+                     {"content": [{"type": "text", "text": "continue"}]}})
+        self.assertFalse(fb._proven_in_transcript(
+            self.fp, self.offset, "continue", timeout_s=0.1))
+
+    def test_list_content_counts(self):
+        self.append({"type": "user", "message":
+                     {"content": [{"type": "text", "text": "continue"}]}})
+        self.assertTrue(fb._proven_in_transcript(
+            self.fp, self.offset, "continue", timeout_s=0.1))
+
+    def test_missing_file_is_unproven(self):
+        self.assertFalse(fb._proven_in_transcript(
+            Path(self.tmp) / "gone.jsonl", 0, "continue", timeout_s=0.1))
+
+
+class TestTmuxResume(unittest.TestCase):
+    """The fallback resume believes nothing but the transcript."""
+
+    def setUp(self):
+        self._saved = {n: getattr(fb, n) for n in
+                       ("run", "deliver_text", "_wait_composer_idle",
+                        "_proven_in_transcript")}
+        self._sleep = fb.time.sleep
+        fb.time.sleep = lambda s: None
+        self.home = Path(tempfile.mkdtemp(prefix="fb-tmuxres-"))
+        proj = self.home / "projects" / "-w-wt"
+        proj.mkdir(parents=True)
+        (proj / "s1.jsonl").write_text("")
+        self.waits, self.delivered = [], []
+        fb.run = lambda cmd, **kw: (0, "")
+        fb._wait_composer_idle = lambda name, t: self.waits.append(t) or True
+        fb.deliver_text = lambda name, text: self.delivered.append(text) or True
+        fb._proven_in_transcript = lambda fp, off, text, timeout_s=20.0: True
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(fb, n, f)
+        fb.time.sleep = self._sleep
+
+    def test_waits_out_reload_before_pasting(self):
+        out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.waits, [fb.RESUME_READY_S])  # settled, then pasted
+        self.assertEqual(self.delivered, ["continue"])
+        self.assertIn("attach", out["message"])
+
+    def test_vanished_paste_retries_then_fails_honestly(self):
+        fb._proven_in_transcript = lambda *a, **kw: False
+        out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
+        self.assertFalse(out["ok"])
+        self.assertEqual(len(self.delivered), 3)           # three real attempts
+        self.assertEqual(self.waits, [fb.RESUME_READY_S, 90.0, 90.0])
+        self.assertIn("attach", out["message"])
+
+    def test_missing_transcript_reports_unproven(self):
+        home = Path(tempfile.mkdtemp(prefix="fb-nohome-"))
+        (home / "projects").mkdir()
+        out = fb._tmux_resume("wt", "/w/wt", home, "s1")
+        self.assertTrue(out["ok"])
+        self.assertIn("unproven", out["message"])
+
+    def test_tmux_failure_reports(self):
+        fb.run = lambda cmd, **kw: (1, "boom")
+        out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
+        self.assertFalse(out["ok"])
+        self.assertIn("tmux failed", out["message"])
 
 
 # --------------------------------------------------------- demo integration
