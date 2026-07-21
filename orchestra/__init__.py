@@ -30,14 +30,13 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-from . import config
+from . import config, shell
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO and
@@ -45,6 +44,7 @@ from . import config
 # so a facade copy would go stale and `orchestra.DEMO = True` would be a patch
 # that lies. Reach them as `orchestra.config.DEMO`.
 from .config import CFG, HOME, HERE, load_config, account_label
+from .shell import run
 
 TAIL_BYTES = 128 * 1024
 HEAD_BYTES = 16 * 1024
@@ -53,14 +53,6 @@ _cache = {"t": 0.0, "state": None}
 
 
 # ---------------------------------------------------------------- collectors
-
-def run(cmd, cwd=None, timeout=6):
-    try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout.strip()
-    except Exception:
-        return 1, ""
-
 
 def munge(path):
     """Claude Code's project-dir name for a cwd."""
@@ -90,20 +82,20 @@ def discover_worktrees():
 
 def git_info(git_root):
     info = {"branch": None, "commit": None, "dirty": 0, "ahead": None, "behind": None}
-    rc, branch = run(["git", "branch", "--show-current"], cwd=git_root)
+    rc, branch = shell.run(["git", "branch", "--show-current"], cwd=git_root)
     if rc == 0 and branch:
         info["branch"] = branch
     else:
-        rc, head = run(["git", "rev-parse", "--short", "HEAD"], cwd=git_root)
+        rc, head = shell.run(["git", "rev-parse", "--short", "HEAD"], cwd=git_root)
         info["branch"] = f"detached@{head}" if rc == 0 else "?"
-    rc, log = run(["git", "log", "-1", "--format=%h%x00%ct%x00%s"], cwd=git_root)
+    rc, log = shell.run(["git", "log", "-1", "--format=%h%x00%ct%x00%s"], cwd=git_root)
     if rc == 0 and log:
         h, ct, s = (log.split("\x00") + ["", "", ""])[:3]
         info["commit"] = {"hash": h, "ts": int(ct or 0), "subject": s}
-    rc, status = run(["git", "status", "--porcelain"], cwd=git_root)
+    rc, status = shell.run(["git", "status", "--porcelain"], cwd=git_root)
     if rc == 0:
         info["dirty"] = len([l for l in status.splitlines() if l.strip()])
-    rc, lr = run(["git", "rev-list", "--left-right", "--count", "@{u}...HEAD"], cwd=git_root)
+    rc, lr = shell.run(["git", "rev-list", "--left-right", "--count", "@{u}...HEAD"], cwd=git_root)
     if rc == 0 and lr:
         parts = lr.split()
         if len(parts) == 2:
@@ -122,8 +114,8 @@ def _pid_cwds(pids):
             except OSError:
                 pass
     else:  # macOS and other BSDs: one lsof call for all pids
-        _, out = run(["lsof", "-a", "-d", "cwd", "-p", ",".join(map(str, pids)), "-Fn"],
-                     timeout=10)
+        _, out = shell.run(["lsof", "-a", "-d", "cwd", "-p", ",".join(map(str, pids)), "-Fn"],
+                           timeout=10)
         cur = None
         for line in out.splitlines():
             if line.startswith("p"):
@@ -182,8 +174,8 @@ def _pid_config_dirs(pids):
             except OSError:
                 pass
     else:  # macOS/BSD: `ps eww` appends the environment to the command column
-        _, out = run(["ps", "eww", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
-                     timeout=10)
+        _, out = shell.run(["ps", "eww", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
+                           timeout=10)
         for line in out.splitlines():
             m = re.match(r"\s*(\d+)\s+(.*)", line)
             if not m:
@@ -225,7 +217,7 @@ def _tmux_pane_map(sock_flag):
     """pane shell pid -> 'session:win.pane' for one tmux server."""
     cmd = ["tmux"] + (["-L", sock_flag] if sock_flag else []) + \
           ["list-panes", "-a", "-F", "#{pane_pid}|#{session_name}:#{window_index}.#{pane_index}"]
-    rc, out = run(cmd)
+    rc, out = shell.run(cmd)
     panes = {}
     if rc == 0:
         for line in out.splitlines():
@@ -267,7 +259,7 @@ def shell_children(table, claude_pids):
 
 def claude_processes():
     """Live `claude` CLI processes with cwd, tty, and hosting terminal app."""
-    rc, out = run(["ps", "-axo", "pid=,ppid=,tty=,pcpu=,etime=,command="])
+    rc, out = shell.run(["ps", "-axo", "pid=,ppid=,tty=,pcpu=,etime=,command="])
     table, procs = {}, []
     for line in out.splitlines():
         m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\S+)\s+(.*)", line)
@@ -824,11 +816,11 @@ _topo = {"t": 0.0, "data": None}
 
 def _base_ref(git_root):
     """The trunk ref this repo's branches are measured against."""
-    rc, out = run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=git_root)
+    rc, out = shell.run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=git_root)
     if rc == 0 and out.startswith("refs/remotes/"):
         return out[len("refs/remotes/"):]
     for cand in ("origin/main", "origin/master", "main", "master"):
-        rc, _ = run(["git", "rev-parse", "-q", "--verify", cand], cwd=git_root)
+        rc, _ = shell.run(["git", "rev-parse", "-q", "--verify", cand], cwd=git_root)
         if rc == 0:
             return cand
     return None
@@ -840,17 +832,17 @@ def branch_topology():
     groups = {}
     for w in discover_worktrees():
         g = w["git"]
-        rc, origin = run(["git", "remote", "get-url", "origin"], cwd=g)
+        rc, origin = shell.run(["git", "remote", "get-url", "origin"], cwd=g)
         key = origin if rc == 0 and origin else "local:" + w["path"]
         base = _base_ref(g)
         if not base:
             continue
-        rc, mb = run(["git", "merge-base", "HEAD", base], cwd=g)
+        rc, mb = shell.run(["git", "merge-base", "HEAD", base], cwd=g)
         if rc != 0 or not mb:
             continue
 
         def ts(ref):
-            rc2, out2 = run(["git", "show", "-s", "--format=%ct", ref], cwd=g)
+            rc2, out2 = shell.run(["git", "show", "-s", "--format=%ct", ref], cwd=g)
             try:
                 return int(out2.strip().splitlines()[-1])
             except (ValueError, IndexError):
@@ -859,13 +851,13 @@ def branch_topology():
         fork_ts, tip_ts, base_ts = ts(mb), ts("HEAD"), ts(base)
         if not (fork_ts and tip_ts):
             continue
-        _, ah = run(["git", "rev-list", "--count", f"{mb}..HEAD"], cwd=g)
-        _, bh = run(["git", "rev-list", "--count", f"{mb}..{base}"], cwd=g)
-        _, cts = run(["git", "log", "--format=%ct", "-40", f"{mb}..HEAD"], cwd=g)
-        _, last = run(["git", "log", "-1", "--format=%h%x00%s"], cwd=g)
+        _, ah = shell.run(["git", "rev-list", "--count", f"{mb}..HEAD"], cwd=g)
+        _, bh = shell.run(["git", "rev-list", "--count", f"{mb}..{base}"], cwd=g)
+        _, cts = shell.run(["git", "log", "--format=%ct", "-40", f"{mb}..HEAD"], cwd=g)
+        _, last = shell.run(["git", "log", "-1", "--format=%h%x00%s"], cwd=g)
         h, subj = (last.split("\x00") + ["", ""])[:2]
-        _, br = run(["git", "branch", "--show-current"], cwd=g)
-        _, dirty = run(["git", "status", "--porcelain"], cwd=g)
+        _, br = shell.run(["git", "branch", "--show-current"], cwd=g)
+        _, dirty = shell.run(["git", "status", "--porcelain"], cwd=g)
         grp = groups.setdefault(key, {
             "repo": re.sub(r"\.git$", "", key.rsplit("/", 1)[-1]),
             "base": base, "trunk_ts": 0, "trunk_commits": [], "_root": g,
@@ -883,8 +875,8 @@ def branch_topology():
             "commits": [int(x) for x in cts.split()][:40] if cts else [],
         })
     for grp in groups.values():
-        _, tct = run(["git", "log", "--format=%ct", "-40", grp["base"]],
-                     cwd=grp.pop("_root"))
+        _, tct = shell.run(["git", "log", "--format=%ct", "-40", grp["base"]],
+                           cwd=grp.pop("_root"))
         grp["trunk_commits"] = [int(x) for x in tct.split()][:40] if tct else []
     return {"generated_at": now, "groups": list(groups.values())}
 
@@ -1036,7 +1028,7 @@ def cached_limits(refresh=False):
     if not binp:
         return {"available": False, "error": "cclimits not found — install github.com/acrdlph/cclimits"}
     cmd = [binp, "--json"] + (["--refresh"] if refresh else [])
-    rc, out = run(cmd, timeout=90 if refresh else 30)
+    rc, out = shell.run(cmd, timeout=90 if refresh else 30)
     if rc != 0 or not out:
         return _limits["data"] or {"available": False, "error": "cclimits failed (see terminal)"}
     try:
@@ -1276,14 +1268,14 @@ def focus_process(pid):
                  f" attach -t {shlex.quote(session)}"
         script = ('tell application "Terminal"\n  do script "%s"\n  activate\nend tell'
                   % _osa_escape(attach))
-        rc, _ = run(["osascript", "-e", script], timeout=8)
+        rc, _ = shell.run(["osascript", "-e", script], timeout=8)
         if rc == 0:
             return {"ok": True, "message": f"opened Terminal attached to {session} (Ctrl-b d to detach)"}
         return {"ok": False, "message":
                 f"couldn't open Terminal — grant Automation permission, or run:  {attach}"}
     if host in ("Terminal", "iTerm2") and tty:
         script = (_FOCUS_TERMINAL if host == "Terminal" else _FOCUS_ITERM) % f"/dev/{tty}"
-        rc, out = run(["osascript", "-e", script], timeout=8)
+        rc, out = shell.run(["osascript", "-e", script], timeout=8)
         if rc == 0 and out.strip() == "true":
             return {"ok": True, "message": f"focused {host} window ({tty})"}
         if rc != 0:
@@ -1293,7 +1285,7 @@ def focus_process(pid):
         return {"ok": False, "message": f"no {host} tab with {tty} found"}
     if host in ("Cursor", "VS Code"):
         app = "Cursor" if host == "Cursor" else "Visual Studio Code"
-        run(["open", "-a", app])
+        shell.run(["open", "-a", app])
         return {"ok": True, "message":
                 f"{where} lives in an embedded terminal inside {host} — "
                 f"activated it, check its terminal panel"}
@@ -1353,14 +1345,14 @@ def send_to_process(pid, text):
         return {"ok": False, "message": f"pid {pid} is gone"}
     if proc.get("tmux_target"):
         sock = ["-L", proc["tmux_sock"]] if proc["tmux_sock"] else []
-        rc1, _ = run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "-l", text])
-        rc2, _ = run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "Enter"])
+        rc1, _ = shell.run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "-l", text])
+        rc2, _ = shell.run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "Enter"])
         ok = rc1 == 0 and rc2 == 0
         return {"ok": ok, "message": "sent via tmux" if ok else "tmux send-keys failed"}
     if proc["host"] in ("Terminal", "iTerm2") and proc["tty"]:
         script = (_SEND_TERMINAL if proc["host"] == "Terminal" else _SEND_ITERM) % (
             f"/dev/{proc['tty']}", _osa_escape(text))
-        rc, out = run(["osascript", "-e", script], timeout=10)
+        rc, out = shell.run(["osascript", "-e", script], timeout=10)
         if rc == 0 and out.strip() == "true":
             return {"ok": True, "message": f"typed into {proc['host']} ({proc['tty']})"}
         return {"ok": False, "message":
@@ -1431,10 +1423,10 @@ def _park_on_trunk(git_root, trunk):
     two git commands don't need an agent. Returns None if the switch fails so
     the caller can hand it to an agent instead."""
     branch = trunk.split("/", 1)[-1]
-    if run(["git", "switch", branch], cwd=git_root, timeout=30)[0] != 0:
+    if shell.run(["git", "switch", branch], cwd=git_root, timeout=30)[0] != 0:
         return None
-    pulled = run(["git", "pull", "--ff-only", "--quiet"], cwd=git_root,
-                 timeout=60)[0] == 0
+    pulled = shell.run(["git", "pull", "--ff-only", "--quiet"], cwd=git_root,
+                       timeout=60)[0] == 0
     return {"ok": True, "mode": "parked", "message":
             f"already landed — parked on {branch}, no agent needed"
             + ("" if pulled else " (pull failed; next dispatch refreshes)")}
@@ -1481,11 +1473,11 @@ def start_finish(wt_name):
     trunk = _base_ref(git_root)
     if not trunk:
         return {"ok": False, "message": "no trunk ref found for this repo"}
-    run(["git", "fetch", "--quiet", "origin"], cwd=git_root, timeout=30)
-    landed = run(["git", "merge-base", "--is-ancestor", "HEAD", trunk],
-                 cwd=git_root)[0] == 0
-    porcelain = [l for l in run(["git", "status", "--porcelain"],
-                                cwd=git_root)[1].splitlines() if l.strip()]
+    shell.run(["git", "fetch", "--quiet", "origin"], cwd=git_root, timeout=30)
+    landed = shell.run(["git", "merge-base", "--is-ancestor", "HEAD", trunk],
+                       cwd=git_root)[0] == 0
+    porcelain = [l for l in shell.run(["git", "status", "--porcelain"],
+                                      cwd=git_root)[1].splitlines() if l.strip()]
     mine = [p for p in claude_processes() if p.get("cwd")
             and (p["cwd"] == path or p["cwd"].startswith(path + os.sep))]
     live = next((p for p in mine if _reachable(p)), None)
@@ -1575,8 +1567,8 @@ def start_finish(wt_name):
                 "a live process exists but its terminal can't be scripted — "
                 "finish from that terminal, or close it and ✓ finish again"}
     if landed and not porcelain:
-        branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                     cwd=git_root)[1].strip()
+        branch = shell.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                           cwd=git_root)[1].strip()
         if branch == trunk.split("/", 1)[-1]:
             return {"ok": True, "mode": "noop",
                     "message": "already landed and clean — nothing to finish"}
@@ -1659,7 +1651,7 @@ def read_dispatch_log(limit=25):
     except OSError:
         return {"entries": []}
     live = set()
-    rc, out = run(["tmux", "-L", FLEET_SOCK, "list-sessions", "-F", "#{session_name}"])
+    rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "list-sessions", "-F", "#{session_name}"])
     if rc == 0:
         live = set(out.splitlines())
     for r in rows:
@@ -1777,14 +1769,14 @@ def deliver_text(name, text):
     until the send is proven (see kickoff_sent). Pasting atomically (bracketed,
     via a tmux buffer) sidesteps the CLI's paste heuristic, which chops a rapid
     send-keys burst into '[Pasted text #N]' chips that swallow the Enter."""
-    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestra-kickoff", text])
-    run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
-         "-b", "orchestra-kickoff", "-t", name])
+    shell.run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestra-kickoff", text])
+    shell.run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
+               "-b", "orchestra-kickoff", "-t", name])
     time.sleep(1)
     for _ in range(3):
-        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
+        shell.run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
         time.sleep(2)
-        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+        _, pane = shell.run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
         if kickoff_sent(pane):
             return True
     return False
@@ -1826,9 +1818,9 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
         name = ("closeout-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree)
                 .strip("-").lower() + time.strftime("-%H%M%S"))
         _log(job, f"② launching one-shot closeout {name}…")
-        rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
-                       "-c", wt["path"],
-                       closeout_shell(home, model, mission, closeout_trunk)])
+        rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
+                             "-c", wt["path"],
+                             closeout_shell(home, model, mission, closeout_trunk)])
         if rc != 0:
             return finish({"ok": False,
                            "message": f"tmux failed: {out or 'is tmux installed?'}"})
@@ -1862,14 +1854,14 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
     shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
                  f"exec claude --dangerously-skip-permissions{model_flag}")
     _log(job, f"② creating tmux session {name}…")
-    rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
-                   "-c", wt["path"], shell_cmd])
+    rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
+                         "-c", wt["path"], shell_cmd])
     if rc != 0:
         return finish({"ok": False, "message": f"tmux failed: {out or 'is tmux installed?'}"})
     brief = re.sub(r"\s*\n\s*", " ", kickoff).strip()
 
     def keys(*args):
-        run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name] + list(args))
+        shell.run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name] + list(args))
 
     _log(job, "③ booting claude…")
     time.sleep(6)
@@ -1879,7 +1871,7 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
         keys("-l", f"/effort {effort}")
         keys("Enter")
         time.sleep(3)
-        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+        _, pane = shell.run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
         effort_confirmed = "set effort level" in pane.lower()
         _log(job, "  effort " + ("confirmed ✓" if effort_confirmed else "UNCONFIRMED ⚠"))
         if not effort_confirmed:
@@ -2095,7 +2087,7 @@ def _wait_composer_idle(name, timeout_s):
     deadline = time.time() + timeout_s
     streak = 0
     while time.time() < deadline:
-        _, pane = run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+        _, pane = shell.run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
         streak = streak + 1 if composer_idle(pane) else 0
         if streak >= 2:
             return True
@@ -2143,10 +2135,10 @@ def _tmux_resume(worktree, cwd, home, sid):
     less retries, then reports failure with the attach command."""
     name = ("resume-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower()
             + time.strftime("-%H%M%S"))
-    shell = (f"export CLAUDE_CONFIG_DIR={shlex.quote(str(home))}\n"
-             f"exec claude --dangerously-skip-permissions --resume {shlex.quote(sid)}\n")
-    rc, out = run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
-                   "-c", cwd, shell])
+    shell_cmd = (f"export CLAUDE_CONFIG_DIR={shlex.quote(str(home))}\n"
+                 f"exec claude --dangerously-skip-permissions --resume {shlex.quote(sid)}\n")
+    rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
+                         "-c", cwd, shell_cmd])
     if rc != 0:
         return {"ok": False,
                 "message": f"tmux failed: {out or 'is tmux installed?'}"}

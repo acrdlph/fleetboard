@@ -561,11 +561,11 @@ class TestDispatchLog(ConfigGuard):
                 "mission_original": f"do thing {i}"}) + "\n")
         self.tmp.close()
         fb.DISPATCH_LOG = Path(self.tmp.name)
-        self._run = fb.run
-        fb.run = lambda *a, **k: (0, "mission-s2")   # only s2 is "live" in tmux
+        self._run = fb.shell.run
+        fb.shell.run = lambda *a, **k: (0, "mission-s2")   # only s2 is "live" in tmux
 
     def tearDown(self):
-        fb.run = self._run
+        fb.shell.run = self._run
         Path(self.tmp.name).unlink(missing_ok=True)
         super().tearDown()
 
@@ -603,7 +603,7 @@ class TestDispatchContract(ConfigGuard):
 # ------------------------------------------------------------ finish tiers
 
 class FakeGit:
-    """Stand-in for fb.run that answers the git calls start_finish makes."""
+    """Stand-in for fb.shell.run that answers the git calls start_finish makes."""
     def __init__(self, landed=True, porcelain="", branch="feat/x",
                  switch_rc=0, pull_rc=0):
         self.landed, self.porcelain, self.branch = landed, porcelain, branch
@@ -666,7 +666,7 @@ class TestStartFinish(ConfigGuard):
              "cmd": "claude --dangerously-skip-permissions"}]
 
     def finish(self, **git):
-        fb.run = self.git = FakeGit(**git)
+        fb.shell.run = self.git = FakeGit(**git)
         return fb.start_finish("wt")
 
     # -- live terminal ------------------------------------------------------
@@ -1198,7 +1198,7 @@ class TestDeliverText(unittest.TestCase):
     """Enter is pressed until the send is proven, then stops."""
 
     def setUp(self):
-        self._run, self._sleep = fb.run, fb.time.sleep
+        self._run, self._sleep = fb.shell.run, fb.time.sleep
         fb.time.sleep = lambda s: None
         self.calls = []
         self.panes = ["❯ [Pasted text #1] still in the composer", "❯ \n"]
@@ -1208,10 +1208,10 @@ class TestDeliverText(unittest.TestCase):
             if "capture-pane" in cmd:
                 return 0, self.panes.pop(0)
             return 0, ""
-        fb.run = fake_run
+        fb.shell.run = fake_run
 
     def tearDown(self):
-        fb.run, fb.time.sleep = self._run, self._sleep
+        fb.shell.run, fb.time.sleep = self._run, self._sleep
 
     def test_enters_until_sent(self):
         self.assertTrue(fb.deliver_text("sess", "continue"))
@@ -1303,8 +1303,9 @@ class TestTmuxResume(unittest.TestCase):
 
     def setUp(self):
         self._saved = {n: getattr(fb, n) for n in
-                       ("run", "deliver_text", "_wait_composer_idle",
+                       ("deliver_text", "_wait_composer_idle",
                         "_proven_in_transcript")}
+        self._saved_run = fb.shell.run
         self._sleep = fb.time.sleep
         fb.time.sleep = lambda s: None
         self.home = Path(tempfile.mkdtemp(prefix="fb-tmuxres-"))
@@ -1312,7 +1313,7 @@ class TestTmuxResume(unittest.TestCase):
         proj.mkdir(parents=True)
         (proj / "s1.jsonl").write_text("")
         self.waits, self.delivered = [], []
-        fb.run = lambda cmd, **kw: (0, "")
+        fb.shell.run = lambda cmd, **kw: (0, "")
         fb._wait_composer_idle = lambda name, t: self.waits.append(t) or True
         fb.deliver_text = lambda name, text: self.delivered.append(text) or True
         fb._proven_in_transcript = lambda fp, off, text, timeout_s=20.0: True
@@ -1320,6 +1321,7 @@ class TestTmuxResume(unittest.TestCase):
     def tearDown(self):
         for n, f in self._saved.items():
             setattr(fb, n, f)
+        fb.shell.run = self._saved_run
         fb.time.sleep = self._sleep
 
     def test_waits_out_reload_before_pasting(self):
@@ -1345,7 +1347,7 @@ class TestTmuxResume(unittest.TestCase):
         self.assertIn("unproven", out["message"])
 
     def test_tmux_failure_reports(self):
-        fb.run = lambda cmd, **kw: (1, "boom")
+        fb.shell.run = lambda cmd, **kw: (1, "boom")
         out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
         self.assertFalse(out["ok"])
         self.assertIn("tmux failed", out["message"])
