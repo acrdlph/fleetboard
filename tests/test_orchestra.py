@@ -638,18 +638,18 @@ class TestStartFinish(ConfigGuard):
         super().setUp()
         fb.config.DEMO = False
         fb._closeouts.clear()
-        self._saved = {n: getattr(fb, n) for n in
-                       ("run", "send_to_process", "start_dispatch")}
+        self._saved = {n: getattr(fb, n) for n in ("run", "start_dispatch")}
         self._saved_git = {n: getattr(fb.gitrepo, n) for n in
                            ("discover_worktrees", "_base_ref")}
         self._saved_procs = fb.procs.claude_processes
         self._saved_scan = fb.transcripts.scan_sessions
+        self._saved_send = fb.terminal.send_to_process
         fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.gitrepo._base_ref = lambda root: "origin/main"
         fb.procs.claude_processes = lambda: []
         self.sent = []
-        fb.send_to_process = lambda pid, text: (
+        fb.terminal.send_to_process = lambda pid, text: (
             self.sent.append(text) or {"ok": True})
         self.dispatched = []
         fb.start_dispatch = lambda brief, **kw: (
@@ -662,6 +662,7 @@ class TestStartFinish(ConfigGuard):
             setattr(fb.gitrepo, n, f)
         fb.procs.claude_processes = self._saved_procs
         fb.transcripts.scan_sessions = self._saved_scan
+        fb.terminal.send_to_process = self._saved_send
         super().tearDown()
 
     def live(self):
@@ -1069,16 +1070,17 @@ class TestFireResume(ResumeGuard):
     def setUp(self):
         super().setUp()
         self._saved = {n: getattr(fb, n) for n in
-                       ("cached_state", "send_to_process", "_tmux_resume")}
+                       ("cached_state", "_tmux_resume")}
         self._saved_git = {"discover_worktrees": fb.gitrepo.discover_worktrees}
         self._saved_homes = fb.transcripts.claude_homes
         self._saved_lau = fb.limits._limit_active_until
+        self._saved_send = fb.terminal.send_to_process
         fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.transcripts.claude_homes = lambda: [Path("/h/.claude-account2")]
         fb.limits._limit_active_until = lambda account, model, now: None
         self.sent, self.tmuxed = [], []
-        fb.send_to_process = lambda pid, text: (
+        fb.terminal.send_to_process = lambda pid, text: (
             self.sent.append((pid, text)) or {"ok": True, "message": "sent via tmux"})
         fb._tmux_resume = lambda wt, cwd, home, sid: (
             self.tmuxed.append((wt, cwd, str(home), sid))
@@ -1091,6 +1093,7 @@ class TestFireResume(ResumeGuard):
             setattr(fb.gitrepo, n, f)
         fb.transcripts.claude_homes = self._saved_homes
         fb.limits._limit_active_until = self._saved_lau
+        fb.terminal.send_to_process = self._saved_send
         super().tearDown()
 
     def board(self, status="limit", pid=None, reachable=True, handed=None,
@@ -1177,7 +1180,7 @@ class TestFireResume(ResumeGuard):
         self.assertIn("stale view", fb._resumes["wt|s1"]["message"])
 
     def test_failed_send_falls_back_to_tmux_resume(self):
-        fb.send_to_process = lambda pid, text: {"ok": False, "message": "no automation"}
+        fb.terminal.send_to_process = lambda pid, text: {"ok": False, "message": "no automation"}
         self.board(pid=42)
         fb.fire_resume(self.arm())
         self.assertEqual(len(self.tmuxed), 1)
