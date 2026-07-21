@@ -1,0 +1,12 @@
+{
+  "roots": [
+    "/Users/achill/Downloads"
+  ],
+  "pattern": "confid",
+  "exclude_accounts": [
+    "main"
+  ],
+  "reserve_percent": {
+    "main": 20
+  }
+}

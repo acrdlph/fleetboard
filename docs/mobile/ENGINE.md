@@ -19,7 +19,7 @@ It decides four things and does not reopen them:
 
 ### 1.1 The forcing argument
 
-`cached_state()` (orchestr.py:996–1003) computes state **only when a client asks for it**:
+`cached_state()` (orchestra.py:996–1003) computes state **only when a client asks for it**:
 
 ```python
 def cached_state():
@@ -42,7 +42,7 @@ must become continuous and client-independent.** That is the one premise in the 
 that survived every attack unscratched.
 
 One honest correction to how that argument has been stated. It does **not** follow that
-orchestr's architecture forbids continuous observation today. `resume_loop()` (orchestr.py:2166,
+orchestra's architecture forbids continuous observation today. `resume_loop()` (orchestra.py:2166,
 started at :2295) already runs forever with zero clients attached, wakes every
 `RESUME_POLL_S = 5.0`, and *actuates terminals*. The distance from here to "push is possible" is
 one more `threading.Thread(target=..., daemon=True)`. So continuity costs a thread, not a
@@ -67,12 +67,12 @@ collect_state()          1641 ms   (9 worktrees, 5 live claude processes)
   claude_processes        112 ms    7%
   discover_worktrees        1 ms
 
-STATE_TTL_S = 4.0 (orchestr.py:61) + setInterval(tick, 5000) (index.html:1169)
+STATE_TTL_S = 4.0 (orchestra.py:61) + setInterval(tick, 5000) (index.html:1169)
   → ~10.6 s worst case from a real change to pixels
 ```
 
 Re-measured on a busier day the same collect took **4083 ms**, so the number is a floor, not a
-ceiling. And `CFG["working_s"] = 90` (orchestr.py:51), consumed at `classify_session`:563, holds
+ceiling. And `CFG["working_s"] = 90` (orchestra.py:51), consumed at `classify_session`:563, holds
 `● WORKING` for up to **90 s** after a session stops writing — 8.5× the entire pipeline. That is
 hysteresis, not latency, and no amount of faster collection touches it.
 
@@ -87,7 +87,7 @@ edits fix most of it and none of them is architectural:
 | `working_s` 90 → 25 | removes the dominant staleness term |
 
 What makes the architecture worth doing is the **combination**: the iOS client is coming, and the
-wire contract it binds to is decided by this work. Refactoring `orchestr.py` is always cheap —
+wire contract it binds to is decided by this work. Refactoring `orchestra.py` is always cheap —
 one file, 1,634 lines of tests. Refactoring an App Store binary is not. So the test for "does
 this land now" is not *is it elegant* but **would shipping iOS before it force iOS to be rebuilt**.
 Four things pass that test (§8), and all four are cheap. Everything else in this document is
@@ -138,7 +138,7 @@ This is the only criterion on the table that is falsifiable, so it is the one us
 
 The arrow from OBSERVER to SERVER is `snapshot()` / `wait_for()`. The arrow back is `nudge()` and
 `hook()` — evidence, never commands. **OBSERVER must never reference a SERVER symbol.** Both live
-in `orchestr.py` at module scope (§2.7); the direction is enforced by a grep test, not by the
+in `orchestra.py` at module scope (§2.7); the direction is enforced by a grep test, not by the
 import system, and that is a conscious trade recorded in §10.
 
 ### 2.2 Why ENGINE / BROKER / ACTUATOR was rejected
@@ -178,7 +178,7 @@ cadences into one versioned store — is the more interesting design and three o
 are adopted wholesale (§3.4, §6.2, §3.3). It is rejected as the **structure** for one concrete
 reason:
 
-`pair_sessions_with_procs` (orchestr.py:186–199) pairs sessions to processes by exact
+`pair_sessions_with_procs` (orchestra.py:186–199) pairs sessions to processes by exact
 `CLAUDE_CONFIG_DIR` match first and then falls back to **freshness order**; its docstring states
 the precondition that `sessions` must be freshest-first. The handoff-succession pass (:735–745)
 then compares ages *across* sessions to decide which limit-hit session has been superseded. Both
@@ -489,7 +489,7 @@ Dispatch stays asynchronous with a job id because it is 17 s, not because it is 
 write-ahead ordering is load-bearing and fixes the worst defect in the system today:
 `_run_dispatch` creates the tmux session at :1798 but appends to `DISPATCH_LOG` at :1827, after
 `sleep(6)` + `sleep(3)` + `deliver_text`. `start.sh`:8 sends SIGTERM, **there is no signal handler
-anywhere in orchestr.py**, and every worker is `daemon=True` — so a plain `./start.sh` mid-dispatch
+anywhere in orchestra.py**, and every worker is `daemon=True` — so a plain `./start.sh` mid-dispatch
 orphans a tmux session running `claude --dangerously-skip-permissions` with a half-delivered brief
 and no audit row. Journal `phase: creating` with the tmux name *before* the side effect.
 
@@ -642,7 +642,7 @@ field from day one.
 ## 4. Statefulness and its dangers
 
 The strongest attack on the original proposal was this: `collect_state()` is a **pure function of
-the world at time `now`**. Nothing carries forward, so **there is no state in which orchestr can be
+the world at time `now`**. Nothing carries forward, so **there is no state in which orchestra can be
 persistently wrong** — every bug has a lifetime of one collection. `scan_sessions`:619–620
 (`if age > window_s: continue`) is free garbage collection; the `pending` dict at :503 is rebuilt
 from zero, so a lost `tool_result` cannot strand a session. That is a real engineering asset and it
@@ -872,7 +872,7 @@ class Srv(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 ```
 
-Streaming was verified against the **real** `Handler` subclassed from `orchestr.py`: headers
+Streaming was verified against the **real** `Handler` subclassed from `orchestra.py`: headers
 `HTTP/1.0 200 OK` + `Content-Type: text/event-stream`, then events delivered at t+0.004 s, +0.310,
 +0.613, +0.919, +1.229 — genuinely incremental. A concurrent `GET /api/state` returned 4,485 bytes
 in 70 ms while the stream was open. Total structural change: **one early return, ~14 lines.**
@@ -1083,7 +1083,7 @@ Two rules:
 | transcripts unreadable | session drops out of the window, exactly as today (:619–620) |
 | tmux | actuation falls back to AppleScript for Terminal.app / iTerm2, unchanged |
 
-**Adoption is the hard part and it is out of scope here.** Agents dispatched *by* orchestr can be
+**Adoption is the hard part and it is out of scope here.** Agents dispatched *by* orchestra can be
 configured automatically; agents the user starts independently cannot. The installation flow must
 not hijack the user's own `settings.json` hooks. ADR 0007 fixes the direction; the mechanism is an
 open question (§11).
@@ -1162,7 +1162,7 @@ nghttp2 1.67.1. Both binaries ship with macOS. No package.
 
 Every step is independently shippable, independently valuable and independently revertable. Every
 step keeps all 142 stdlib `unittest` tests green — which constrains the design: **all functions stay
-at module scope in `orchestr.py`**, because the suite loads the file by path via
+at module scope in `orchestra.py`**, because the suite loads the file by path via
 `importlib.util.spec_from_file_location` and monkeypatches module globals (`fb.run`, `fb.git_info`,
 `fb.claude_processes`, `fb.send_to_process`, `fb._cache`, `fb._closeouts`, `fb._resumes`, `fb.CFG`).
 Splitting into `probes.py` / `observer.py` / `server.py` would break that patch point in ~40 setUps
@@ -1348,12 +1348,12 @@ exact notification the architecture exists to deliver. **Recommendation:** ship 
 cadence, add a `limits_polls_today` counter, and tune once there is a week of data.
 
 **4. Hook installation mechanism.**
-Agents orchestr dispatches can be configured automatically. Agents the user starts cannot, and the
-flow must not hijack their own `settings.json` hooks. **Recommendation:** a `orchestr hooks install`
+Agents orchestra dispatches can be configured automatically. Agents the user starts cannot, and the
+flow must not hijack their own `settings.json` hooks. **Recommendation:** a `orchestra hooks install`
 command that writes an *additive* hook entry pointing at a small shim, plus a board banner offering
 it per unhooked account. Needs the user's call on how invasive that is allowed to be.
 
-**5. Does `working_s` stay in `orchestr.config.json`?**
+**5. Does `working_s` stay in `orchestra.config.json`?**
 It is being replaced by `QUIET_S` with different semantics. **Recommendation:** accept `working_s`
 as a deprecated alias for one release, log once when it is set, then remove.
 

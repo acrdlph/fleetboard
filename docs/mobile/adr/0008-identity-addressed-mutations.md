@@ -12,7 +12,7 @@ in the shipping code today**.
 - `index.html:703` `sendToPid(pid, text)` POSTs `{pid, text}`. No sid, no account, no worktree.
 - The pid is captured into the drawer when it opens (`window._chatPid` / the `chatTarget`
   select) and posted whenever the user finally hits send — possibly many minutes later.
-- `send_to_process()` (orchestr.py:1379) validates only:
+- `send_to_process()` (orchestra.py:1379) validates only:
   ```python
   proc = next((p for p in claude_processes() if p["pid"] == pid), None)
   ```
@@ -26,7 +26,7 @@ process, the reply is typed into the wrong agent's terminal. Those agents run un
 `--dangerously-skip-permissions`, so the misdirected text is acted on. Pid recycling is routine
 on a machine running many short-lived agents.
 
-`fire_resume`'s docstring (orchestr.py:2113–2116) already names this class of failure — but
+`fire_resume`'s docstring (orchestra.py:2113–2116) already names this class of failure — but
 guards only the resume path.
 
 ## Decision

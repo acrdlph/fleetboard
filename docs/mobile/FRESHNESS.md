@@ -1,4 +1,4 @@
-# FRESHNESS — making orchestr's state true, fast, and pushable
+# FRESHNESS — making orchestra's state true, fast, and pushable
 
 **Status:** settled (design). **Date:** 2026-07-21.
 **Outranked by:** [`VERIFIED-FACTS.md`](VERIFIED-FACTS.md). If this document contradicts a
@@ -35,7 +35,7 @@ collect_state()                 1641 ms
 Stacked on top of that, from a real change to pixels on the board:
 
 ```
-  up to  4000 ms   STATE_TTL_S = 4.0            (orchestr.py:61)
+  up to  4000 ms   STATE_TTL_S = 4.0            (orchestra.py:61)
        + 1641 ms   collect_state(), inline, in the request
   up to  5000 ms   setInterval(tick, 5000)      (index.html:1169)
   ========================
@@ -57,7 +57,7 @@ Two structural facts make it worse than the arithmetic:
 Separately, and larger than everything above combined:
 
 ```python
-# orchestr.py:557 — classify_session, first branch
+# orchestra.py:557 — classify_session, first branch
 if age_s < working_s:            # CFG["working_s"] = 90
     return "working", False
 ```
@@ -87,7 +87,7 @@ actually running.
 
 Meanwhile the fact that would settle it is already on disk **and already parsed**:
 `{"type":"system","subtype":"turn_duration",…}` is the CLI's explicit end-of-turn marker.
-`parse_session_tail()` (orchestr.py:507–512) reads that record today and extracts two fields from
+`parse_session_tail()` (orchestra.py:507–512) reads that record today and extracts two fields from
 it — and never records **that it was last**. Sampled across the 71 in-window transcripts on this
 machine, `system/turn_duration` is the terminal non-sidechain entry in **40 of them (56 %)**.
 Those sessions are provably not mid-turn, and the classifier guesses from mtime for every one.
@@ -265,8 +265,8 @@ def _resolve_git():
     """~13 ms of xcrun shim tax on every git invocation; 40 invocations per
     collect. Resolve once at startup and VERIFY the candidate runs."""
     cands = []
-    if os.environ.get("ORCHESTR_GIT"):
-        cands.append(os.environ["ORCHESTR_GIT"])
+    if os.environ.get("ORCHESTRA_GIT"):
+        cands.append(os.environ["ORCHESTRA_GIT"])
     if sys.platform == "darwin":
         cands += ["/Library/Developer/CommandLineTools/usr/bin/git",
                   "/Applications/Xcode.app/Contents/Developer/usr/bin/git"]
@@ -303,7 +303,7 @@ ahead/behind and the dirty entries in one call. Verified byte-for-byte against `
 
 **The trap:** `# branch.ab +A -B` is `+ahead -behind`. The v1 call it replaces is
 `git rev-list --left-right --count @{u}...HEAD`, where `parts[0]` is the **upstream** side —
-i.e. *behind* — and `parts[1]` is *ahead* (orchestr.py:156–160 assigns them in that order). A
+i.e. *behind* — and `parts[1]` is *ahead* (orchestra.py:156–160 assigns them in that order). A
 naive port silently swaps the two numbers on every card. Get this backwards and nothing errors.
 
 `--no-optional-locks` is mandatory for two reasons, not one. It stops `git status` taking
@@ -524,8 +524,8 @@ Two further rules the memo buys:
   already resolved keeps its cwd; a pid we could not resolve gets `cwd: None, cwd_ok: False` and
   publishes `liveness: "unknown"`.
 
-**Linux is untouched.** `_pid_cwds` uses `os.readlink("/proc/<pid>/cwd")` (orchestr.py:171) and
-`_pid_config_dirs` reads `/proc/<pid>/environ` (orchestr.py:227) — both subprocess-free and
+**Linux is untouched.** `_pid_cwds` uses `os.readlink("/proc/<pid>/cwd")` (orchestra.py:171) and
+`_pid_config_dirs` reads `/proc/<pid>/environ` (orchestra.py:227) — both subprocess-free and
 sub-millisecond, both still selected by `sys.platform.startswith("linux")` exactly as today. The
 memo simply has no work to do there.
 
@@ -577,7 +577,7 @@ class Collector(threading.Thread):
         self.idle_streak = 0
 
     def poke(self):
-        """Every mutation calls this. Replaces `_cache["t"] = 0.0` (orchestr.py
+        """Every mutation calls this. Replaces `_cache["t"] = 0.0` (orchestra.py
         :1476, :1499) and extends the same guarantee to _run_dispatch (1736),
         /api/send (2263), set_reserve (1110) and _park_on_trunk (1408), which
         have NO invalidation today."""
@@ -662,7 +662,7 @@ if self.path.startswith("/api/state"):
 `tick()`'s existing error path must not be spuriously triggered. `/api/state` with no query
 string behaves exactly as today.
 
-**A fallback matters for the test suite.** `tests/` imports `orchestr.py` via `importlib` and
+**A fallback matters for the test suite.** `tests/` imports `orchestra.py` via `importlib` and
 never runs `main()`, so no collector thread exists there. `cached_state()` keeps its old
 TTL+lock path behind `if COLLECTOR is None or not COLLECTOR.is_alive():`, and the seven
 `fb._cache["state"] = None` sites in `test_integration.py` keep working unchanged.
@@ -824,7 +824,7 @@ Limits: `max_user_watches` is 8,192 on old kernels and **65,536–524,288 on cur
 need ~300. `ENOSPC` puts the path in `DEGRADED`.
 
 The whole ctypes path is wrapped in `try/except`, logs once, and returns `PollWatcher`. Set
-`ORCHESTR_WATCH=poll` on any platform to force it. **That is also what CI runs**, so the
+`ORCHESTRA_WATCH=poll` on any platform to force it. **That is also what CI runs**, so the
 event-driven code path is testable without a Linux box.
 
 **Expected after Layer 3:**
@@ -873,7 +873,7 @@ traceback per tailnet blip) and impose a hard subscriber cap.
 
 `protocol_version` is unset, so `BaseHTTPRequestHandler` speaks HTTP/1.0 and the stream is
 terminated by close — which forbids `Content-Length` and is exactly what SSE wants. The route
-must early-return before `do_GET`'s unconditional `Content-Length` tail (orchestr.py:2240–2245).
+must early-return before `do_GET`'s unconditional `Content-Length` tail (orchestra.py:2240–2245).
 `wbufsize = 0` is confirmed, so `flush()` is belt-and-braces.
 
 #### The frame format
@@ -907,7 +907,7 @@ Rules, each of which exists because something breaks without it:
 
 - **`order`, `counts`, `free_worktrees`, `generated_at` ship on EVERY frame** (166 B total). The
   client contains no triage sort and does not know the handed-off exclusion rule
-  (orchestr.py:799–800). `severity()` must never be reimplemented in JS — `index.html` already
+  (orchestra.py:799–800). `severity()` must never be reimplemented in JS — `index.html` already
   flags its one existing fork (`ruleBasedAutoPick`, L935: *"mirror the backend rule exactly"*)
   and this design adds no second.
 - **`transitions` is server-computed.** The bell stops being `attn > lastAttn` arithmetic on the
@@ -962,7 +962,7 @@ when a stream is not warranted, and for anyone beyond `MAX_STREAMS`.
 
 **Class: ambiguity. ~350 lines. Opportunistic; degrades to Layers 0–4 with no visible seam.**
 
-Everything above is orchestr reverse-engineering agent state from mtimes and process tables. Two
+Everything above is orchestra reverse-engineering agent state from mtimes and process tables. Two
 statuses cannot be recovered that way at any speed, and the README already concedes it:
 
 - **`■ BLOCKED` vs a long tool run.** Both are an unresolved `tool_use`. Permission prompts are
@@ -988,16 +988,16 @@ turn rather than scraped from whichever `turn_duration` survived the 128 KB tail
 
 #### Adoption: exactly one tier, and it needs no consent
 
-**Tier 0 — orchestr-dispatched agents. Zero config, 100 % coverage, day one.**
+**Tier 0 — orchestra-dispatched agents. Zero config, 100 % coverage, day one.**
 
 ```python
 shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
              f"exec claude --dangerously-skip-permissions{model_flag}"
-             f"{signal_flag()}")     # -> " --settings ~/.orchestr/hooks.json"
+             f"{signal_flag()}")     # -> " --settings ~/.orchestra/hooks.json"
 ```
 
 `--settings` is additive, so the user's own `settings.json`, hooks and `statusLine` are never
-opened, never parsed, never rewritten. Every agent orchestr launches is hooked from its first
+opened, never parsed, never rewritten. Every agent orchestra launches is hooked from its first
 millisecond, and the `~30 s` blindness the UI currently apologises for in prose
 (`index.html:1132`) collapses to one frame after `SessionStart`.
 
@@ -1014,12 +1014,12 @@ self-check that pipes a synthetic payload through the real script and demands a 
 
 ```sh
 #!/bin/sh
-# orchestr-signal v1. Never write to stdout (the CLI parses hook stdout as
+# orchestra-signal v1. Never write to stdout (the CLI parses hook stdout as
 # control JSON and a stray token can BLOCK the turn). Never exit non-zero.
 LC_ALL=C; export LC_ALL      # ${#b} must be BYTES: verified 6 vs 9 for multibyte
 b=$(cat) || exit 0; [ -n "$b" ] || exit 0
 ...POST to 127.0.0.1:4242/api/agent/event?pid=$PPID via /dev/tcp, else curl,
-   else append to ~/.orchestr/spool.jsonl...
+   else append to ~/.orchestra/spool.jsonl...
 ```
 
 Measured over 40 runs: **p50 8.7 ms, p90 10.2 ms — and max 446.6 ms at load average 6.7.** The
@@ -1050,7 +1050,7 @@ No disk, no subprocess, and — deliberately — **no call to `collect_state()`*
 change a git branch.
 
 **This handler has no reachable path to `send_to_process`, `_run_dispatch`, `deliver_text` or
-`start_finish`.** A hook event can change what the board *says*; it can never make orchestr
+`start_finish`.** A hook event can change what the board *says*; it can never make orchestra
 *act*. That is the "only an explicit user request may act on an agent" invariant, enforced
 structurally.
 
@@ -1200,7 +1200,7 @@ immediately. This kills sub-second oscillation without ever delaying something r
 atomic, so the board never renders an intermediate view of it.
 
 Optional exactness, affordable **only** because it is event-scheduled: `composer_idle()`
-(orchestr.py:1697) already parses `"esc to interrupt"` out of `tmux capture-pane` — ground truth
+(orchestra.py:1697) already parses `"esc to interrupt"` out of `tmux capture-pane` — ground truth
 for mid-turn. Fire it **once**, at the instant `thinking_s` expires, for tmux-hosted sessions
 only. Bucket C collapses to zero false flips for every dispatched fleet agent, at a few calls per
 minute rather than a per-tick cost. `tmux list-panes -a` measures 6.6–13.0 ms.
@@ -1331,10 +1331,10 @@ Each step is shippable alone, valuable alone, and revertible alone.
 | **4** | 2 | `Collector` thread, `poke()` at the four missing mutation sites, `/api/state?since=&wait=`, gzip, `evidence` block | ~140 | **10.6 s → ~330 ms.** Herd structurally impossible. Hidden tabs fixed. Push becomes possible. |
 | **5** | 4 (client half) | absolute timestamps on the 1 s ticker, rAF coalescing, `seq`/`generated_at` guards, `pointerdown` hold, `REG` pruned, resume confirmation | ~90 js | card rewrites down 6×; three latent client bugs closed |
 | **6** | 4 (server half) | `/api/stream` SSE, delta frames, server-side `transitions`, `digest`, `mode=digest` | ~130 | ~35 KB/5 s → ~2 KB/change; bell moves server-side; the push pipeline exists |
-| **7** | 3 | `KqueueWatcher` + `PollWatcher` behind `ORCHESTR_WATCH`, `TranscriptCursor`, 1 s reconcile, liveness canary | ~250 | ~330 → **~122 ms**; server CPU 8 % → ~1 %; the honest write clock |
+| **7** | 3 | `KqueueWatcher` + `PollWatcher` behind `ORCHESTRA_WATCH`, `TranscriptCursor`, 1 s reconcile, liveness canary | ~250 | ~330 → **~122 ms**; server CPU 8 % → ~1 %; the honest write clock |
 | **8** | 4 §4.3 | `thinking_s = 20`, `notify_settle_s = 45`, `provisional`, `MIN_DWELL_S`, the `phase` presentation | ~60 | the board stops lying in *both* directions |
 | **9** | 5 | `--settings` on dispatch, `/api/agent/event`, the signal overlay, `HOOK_LEASE_S` | ~350 | `■ BLOCKED` / `◆ YOUR TURN` become observed for every dispatched agent; actions become confirmable |
-| **10** | 3 (Linux) | `InotifyWatcher` via ctypes + `os.pidfd_open`, behind a runtime probe | ~120 | parity on Linux; `ORCHESTR_WATCH=poll` remains the floor |
+| **10** | 3 (Linux) | `InotifyWatcher` via ctypes + `os.pidfd_open`, behind a runtime probe | ~120 | parity on Linux; `ORCHESTRA_WATCH=poll` remains the floor |
 
 Steps 1–3 are roughly a day and need no architectural change at all. Step 4 is where the user's
 complaint is actually answered. Steps 7–9 are where the board stops guessing.
@@ -1347,7 +1347,7 @@ lane and gets the same `_resolve_git` + memo treatment; that is its own change.
 
 ## 8. Testing
 
-Everything below fits `tests/` as it stands: stdlib `unittest`, zero dependencies, `orchestr.py`
+Everything below fits `tests/` as it stands: stdlib `unittest`, zero dependencies, `orchestra.py`
 loaded by path via `importlib`, module globals snapshotted and restored by `ConfigGuard`.
 
 ### 8.1 Layer 0 — the classifier ladder
@@ -1485,7 +1485,7 @@ def test_state_shape_is_unchanged(self):
     New keys are additive only."""
 
 def test_cached_state_falls_back_without_a_collector(self):
-    """tests/ imports orchestr.py without main(), so no thread exists."""
+    """tests/ imports orchestra.py without main(), so no thread exists."""
     self.assertIsNone(fb.COLLECTOR)
     self.assertIn("worktrees", fb.cached_state())
 ```
@@ -1553,7 +1553,7 @@ def test_stale_delegated_does_not_pin_working(self):
     and assistant activity must not report working via that stale count."""
 ```
 
-`ORCHESTR_WATCH=poll` is what CI sets, so the `PollWatcher` path is the tested one on every
+`ORCHESTRA_WATCH=poll` is what CI sets, so the `PollWatcher` path is the tested one on every
 platform and the kqueue/inotify backends are exercised only in a `skipUnless` block on a real
 machine.
 
@@ -1621,11 +1621,11 @@ runner.
    *Mitigation:* the reconciliation rank — a renamed key degrades a session to inference and logs
    once. It must never degrade to a *wrong* status. Hooks are never the only source for any
    status.
-5. **Thread lifecycle and the test suite.** `tests/` imports `orchestr.py` without `main()`.
+5. **Thread lifecycle and the test suite.** `tests/` imports `orchestra.py` without `main()`.
    *Mitigation:* the collector is started only from `main()`; `cached_state()` keeps its
    TTL fallback; the seven `_cache["state"] = None` sites keep working.
 6. **`ctypes` on Linux couples us to the libc ABI.** *Mitigation:* three symbols, one struct,
-   stable since 2005, wrapped in `try/except`, with `ORCHESTR_WATCH=poll` one env var away — and
+   stable since 2005, wrapped in `try/except`, with `ORCHESTRA_WATCH=poll` one env var away — and
    the poll floor is 1.98 ms for a 996-object sweep. The ctypes path is optional, not
    load-bearing.
 7. **SSE thread-per-client.** Verified reclaimed after rude disconnects, but not unbounded.

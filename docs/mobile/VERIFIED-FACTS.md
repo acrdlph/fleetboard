@@ -13,15 +13,15 @@ collect_state()          1641 ms total   (9 worktrees, 5 live claude processes)
   discover_worktrees        1 ms
 ```
 
-Stacked client-visible latency: `STATE_TTL_S = 4.0` (orchestr.py:61) + `setInterval(tick, 5000)`
+Stacked client-visible latency: `STATE_TTL_S = 4.0` (orchestra.py:61) + `setInterval(tick, 5000)`
 (index.html:1169) → **~10.6 s worst case** from change to pixels.
 
-Separate and larger: `CFG["working_s"] = 90` (orchestr.py:51) holds `● WORKING` for up to
+Separate and larger: `CFG["working_s"] = 90` (orchestra.py:51) holds `● WORKING` for up to
 **90 s** after a session stops writing. This is hysteresis, not latency.
 
 ## git: five calls per worktree collapse to one
 
-`git_info()` (orchestr.py:141) currently spawns **5 git processes per worktree** —
+`git_info()` (orchestra.py:141) currently spawns **5 git processes per worktree** —
 45 subprocess spawns for 9 worktrees:
 
 | line | command |
@@ -44,7 +44,7 @@ the dirty file list in **one call, measured at 19 ms**:
 
 That replaces lines 143, 147, 153 and 156. Only `git log -1` remains separate → **5 calls → 2**.
 
-`branch_topology()` (orchestr.py:~839–882) is worse: ~8 git calls per worktree. Same treatment
+`branch_topology()` (orchestra.py:~839–882) is worse: ~8 git calls per worktree. Same treatment
 applies.
 
 ## kqueue: event-driven watching is viable from stdlib on macOS
@@ -80,7 +80,7 @@ ALL .jsonl incl. subagents 18,773     ← grows ~+982/day, peak +4,123
 ```
 
 Watching every `.jsonl` would take ~30 % of the per-process cap and ~15 % of the **global** file
-table — and exhausting `kern.maxfiles` breaks *other applications*, not just orchestr. That is a
+table — and exhausting `kern.maxfiles` breaks *other applications*, not just orchestra. That is a
 genuine design constraint.
 
 **The watch set must be bounded deliberately**, not taken as free:

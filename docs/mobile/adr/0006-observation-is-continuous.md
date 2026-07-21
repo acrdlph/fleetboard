@@ -4,7 +4,7 @@
 
 ## Context
 
-`cached_state()` (orchestr.py:1000) is **lazy**: state is computed only when a client requests
+`cached_state()` (orchestra.py:1000) is **lazy**: state is computed only when a client requests
 it, cached for `STATE_TTL_S = 4.0`, then discarded. State exists because a browser asked for it.
 
 This is the structural blocker for push. The entire purpose of a notification is to tell the

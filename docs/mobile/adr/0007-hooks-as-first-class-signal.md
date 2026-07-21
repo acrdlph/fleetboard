@@ -4,7 +4,7 @@
 
 ## Context
 
-orchestr reverse-engineers agent state from file mtimes and the process table. Its own README
+orchestra reverse-engineers agent state from file mtimes and the process table. Its own README
 concedes the consequence: *"BLOCKED / YOUR TURN are inferred — permission prompts aren't
 recorded in transcripts."*
 
@@ -23,7 +23,7 @@ the outside: a live process, an idle transcript.
 ## Decision
 
 Ingest **Claude Code hooks** as a first-class, highest-quality signal source. A hook firing on
-an agent state transition POSTs directly to orchestr, converting inferred statuses into
+an agent state transition POSTs directly to orchestra, converting inferred statuses into
 **observed** ones.
 
 Signal sources are ranked, and the engine reconciles them when they disagree:
@@ -38,7 +38,7 @@ hooks (observed)  >  process table  >  precise file writes  >  mtime heuristics 
   single largest available improvement in status *quality*, as distinct from status *speed*.
 - Detection latency for a hooked transition drops to roughly network-local round-trip.
 - **Adoption is the hard part.** Hooks only fire if installed. Required:
-  - agents dispatched *by* orchestr can be configured automatically;
+  - agents dispatched *by* orchestra can be configured automatically;
   - agents started independently by the user cannot — the system must degrade gracefully to
     inference, and must never present an unhooked session as less trustworthy in a confusing way;
   - an installation flow that does **not** hijack the user's own `settings.json` hooks.
@@ -51,7 +51,7 @@ still to be specified. This ADR fixes the *direction*; `ENGINE.md` fixes the mec
 
 ## Alternatives rejected
 
-- **tmux `capture-pane` polling** to detect a prompt. orchestr already uses `capture-pane`
+- **tmux `capture-pane` polling** to detect a prompt. orchestra already uses `capture-pane`
   elsewhere, so it is proven — but it is a screen-scrape: fragile against CLI output changes,
   only works for tmux-hosted agents, and costs a subprocess per probe. Retained as the lowest
   tier of the fallback ladder, not the primary.

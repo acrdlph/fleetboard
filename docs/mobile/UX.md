@@ -1,4 +1,4 @@
-# orchestr for iOS — UX & Design Specification
+# orchestra for iOS — UX & Design Specification
 
 **Status:** design-complete, implementation-ready for v1.
 **Scope:** the complete mobile user experience — information architecture, every screen, every flow, the visual system, and accessibility.
@@ -42,7 +42,7 @@ Stated as commitments. Every later section is checkable against them.
 6. **Every actuating control is at least 44 × 44 pt, and that costs real layout space.** Density is recovered by dropping columns at large type sizes, not by shrinking targets.
 7. **The board never moves under a finger.** Order and membership freeze on first touch and apply only on an explicit trigger. A tap on a row that just moved is refused, perceptibly.
 8. **The app never initiates a retry of a non-idempotent write.** Where the platform can retry beneath us, an idempotency key is a shipping precondition, not an enhancement.
-9. **Every failure surfaces the server's own prose.** orchestr's messages already carry the remedy (`"couldn't reach Terminal — Automation permission? (ttys004)"`). Paraphrasing destroys the only actionable part.
+9. **Every failure surfaces the server's own prose.** orchestra's messages already carry the remedy (`"couldn't reach Terminal — Automation permission? (ttys004)"`). Paraphrasing destroys the only actionable part.
 10. **Offline, stale, asleep and unpaired are first-class states with designed screens** — not spinners, not blank views, not silent last-known-good.
 
 ## 1.3 Where principles trade against each other
@@ -77,7 +77,7 @@ A design that specifies `http://100.84.12.7:4242` cannot make its first network 
 tailscale cert studio-mac.tailXXXX.ts.net       # .crt + .key
 ```
 
-and orchestr wraps its listener in ~12 lines of `ssl.SSLContext` (stdlib — the zero-dependency identity survives). Consequences:
+and orchestra wraps its listener in ~12 lines of `ssl.SSLContext` (stdlib — the zero-dependency identity survives). Consequences:
 
 - ATS is satisfied with **zero exceptions** and no trust delegate at all.
 - The pairing QR carries `https://studio-mac.tailXXXX.ts.net:4242`, which survives the Mac's IP changing.
@@ -144,11 +144,11 @@ If `tabViewBottomAccessory` proves differently shaped than assumed, the structur
 ## 2.3 Screen map
 
 ```
-orchestr
+orchestra
 │
 ├── ONBOARDING  (first launch only, and on 401)
 │   ├── Welcome
-│   ├── Prerequisites  (Tailscale · orchestr running)
+│   ├── Prerequisites  (Tailscale · orchestra running)
 │   ├── QR Scanner ──────────── Manual entry
 │   ├── Paired ✓
 │   └── Push setup ─── Sink choice ─── Mac steps ─── Verify ─── Permission
@@ -218,7 +218,7 @@ orchestr
 
 ```
 ╔════════════════════════════════════════════════════╗
-║  ⌁  orchestr        achill@fleet             🚀    ║  nav, inline title
+║  ⌁  orchestra        achill@fleet             🚀    ║  nav, inline title
 ╠════════════════════════════════════════════════════╣
 ║   ▲  2 need you                                    ║  34pt, accent
 ║      3 busy · 1 limited · 4 free · 1 idle          ║  13pt muted ▸ Counts
@@ -380,7 +380,7 @@ The subagent tag takes the first match, exactly as the desktop: `subagents_activ
 |---|---|
 | **first load ever** | 3 skeleton sections, breathing (static grey under Reduce Motion). Never a spinner over blank. |
 | **any subsequent load** | last-good state stays; the accessory carries connection state. Skeletons never replace live data. |
-| **zero worktrees** | `◇ no worktrees found` · *"orchestr watches git repos under `/Users/achill/Downloads`, filtered by `/confid/i`. Nothing matched."* · ‹Show my config› ‹Manual: setup›. Paths come from `/api/hello`'s `config` block — the desktop renders a literally blank grid here. |
+| **zero worktrees** | `◇ no worktrees found` · *"orchestra watches git repos under `/Users/achill/Downloads`, filtered by `/confid/i`. Nothing matched."* · ‹Show my config› ‹Manual: setup›. Paths come from `/api/hello`'s `config` block — the desktop renders a literally blank grid here. |
 | **worktrees, no sessions** | `○ nothing has run in the last 48h` + ‹New mission› |
 | **only ended sessions in a card** | `{n} ended session(s) hidden` + inline ‹Show› |
 | **no free worktrees** | `FREE (0) — everything busy` |
@@ -623,8 +623,8 @@ In-flight jobs are **server-owned**. `Intent` carries `{id, kind, target, phase,
 - Account menu lists `ok` accounts as `{fb_label} · {round(headroom)}% left`, sorted descending, suffixed `🔒 reserve` / `⛔ exhausted`. **Join on `fb_label`, never `slug`** — they differ (`slug: "default"` vs `fb_label: "main"`).
 - Model and Effort have **no default**; Launch stays disabled until both are set, mirroring the server's own refusal, so the app never sends a request it knows will bounce. The disabled reason is shown inline, not just as a dimmed button.
 - Draft persists to the App Group on a 500 ms debounce; survives app kill and failed launch.
-- **Share extension** hosts a minimal composer *inside the extension* — text view, four pickers, Launch — reading credentials from the shared Keychain access group. (`NSExtensionContext.open(_:)` to launch the host app is unsupported/unreliable, so "opens the app prefilled" does not work.) If the tailnet is unreachable it writes a draft and completes with *"saved as a draft in orchestr"*.
-- **`orchestr://mission?text=` is invocable by any web page.** The composer **never auto-launches**; Launch always requires an explicit tap, and a URL-opened composer shows `from a link` above the text.
+- **Share extension** hosts a minimal composer *inside the extension* — text view, four pickers, Launch — reading credentials from the shared Keychain access group. (`NSExtensionContext.open(_:)` to launch the host app is unsupported/unreliable, so "opens the app prefilled" does not work.) If the tailnet is unreachable it writes a draft and completes with *"saved as a draft in orchestra"*.
+- **`orchestra://mission?text=` is invocable by any web page.** The composer **never auto-launches**; Launch always requires an explicit tap, and a URL-opened composer shows `from a link` above the text.
 
 ## 3.6 Limits
 
@@ -699,7 +699,7 @@ Three server-side problems fixed upstream so the phone does not inherit them: `_
   - set to 0 → `0% — this removes the override; the default (20%) applies again`
 
   That last is the server's actual behaviour: setting 0 *pops the key*, and the `"*"` wildcard then applies.
-- **Whole-page error** (`available: false`): the server's error, the `cclimits` install hint, and the consequence — *"without this, orchestr can't tell a limit-parked agent from an idle one."*
+- **Whole-page error** (`available: false`): the server's error, the `cclimits` install hint, and the consequence — *"without this, orchestra can't tell a limit-parked agent from an idle one."*
 
 ## 3.8 Server
 
@@ -710,7 +710,7 @@ Three server-side problems fixed upstream so the phone does not inherit them: `_
 ║  ● studio-mac                                      ║
 ║    studio-mac.tailXXXX.ts.net:4242 · achill        ║
 ║    stream live · 240 ms · v41207                   ║
-║    orchestr 0.10.0 · up 2d 4h · awake           ›  ║
+║    orchestra 0.10.0 · up 2d 4h · awake           ›  ║
 ╟─ NOTIFICATIONS ────────────────────────────────────╢
 ║   ● Delivering · last push 14:02                   ║
 ║   Sink                    APNs (studio-mac key) ›  ║
@@ -771,7 +771,7 @@ Three server-side problems fixed upstream so the phone does not inherit them: `_
 ║  Waiting on:  Bash, Edit                           ║
 ║                                                    ║
 ║  ⓘ inferred — no permission hook is installed, so  ║
-║    orchestr is reading this from the transcript:   ║
+║    orchestra is reading this from the transcript:   ║
 ║    two tool calls opened 6 minutes ago and         ║
 ║    neither has a result.                           ║
 ║                                                    ║
@@ -834,7 +834,7 @@ Rendered in the bottom accessory, never as a full-screen takeover.
 | `mac_asleep` | `NWPath` satisfied but connect refused, or `wake_gap > 120` | §3.14 | blocked |
 | `unauthorized` | 401 | `⚠ this iPhone is no longer paired  ‹Re-pair›` | blocked |
 
-**One offline message, not two.** URLSession does not reliably distinguish "no route" from "connection refused" — both commonly surface as `NSURLErrorCannotConnectToHost`, and over a tunnel it depends on whether Tailscale drops or rejects the packet. `NWPathMonitor` reports `.satisfied` whenever the tunnel is up, regardless of peer reachability. Confidently saying *"studio-mac is up but orchestr isn't running"* when the tailnet actually dropped sends the user to the wrong machine.
+**One offline message, not two.** URLSession does not reliably distinguish "no route" from "connection refused" — both commonly surface as `NSURLErrorCannotConnectToHost`, and over a tunnel it depends on whether Tailscale drops or rejects the packet. `NWPathMonitor` reports `.satisfied` whenever the tunnel is up, regardless of peer reachability. Confidently saying *"studio-mac is up but orchestra isn't running"* when the tailnet actually dropped sends the user to the wrong machine.
 
 **The distinction lives in Troubleshoot**, which is a *sequence*:
 
@@ -846,11 +846,11 @@ Rendered in the bottom accessory, never as a full-screen takeover.
 ║     100.84.12.7 · studio-mac reachable             ║
 ║  ✓  studio-mac.tailXXXX.ts.net resolves            ║
 ║  ✗  Port 4242 refused the connection               ║
-║     orchestr isn't running on studio-mac.          ║
+║     orchestra isn't running on studio-mac.          ║
 ║                                                    ║
 ║     On your Mac:                                   ║
 ║     ┌────────────────────────────────────────────┐ ║
-║     │  cd ~/Downloads/orchestr && ./start.sh     │ ║
+║     │  cd ~/Downloads/orchestra && ./start.sh     │ ║
 ║     └────────────────────────────────────────────┘ ║
 ║                              ‹Copy›                ║
 ║  —  /api/hello                        not reached  ║
@@ -1297,7 +1297,7 @@ Limits                    Account Detail            After edit
 1. Limits → tap an account → Account Detail.
 2. Drag the slider (snapped to 5 %). The readout and caption update live; nothing is sent.
 3. Release → optimistic update + POST, debounced 600 ms.
-4. Success: an inline confirmation, no toast. Failure: **inline** error with the literal truth — the server mutates its in-memory config *before* the disk write, so `ok:false` means *"saved for now, but the config file couldn't be written; it resets when orchestr restarts"*.
+4. Success: an inline confirmation, no toast. Failure: **inline** error with the literal truth — the server mutates its in-memory config *before* the disk write, so `ok:false` means *"saved for now, but the config file couldn't be written; it resets when orchestra restarts"*.
 
 **Refresh all accounts** is a separate, deliberate act in the accessory: disabled while in flight, labelled `up to a minute`, never auto-retried.
 
@@ -1345,9 +1345,9 @@ Full specification in §5. The flow:
 ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
 │                  │   │ Before we start  │   │  ┌────────────┐  │
 │       ⌁          │   │                  │   │  │            │  │
-│    orchestr      │   │ ① Tailscale on   │   │  │   [camera] │  │
+│    orchestra      │   │ ① Tailscale on   │   │  │   [camera] │  │
 │                  │   │   this iPhone ✓  │   │  │            │  │
-│ Mission control  │   │ ② orchestr       │   │  └────────────┘  │
+│ Mission control  │   │ ② orchestra       │   │  └────────────┘  │
 │ for the agents   │   │   running     →  │   │                  │
 │ on your Mac.     │   │                  │   │ Point at the code│
 │                  │   │ On your Mac:     │   │ in your Mac's    │
@@ -1373,7 +1373,7 @@ Full specification in §5. The flow:
 `./start.sh --pair` prints an ASCII QR encoding:
 
 ```
-orchestr://pair?url=https%3A%2F%2Fstudio-mac.tailXXXX.ts.net%3A4242
+orchestra://pair?url=https%3A%2F%2Fstudio-mac.tailXXXX.ts.net%3A4242
                &name=studio-mac&token=<32-byte base64url>[&pin=<sha256-spki>]
 ```
 
@@ -1427,7 +1427,7 @@ Validation calls `GET /api/hello` — needed anyway, because `HEAD` and `OPTIONS
 `UNTextInputNotificationAction`. The handler runs in a background app launch: tunnel wake → `POST /api/send {account, sid, expect_sid, text, idempotency_key}`. **One round trip**, ~300–800 ms on a warm tailnet, because the identity assertion is server-side.
 
 - Hard budget **8 s**. Beyond it the handler posts `⚠ couldn't reach studio-mac — your reply is saved as a draft` and writes the draft to the App Group.
-- Failure — including an `expect_sid` mismatch — arrives as a **second local banner**: `⚠ that session's terminal changed — open orchestr`. A notification-action handler cannot present inline UI; the only channel back is a new notification.
+- Failure — including an `expect_sid` mismatch — arrives as a **second local banner**: `⚠ that session's terminal changed — open orchestra`. A notification-action handler cannot present inline UI; the only channel back is a new notification.
 - Success posts nothing; the badge decrement is the acknowledgement.
 
 **This ships enabled.** It is the flagship mobile flow — answering a blocked agent without unlocking the phone.
@@ -1719,7 +1719,7 @@ On the live fleet 8 of 9 worktrees are **linked worktrees of one repo** sharing 
 | state | rendering |
 |---|---|
 | loading | header outline + 4 shimmer rows. Never a spinner on blank. This also kills the desktop's "topology arrives before state → every node flashes ◇ FREE" flash, very visible over a tailnet |
-| no groups | *"no repos to map — orchestr found worktrees, but none has a trunk ref (origin/HEAD, origin/main, main, master). The board still works."* + ‹open board› |
+| no groups | *"no repos to map — orchestra found worktrees, but none has a trunk ref (origin/HEAD, origin/main, main, master). The board still works."* + ‹open board› |
 | unmapped worktrees | muted footer naming them and the reason. The server silently drops these today, so the topology list can be shorter than the board's with nothing surfaced |
 | stale | inline amber bar *"map data 4m old · pull to refresh"*. Because geometry is computed against the device clock, tip positions stay truthful as the payload ages — only `behind`/`dirty`/`status` go stale, and only those are marked |
 | offline | keep the last payload, dim the strip to 60 %, banner *"not reachable — showing the map from 12:41"*, **both action buttons disabled**. Never blank, never queued for later delivery — a deferred merge-and-push is worse than no merge |
@@ -1837,7 +1837,7 @@ It covers exactly the reversible-by-re-issue actions: **Disarm** (re-arms with t
 | **App icon quick actions** | *Who needs me* · *New mission* · *Limits* |
 | **Control Center controls** (iOS 18+) | *New mission* (opens the composer) · *Who needs me* (opens Fleet). **Neither performs a write** — a Control Center tile is one accidental swipe |
 | **App Intents / Shortcuts / Spotlight** | `ShowBoard` · `WhatNeedsMe` (spoken summary: *"three agents need you: ConfidAI-auth has a question, …"*) · `DispatchMission(mission:worktree:account:model:effort:)`. `mission`, `model` and `effort` are **required with no defaults** — that part does mirror the server, which refuses a dispatch without model and effort. `worktree` and `account` are *also* required here, which is **stricter than the server** (both accept `null` for Auto): a Shortcut runs unattended, so the deterministic auto-picker choosing a target nobody looked at is a worse failure than an extra parameter |
-| **URL scheme** | `orchestr://board`, `orchestr://worktree/<name>`, `orchestr://session/<account>/<sid>`, `orchestr://mission?text=` (never auto-launches), `orchestr://pair?…` |
+| **URL scheme** | `orchestra://board`, `orchestra://worktree/<name>`, `orchestra://session/<account>/<sid>`, `orchestra://mission?text=` (never auto-launches), `orchestra://pair?…` |
 | **Share extension** | composes and launches a mission in-extension (§3.5) |
 | **Hardware keyboard** | not designed for v1 |
 
@@ -1917,7 +1917,7 @@ Reading anything · replying · arming or disarming auto-resume · adjusting res
 | **Widget extension** | Home Screen + Lock Screen widgets, Live Activities, Control Center controls |
 | **Notification Service Extension (NSE)** | **two jobs, both mandatory**: (a) fetch notification body text over the tailnet so transcript prose never touches APNs; (b) write fleet counts into the App Group and call `WidgetCenter.shared.reloadAllTimelines()` *before* the alert renders — this is how widgets stay fresh |
 | **Share extension** | composes a mission **inside the extension** (§3.5) |
-| **App Group** `group.orchestr.fleet` | shared container: last snapshot, counts, drafts; credentials in the shared Keychain access group |
+| **App Group** `group.orchestra.fleet` | shared container: last snapshot, counts, drafts; credentials in the shared Keychain access group |
 
 ## 8.2 Push mechanism, and the key-distribution problem
 
@@ -2103,7 +2103,7 @@ Banner as rendered:
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ ⌁  orchestr                                 now  │
+│ ⌁  orchestra                                 now  │
 │    ConfidAI-auth needs an answer                 │
 │    NEEDS ANSWER · [work] · opus-4-8              │
 │    I can take either approach — do you want the  │
@@ -2141,7 +2141,7 @@ The `silent` state distinguishes "quiet fleet" from "broken pipeline", which is 
 ```jsonc
 // POST /api/devices   (authenticated; idempotent on `token`)
 { "token": "a1b2…", "kind": "apns", "name": "achill's iPhone",
-  "bundle_id": "com.acrdlph.orchestr", "tz": "Europe/Berlin",
+  "bundle_id": "com.acrdlph.orchestra", "tz": "Europe/Berlin",
   "prefs": {"needs_input": true, "blocked": true, "waiting": false,
             "limit": true, "dispatch": true, "resume": true, "freed": false},
   "quiet_hours": {"from": "22:00", "to": "08:00"},
@@ -2162,7 +2162,7 @@ The `silent` state distinguishes "quiet fleet" from "broken pipeline", which is 
 
 ```
 ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│ ⌁ orchestr   │   │ ⌁ orchestr   │   │ ⌁ orchestr   │
+│ ⌁ orchestra   │   │ ⌁ orchestra   │   │ ⌁ orchestra   │
 │              │   │              │   │              │
 │      2       │   │      ●       │   │      —       │
 │  need you    │   │  all clear   │   │ can't reach  │
@@ -2177,7 +2177,7 @@ The `silent` state distinguishes "quiet fleet" from "broken pipeline", which is 
 
 ```
 ┌──────────────────────────────────────────────┐
-│ ⌁ orchestr · studio-mac          as of 14:02 │
+│ ⌁ orchestra · studio-mac          as of 14:02 │
 │                                              │
 │   ▲ 2 need you   ● 3 busy   ⛔ 1   ◇ 4 free  │
 │ ──────────────────────────────────────────── │
@@ -2204,7 +2204,7 @@ Medium plus up to 6 rows plus an **ARMED** block listing pending auto-resumes an
 
 - **Circular** — ring gauge of tier-1 over a ceiling of 5, `▲2` centred; empty ring + `●` when clear.
 - **Rectangular** — `▲2 · ●3 · ⛔1` / the freshest needs-you name / `14:02`.
-- **Inline** — `▲ 2 agents need you` / `● fleet is clear` / `◯ orchestr unreachable`.
+- **Inline** — `▲ 2 agents need you` / `● fleet is clear` / `◯ orchestra unreachable`.
 
 ### Two rules
 
@@ -2216,7 +2216,7 @@ Medium plus up to 6 rows plus an **ARMED** block listing pending auto-resumes an
 
 # 9. The visual design system
 
-orchestr's identity is **a terminal that grew a face**: near-black canvas, one monospaced face, hairline borders, five hues that *mean* something. iOS's identity is large type, generous targets, Liquid Glass chrome, system gestures, Dynamic Type. Four conflicts, four rules:
+orchestra's identity is **a terminal that grew a face**: near-black canvas, one monospaced face, hairline borders, five hues that *mean* something. iOS's identity is large type, generous targets, Liquid Glass chrome, system gestures, Dynamic Type. Four conflicts, four rules:
 
 | Conflict | Rule |
 |---|---|
@@ -2236,7 +2236,7 @@ orchestr's identity is **a terminal that grew a face**: near-black canvas, one m
 **Daylight is not optional.** Notification banners, notification content extensions, widgets, Live Activities on the Lock Screen, and the launch screen render in the **OS** appearance; `.preferredColorScheme` does not reach them. Once you compute a light status set for those — and you must — a real light theme costs almost nothing. Separately, dark UI degrades far worse under ambient reflection: reflected luminance adds equally to foreground and background, so a measured 15:1 on `#0D0D0D` collapses toward ~2:1 in direct sun while a light canvas barely moves.
 
 ```swift
-@main struct OrchestrApp: App {
+@main struct OrchestraApp: App {
     @AppStorage("appearance") private var appearance: Appearance = .night
     @AppStorage("forceContrast") private var forceContrast = false
     var body: some Scene {
@@ -2429,7 +2429,7 @@ One carried-over exception: headline numbers use **sans** at display size, becau
 
 `Font.custom(_:size:relativeTo:)` does **not** respond to `UIAccessibility.isBoldTextEnabled`. With Bold Text on, the SF human voice goes bold and the entire mono machine voice — worktree names, every status word, every badge, every button, every timestamp — does not. That is not "no benefit"; it is an inverted hierarchy where quiet prose outweighs status words.
 
-Four weights are bundled and `OrchestrType` is resolved from `\.legibilityWeight`:
+Four weights are bundled and `OrchestraType` is resolved from `\.legibilityWeight`:
 
 | token | `.regular` | `.bold` |
 |---|---|---|
@@ -2729,7 +2729,7 @@ withTransaction(t) { proxy.scrollTo(anchorID, anchor: UnitPoint(x: 0, y: fractio
 ## 9.8 The SwiftUI extensions
 
 ```swift
-// OrchestrColor.swift
+// OrchestraColor.swift
 import SwiftUI
 
 /// All colours come from Colors.xcassets, which carries four variants of each:
@@ -2737,7 +2737,7 @@ import SwiftUI
 /// The OS resolves them. There is no ternary at any call site, and UIColor(named:)
 /// is available for the launch screen and the notification content extension.
 /// Computed WCAG ratios are asserted in ColorContrastTests, not documented in comments.
-struct OrchestrTokens: Sendable {
+struct OrchestraTokens: Sendable {
     // surfaces
     let canvas    = Color("canvas")
     let sunken    = Color("sunken")
@@ -2790,11 +2790,11 @@ struct OrchestrTokens: Sendable {
     }
 }
 
-extension Color { static let orc = OrchestrTokens() }
+extension Color { static let orc = OrchestraTokens() }
 ```
 
 ```swift
-// OrchestrType.swift
+// OrchestraType.swift
 import SwiftUI
 
 enum Plex {                       // verified at launch by FontRegistrationTests
@@ -2807,7 +2807,7 @@ enum Plex {                       // verified at launch by FontRegistrationTests
 /// Two voices: mono = the machine, SF = the human.
 /// Resolved from legibilityWeight so Bold Text moves the mono voice too —
 /// Font.custom does not respond to it on its own.
-struct OrchestrType: Sendable {
+struct OrchestraType: Sendable {
     private let heavy: Bool
     init(bold: LegibilityWeight?) { self.heavy = (bold == .bold) }
 
@@ -2830,11 +2830,11 @@ struct OrchestrType: Sendable {
     var button:   Font { .custom(monoStrong, size: 15, relativeTo: .callout) }
 }
 
-private struct TypeKey: EnvironmentKey { static let defaultValue = OrchestrType(bold: nil) }
+private struct TypeKey: EnvironmentKey { static let defaultValue = OrchestraType(bold: nil) }
 extension EnvironmentValues {
-    var orcType: OrchestrType { get { self[TypeKey.self] } set { self[TypeKey.self] = newValue } }
+    var orcType: OrchestraType { get { self[TypeKey.self] } set { self[TypeKey.self] = newValue } }
 }
-// at the app root:  .environment(\.orcType, OrchestrType(bold: legibilityWeight))
+// at the app root:  .environment(\.orcType, OrchestraType(bold: legibilityWeight))
 
 /// Tracking as a ratio that resolves at render time, not a shipped-size constant.
 struct Tracked: ViewModifier {
@@ -2851,7 +2851,7 @@ extension View {
 ```
 
 ```swift
-// OrchestrMetrics.swift
+// OrchestraMetrics.swift
 import CoreGraphics
 
 // One `static let` per line: in a comma-separated binding list the type annotation
@@ -2902,7 +2902,7 @@ enum OrcFormat {
 }
 ```
 
-**Concurrency.** `OrchestrTokens` and `OrchestrType` are structs of `Color`/`Font`, both `Sendable`. `Color.orc` is a `static let` of a `Sendable` value type — legal as a global. `StatusStyle` is `Sendable`. Networking is an `actor`; the board view model is `@MainActor @Observable`.
+**Concurrency.** `OrchestraTokens` and `OrchestraType` are structs of `Color`/`Font`, both `Sendable`. `Color.orc` is a `static let` of a `Sendable` value type — legal as a global. `StatusStyle` is `Sendable`. Networking is an `actor`; the board view model is `@MainActor @Observable`.
 
 ## 9.9 The mark and the icon
 
@@ -3132,7 +3132,7 @@ Each is grep-checkable or lint-able.
 | 27 | dispatch progress ①–⑤ | intent frames + Live Activity | kept verbatim |
 | 28 | dispatch log | Activity tab + Dispatch Detail | promoted out of the composer |
 | 29 | `↩ edit again` | ‹Reopen draft› | kept |
-| 30 | `/?mission=` | `orchestr://mission?text=` + share extension | kept, corrected (never auto-launches) |
+| 30 | `/?mission=` | `orchestra://mission?text=` + share extension | kept, corrected (never auto-launches) |
 | 31–32 | show-ended, bell | Filters sheet; notification tiers + foreground haptic | kept |
 | 33 | other live agents | collapsed OTHER AGENTS section | kept |
 | 34 | toasts | persistent inline states + accessory banners | upgraded |
@@ -3193,7 +3193,7 @@ Small, real, cheap to handle — collected here rather than threaded through, be
 
 **Then, in order** (names as `API.md` spells them; `ROADMAP.md` sequences them into M1–M12): SSE `GET /api/v1/stream` with `?since=<epoch:seq>`, `dg` digest and a subscriber cap · durable **ops** (`op_…`) with phases at `/api/v1/ops/{op_id}` · `POST /api/v1/devices/self/push` + per-device prefs/tz/quiet-hours + `GET /api/v1/meta`'s `device.push` block · `GET /api/v1/health` and `GET /api/v1/meta` (identity, `features[]`, `config{}`) · ActivityKit update + push-to-start tokens · epoch `ts` and the idempotency key in `dispatch.log.jsonl` · `POST /api/v1/agents/{ag_id}/kill` · **five-valued `availability`** + `counts.cards` + `order` · `sessions_total`/`sessions_shown` · terminal **`attribution` + `why`** (§3.3.1) · the **`confidence`/`provisional`/`evidence_source`** block (§3.1.4) · `parse_qs` for all query params · the `before=`/`after=` cursor on `/api/v1/sessions/{sid}/messages` · topology **`dropped[]`**, `base_ts`, `axis.s`/`axis.anchor_age_s`, `commits_capped`/`commits_oldest_ts` (§5.3, §5.7, §5.8) · single-flight + negative-cache on `_limits`, atomic `save_resumes`, locks on `_cache`/`_closeouts` · `--demo` sandboxing + demo/real parity · explicit `0` reserve · `try/except` around dispatch and `do_POST` · server-side per-worktree finish lock · `firing_since` on schedules · a pasteboard endpoint (§4.7 — **undefined in `API.md`**, see §0.2).
 
-**Constraints every item inherits**, from the existing test suite's shape: all functions stay at module scope in `orchestr.py`; all subprocess work goes through the single `run()` seam; new module-level mutable state is added to `ConfigGuard`; every new endpoint gets a `TestHTTPSmoke` case plus a demo-refusal assertion; **zero pip installs**; the CI floor is Python 3.11.
+**Constraints every item inherits**, from the existing test suite's shape: all functions stay at module scope in `orchestra.py`; all subprocess work goes through the single `run()` seam; new module-level mutable state is added to `ConfigGuard`; every new endpoint gets a `TestHTTPSmoke` case plus a demo-refusal assertion; **zero pip installs**; the CI floor is Python 3.11.
 
 # Appendix E — four corrections to back-port to the desktop
 

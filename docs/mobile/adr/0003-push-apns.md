@@ -9,7 +9,7 @@ an answer, a limit reset, a mission landed. That requires push. The user confirm
 paid Apple Developer account, which is what makes APNs (and Live Activities, widgets and
 TestFlight) available at all.
 
-The complication: orchestr's identity is "zero dependencies — one python3 stdlib file". APNs
+The complication: orchestra's identity is "zero dependencies — one python3 stdlib file". APNs
 requires an ES256-signed JWT and an HTTP/2 POST. Python's stdlib provides **neither** ECDSA
 signing nor an HTTP/2 client.
 

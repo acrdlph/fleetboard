@@ -1,7 +1,7 @@
-# orchestr HTTP API — v1
+# orchestra HTTP API — v1
 
 **Status:** specification. This document is the contract. Where it disagrees with
-`orchestr.py` at HEAD, the code is wrong and must be changed; where it disagrees with
+`orchestra.py` at HEAD, the code is wrong and must be changed; where it disagrees with
 an earlier design note, this document wins.
 
 **Audience:** the Swift engineer writing the iOS client, and the Python engineer
@@ -20,7 +20,7 @@ have read those notes, here is what changed:
 | Concept | Track proposals | **Canonical here** |
 |---|---|---|
 | Version prefix | `/api/v1/…`, `/api/v2/…` | **`/api/v1/…`** everywhere |
-| Idempotency header | `Idempotency-Key`, `X-Orchestr-Op-Id`, body `op_id` | **`Idempotency-Key`** header (+ `Idempotency-Issued-At`) |
+| Idempotency header | `Idempotency-Key`, `X-Orchestra-Op-Id`, body `op_id` | **`Idempotency-Key`** header (+ `Idempotency-Issued-At`) |
 | Cursor | `?since=<int>&epoch=<hex>`, `"<epoch>:<seq>"` | **`?since=<epoch>:<seq>`**, one opaque token |
 | Delta encoding | entity upsert/remove lists, field-addressed ops | **field-addressed ops** (`{p,f,v,x}`), one format for SSE *and* long-poll |
 | Async work | `job-HHMMSS-N`, `op_…` | **`op_…`**, at `/api/v1/ops/{op_id}`, mirrored into the delta address space as `j/<op_id>` |
@@ -138,11 +138,11 @@ http://127.0.0.1:4242                   loopback only, plaintext, browser board 
 
 | Header | Meaning |
 |---|---|
-| `Orchestr-Api` | `1.0` — the API contract version |
-| `Orchestr-Request-Id` | `req_<8 hex>`, echoed in the error envelope, printed beside any server traceback |
+| `Orchestra-Api` | `1.0` — the API contract version |
+| `Orchestra-Request-Id` | `req_<8 hex>`, echoed in the error envelope, printed beside any server traceback |
 | `Cache-Control` | `no-store` |
-| `Orchestr-Epoch` | current epoch (see §6), on state-bearing responses |
-| `Orchestr-Seq` | current sequence number, on state-bearing responses |
+| `Orchestra-Epoch` | current epoch (see §6), on state-bearing responses |
+| `Orchestra-Seq` | current sequence number, on state-bearing responses |
 | `ETag` | weak validator, on cacheable reads |
 | `Deprecation` / `Link` | on legacy `/api/*` responses only (§16) |
 
@@ -194,7 +194,7 @@ Every device is issued **two** tokens at pairing: one `read`, one `act`. Scopes 
 
 | Scope | Grants | iOS storage |
 |---|---|---|
-| `read` | all reads, the SSE stream, self-service device endpoints | Keychain, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, access group `com.acrdlph.orchestr.shared` (the notification-service extension needs it while the device is locked), **no biometric ACL** |
+| `read` | all reads, the SSE stream, self-service device endpoints | Keychain, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, access group `com.acrdlph.orchestra.shared` (the notification-service extension needs it while the device is locked), **no biometric ACL** |
 | `act` | everything that types at, launches, or kills an agent | Keychain, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` + `SecAccessControl([.biometryCurrentSet, .or, .devicePasscode])`, **not** in the access group |
 | `admin` | device management, reserve edits, config-adjacent writes | **the desktop board only. Phones are never issued `admin`** — a stolen phone must not be able to revoke the Mac's ability to revoke it. |
 
@@ -305,7 +305,7 @@ Stated plainly so nobody over-trusts it:
 
 A `tailscale serve`-proxied request arrives with `Host: <node>.ts.net` (no port) and from
 loopback. That `Host` is not in the allowlist, so it is `403`. If you deliberately want to
-front orchestr with `serve`, you must add the host to `auth.extra_hosts` **and** switch the
+front orchestra with `serve`, you must add the host to `auth.extra_hosts` **and** switch the
 board to nonce authentication — otherwise you publish the desktop `admin` token to every
 tailnet node. Do not do half of it.
 
@@ -316,7 +316,7 @@ tailnet node. Do not do half of it.
 ### 3.1 Flow
 
 ```
-Mac (board /pair, or `python3 orchestr.py --pair`)      iPhone
+Mac (board /pair, or `python3 orchestra.py --pair`)      iPhone
 ──────────────────────────────────────────────────      ──────
 1. admin taps "＋ pair a device"
 2. POST /api/v1/devices/pair/open
@@ -712,8 +712,8 @@ ETag: W/"1a2b3c4d5e6f7081"               worktree detail (content hash)
 ETag: W/"9d4db7b2:412"                   chat (sid : message count)
 ```
 
-`If-None-Match` matching returns `304 Not Modified` with the ETag, `Orchestr-Epoch`,
-`Orchestr-Seq` and no body.
+`If-None-Match` matching returns `304 Not Modified` with the ETag, `Orchestra-Epoch`,
+`Orchestra-Seq` and no body.
 
 Worktree-detail ETags are **content hashes with volatile fields stripped** (`cpu`, `etime`,
 `uptime_s`, `first_seen_at` are excluded from the hash), so an open card that is genuinely
@@ -759,7 +759,7 @@ j/<op_id>                   one operation                            descend
   produce two cards with the same name, which would silently overwrite in a name-keyed map.
   The `name` and `path` ride as fields of `w/<wid>`.
 - **`sid`** is the full transcript UUID, not the 8-char display id.
-- Account labels are orchestr's `fb_label` (`"main"`, `"account8"`), never cclimits' `slug`
+- Account labels are orchestra's `fb_label` (`"main"`, `"account8"`), never cclimits' `slug`
   — for the default home they differ (`slug: "default"` vs `fb_label: "main"`), and
   `session.account` carries the label.
 - **`order` is explicit, not inferred from array position.** The server re-sorts cards by
@@ -859,7 +859,7 @@ Every non-2xx `/api/v1/` response — without exception, including `404` — is 
 | `message` | String | **user-facing prose, shown verbatim.** Often carries the remediation inline. Never parsed. |
 | `detail` | Object | code-specific; may be `{}`. Never assume a key exists. |
 | `retriable` | Bool | the **only** signal a retry policy may read, alongside the status code |
-| `request_id` | String | echoed in `Orchestr-Request-Id`, printed beside any server traceback |
+| `request_id` | String | echoed in `Orchestra-Request-Id`, printed beside any server traceback |
 
 The prose is a product asset. `"couldn't reach Terminal — Automation permission? (ttys004)"`
 and `"reopened in tmux but 'continue' never reached the conversation — attach and type it:
@@ -969,7 +969,7 @@ be slow.
 ```json
 {
   "ok": true,
-  "service": "orchestr",
+  "service": "orchestra",
   "version": "1.0.0",
   "api": "1.0",
   "build": "2026.07.21+9f3c1a",
@@ -1002,7 +1002,7 @@ be slow.
 Client use:
 
 - `min_client_build` > the app's build → render a blocking *"update the app"* screen.
-- `api` major mismatch → *"update orchestr on your Mac"*.
+- `api` major mismatch → *"update orchestra on your Mac"*.
 - `state_ready: false` → expect `503 state_not_ready` on state reads; retry in 2 s.
 - `cert_not_after` within 30 days → warn.
 - `sleep_prevented: false` on a laptop with push configured → warn that notifications will
@@ -1080,7 +1080,7 @@ Capability discovery and budget introspection. Poll on foreground, not on a time
 ```
 
 **API compatibility contract** — stated because HTML skew is impossible but phone skew is
-inevitable (a user who has not updated orchestr in three months while the App Store
+inevitable (a user who has not updated orchestra in three months while the App Store
 auto-updates the app is the default case):
 
 > Within a major version the server **may** add fields, add endpoints, and add enum values
@@ -1377,9 +1377,9 @@ The board. Serves three shapes from one route.
 ```
 HTTP/1.1 304 Not Modified
 ETag: W/"9f2c1a04:4711"
-Orchestr-Epoch: 9f2c1a04
-Orchestr-Seq: 4711
-Orchestr-Api: 1.0
+Orchestra-Epoch: 9f2c1a04
+Orchestra-Seq: 4711
+Orchestra-Api: 1.0
 ```
 
 | Status | When |
@@ -1419,7 +1419,7 @@ Content-Type: text/event-stream; charset=utf-8
 Cache-Control: no-store
 X-Accel-Buffering: no
 Connection: close
-Orchestr-Api: 1.0
+Orchestra-Api: 1.0
 ```
 
 There is **no `Content-Encoding`**, ever, even with `Accept-Encoding: gzip`.
@@ -1437,7 +1437,7 @@ arithmetically impossible.
 event: hello
 id: 4711
 data: {"epoch":"9f2c1a04","seq":4711,"cursor":"9f2c1a04:4711","at":1784636692.641,
-       "dg":"a41f0c93","tick":10.0,"hb":25.0,"sub":"e7c1a2","server":"orchestr/1",
+       "dg":"a41f0c93","tick":10.0,"hb":25.0,"sub":"e7c1a2","server":"orchestra/1",
        "wake_gap":0.0,"collector_ok":true,"max_age_s":300,
        "caps":["delta","gzip","idempotency","ops","events","chatafter","push"]}
 
@@ -1931,7 +1931,7 @@ first's op id via idempotency or a `409 operation_in_flight` if the key differs.
 **Auth:** Bearer, **`admin`**. **Idempotency:** required.
 
 Sets the headroom percentage kept free from **auto**-dispatch. Writes
-`orchestr.config.json` (whole-file read-modify-write under a lock, tmp + atomic replace),
+`orchestra.config.json` (whole-file read-modify-write under a lock, tmp + atomic replace),
 touching only the `reserve_percent` key.
 
 Request:
@@ -2602,7 +2602,7 @@ default 25), `since` (float epoch).
   then genuinely means "never existed", not "lost".
 - **Boot reconciliation:** an op reloaded in `queued`/`running` has no worker behind it, so
   the server settles it `failed` with `error.code = "interrupted_by_restart"` and the message
-  *"orchestr restarted while this was running — check the fleet before retrying; a mission
+  *"orchestra restarted while this was running — check the fleet before retrying; a mission
   may already be live"*. Its idempotency key then resolves to
   `409 operation_indeterminate`, never a silent re-execution.
 - Ops are also mirrored into the delta address space at `j/<op_id>`, so a streaming client
@@ -2878,7 +2878,7 @@ Request:
   "backend": "apns",
   "token": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
   "environment": "production",
-  "topic": "com.acrdlph.orchestr",
+  "topic": "com.acrdlph.orchestra",
   "app_version": "1.0 (14)",
   "tz": "America/Los_Angeles",
   "tz_offset_min": -420,
@@ -3270,7 +3270,7 @@ app (bg)      → write the draft to the App Group container FIRST
               ← result.proven == true   → clear the outbox entry
                 result.proven == false  → keep it, show "sent, not yet confirmed"
                 409 agent_moved         → local notification: "that terminal moved —
-                                          open orchestr", keep the draft
+                                          open orchestra", keep the draft
 ```
 
 ### 12.2 Dispatch a mission with a headroom conflict
@@ -3363,7 +3363,7 @@ Non-negotiable, in the order they must land:
 11. `time.monotonic()` for every duration; `time.time()` only for values on the wire. On
     wake, re-baseline without emitting.
 12. Atomic `tmp + os.replace + fsync` for `resume.schedule.json`, `push.state.json`,
-    `devices.json`, `ops.jsonl` rotation and `orchestr.config.json`. Today
+    `devices.json`, `ops.jsonl` rotation and `orchestra.config.json`. Today
     `save_resumes()` truncates then writes and swallows `OSError`, so a crash mid-write
     silently loses every armed schedule.
 13. `--` sentinel before user text in every `tmux send-keys -l` and `tmux set-buffer`.
@@ -3413,7 +3413,7 @@ degrade to the ntfy backend when absent — the same category as the existing `g
     both fail silently, with no server-side error because nothing arrives.
 13. Request **`.provisional`** notification authorization on first launch, so a first-run
     denial cannot permanently gut the premise.
-14. Reachability ladder: Tailscale down / Mac asleep / orchestr down / pin mismatch / server
+14. Reachability ladder: Tailscale down / Mac asleep / orchestra down / pin mismatch / server
     too old are five distinct states with five distinct actions. Do not show one spinner for
     all of them.
 

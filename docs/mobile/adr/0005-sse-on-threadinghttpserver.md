@@ -7,7 +7,7 @@
 The board polls `/api/state` every 5 s. A phone cannot do that — battery, bytes, and a tailnet
 that drops as the device moves between wifi and LTE. Clients need to be *pushed* to.
 
-The gating risk: orchestr runs on `ThreadingHTTPServer`, which dedicates **one thread per
+The gating risk: orchestra runs on `ThreadingHTTPServer`, which dedicates **one thread per
 request**. An SSE connection is long-lived, so every subscriber pins a thread for its entire
 lifetime. If dead clients never released their threads, this would force a rewrite onto
 `asyncio` or `selectors` — a large change to a 2300-line file, and a serious cost.

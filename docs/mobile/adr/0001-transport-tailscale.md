@@ -4,7 +4,7 @@
 
 ## Context
 
-orchestr binds `127.0.0.1:4242`. The README warns that binding wider "serves your transcript
+orchestra binds `127.0.0.1:4242`. The README warns that binding wider "serves your transcript
 text to the network" — and it undersells the risk: the server also *types into live terminals*
 and dispatches agents running `--dangerously-skip-permissions`. A phone client needs to reach
 it from outside the machine.

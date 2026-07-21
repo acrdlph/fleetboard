@@ -1,8 +1,8 @@
-# orchestr — architecture evolution & iOS client
+# orchestra — architecture evolution & iOS client
 
 **Start here.** This directory holds the design for two linked pieces of work:
 
-1. **Re-architecting orchestr's state layer** so status is fresh, accurate, and pushable.
+1. **Re-architecting orchestra's state layer** so status is fresh, accurate, and pushable.
 2. **A native iOS client** that drives the fleet from a phone while sessions keep running on
    the Mac.
 
@@ -17,7 +17,7 @@ are.
 | | |
 |---|---|
 | **Phase** | A — design (nearly settled) · first code shipped |
-| **Shipped** | **Layer 0** — classifier ladder reordered (orchestr.py `classify_session`). 142 tests pass; input-space diff confirms only the two intended changes. |
+| **Shipped** | **Layer 0** — classifier ladder reordered (orchestra.py `classify_session`). 142 tests pass; input-space diff confirms only the two intended changes. |
 | **Next milestone** | collapse the git subprocess storm (see *Development path*, step 1) |
 | **Last updated** | 2026-07-21 |
 
@@ -42,8 +42,8 @@ treat it as draft.
 
 ## The problem, in one screen
 
-orchestr computes state **lazily** — only when a client asks (`cached_state()`,
-orchestr.py:1000). Measured on a 9-worktree fleet:
+orchestra computes state **lazily** — only when a client asks (`cached_state()`,
+orchestra.py:1000). Measured on a 9-worktree fleet:
 
 ```
 collect_state()          1641 ms
@@ -130,7 +130,7 @@ sequencing in ADR 0004.
    ```bash
    python3 - <<'EOF'
    import time, importlib.util
-   spec = importlib.util.spec_from_file_location("o", "orchestr.py")
+   spec = importlib.util.spec_from_file_location("o", "orchestra.py")
    o = importlib.util.module_from_spec(spec); spec.loader.exec_module(o)
    o.load_config()
    t = time.time(); o.collect_state()

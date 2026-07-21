@@ -1,7 +1,7 @@
-# orchestr for iOS — delivery roadmap
+# orchestra for iOS — delivery roadmap
 
 **Status:** planning. Nothing here is built yet.
-**Scope:** taking orchestr from "a Python file that serves a dark board on loopback" to "a native SwiftUI app that can do everything the board can, over Tailscale, from a phone."
+**Scope:** taking orchestra from "a Python file that serves a dark board on loopback" to "a native SwiftUI app that can do everything the board can, over Tailscale, from a phone."
 
 This document only **sequences**. The *what* and *why* live in the sibling specifications:
 `API.md` (the wire contract — authoritative on every path, field and shape), `ARCHITECTURE.md`
@@ -85,7 +85,7 @@ actual devices in the actual configuration.
 | **S1** | **stdlib APNs.** Generate a P-256 key, sign a JWT header+claims with `/usr/bin/openssl dgst -sha256 -sign`, convert the DER `SEQUENCE{r,s}` to raw `r‖s` (32 bytes each, sign-pad stripped, left-padded), POST to `api.sandbox.push.apple.com` with `curl --http2`. | The entire push strategy rests on this and Python's stdlib has **no HTTP/2 client and no ECDSA**. | M8b, M9, M11 |
 | **S2** | **Reach the Mac from the iPhone.** Tailscale up on both, `tailscale cert <magicdns>`, wrap the listener in `ssl`, load `https://<name>.ts.net:4242/api/state` in mobile Safari **and** from a 20-line URLSession test app. | ATS refuses cleartext, and Tailscale's `100.64.0.0/10` is CGNAT — **not** covered by `NSAllowsLocalNetworking`. If HTTPS-on-tailnet does not work, the whole transport plan changes. | M3, M4, everything |
 | **S3** | **SSE through the tunnel.** Hold an SSE connection from the phone for 10 minutes on cellular with the screen locked; count frames received and reconnects. | SSE is the basis of M5's battery claims. Carrier CGNAT often forces a DERP relay; NAT timeouts vary. | M5 |
-| **S4** | **Unreachability taxonomy.** With Tailscale up: (a) Mac asleep, (b) Mac awake + orchestr stopped, (c) Tailscale off on the phone. Record what `URLError`/errno each produces through the NE tunnel. | The app promises four distinct diagnoses. If they collapse to one timeout, the copy must change rather than lie. | M4 |
+| **S4** | **Unreachability taxonomy.** With Tailscale up: (a) Mac asleep, (b) Mac awake + orchestra stopped, (c) Tailscale off on the phone. Record what `URLError`/errno each produces through the NE tunnel. | The app promises four distinct diagnoses. If they collapse to one timeout, the copy must change rather than lie. | M4 |
 | **S5** | **Free provisioning limits.** Make a throwaway app on a personal team; try to add Push Notifications, App Groups, Keychain Sharing. Note what Xcode refuses. | Determines exactly when the $99 must be spent. Xcode's behaviour here has changed between releases. | §Apple gating |
 | **S6** | **Local-network prompt.** Does iOS show the local-network permission dialog for a `100.64/10` destination routed over `utun`? | Decides whether `NSLocalNetworkUsageDescription` is required or is a wasted scary prompt on first run. | M4 |
 
@@ -170,7 +170,7 @@ None.
 
 **Effort:** M (5–7 days)
 **Unblocks:** every subsequent milestone. Nothing should bind beyond loopback before this lands.
-**You can now:** browse the web with orchestr running without a website being able to launch an agent on your Mac.
+**You can now:** browse the web with orchestra running without a website being able to launch an agent on your Mac.
 
 ---
 
@@ -217,7 +217,7 @@ None.
 2. Open four browser tabs on the board. `ps aux | grep -c '[g]it '` sampled repeatedly shows no more git processes than with one tab.
 3. Close every browser tab, wait two minutes, run `ps` — no git subprocesses are being spawned at all.
 4. `touch` a file in a worktree; the dirty count updates within one tick.
-5. Restart orchestr with no browser open, immediately `curl /api/state | python3 -c "..."` — sessions on an exhausted account already report `status: "limit"`.
+5. Restart orchestra with no browser open, immediately `curl /api/state | python3 -c "..."` — sessions on an exhausted account already report `status: "limit"`.
 6. The board feels instant.
 
 **Effort:** L (10–14 days)
@@ -228,16 +228,16 @@ None.
 
 ## Milestone 3 — Auth, TLS and pairing
 
-**Goal:** orchestr can safely listen on the tailnet, and a device proves who it is.
+**Goal:** orchestra can safely listen on the tailnet, and a device proves who it is.
 
 ### Backend
 
-- **Move mutable secret state out of the repo directory** to `~/Library/Application Support/orchestr/` (0700). `~/Downloads/orchestr` is commonly cloud-synced and Time-Machined, and it will hold a TLS private key.
+- **Move mutable secret state out of the repo directory** to `~/Library/Application Support/orchestra/` (0700). `~/Downloads/orchestra` is commonly cloud-synced and Time-Machined, and it will hold a TLS private key.
 - **Per-device bearer tokens.** `devices.json` storing only `sha256(token)`; `Authorization: Bearer`; loopback exempt so the desktop board is untouched. Scopes (`read` / `act` / `admin`) so a phone's background-readable token cannot dispatch.
 - **TLS.** `tailscale cert <magicdns>` + `ssl.SSLContext.wrap_socket` on the listener (~12 lines, stdlib). Dual-bind: loopback stays plain HTTP so `start.sh`'s hardcoded `http://127.0.0.1:$PORT` keeps working.
 - **`GET /api/hello`** — hostname, user, version, `capabilities[]`, and the config values the client needs to render honest empty states (`roots`, `pattern`, `session_window_h`, `exclude_accounts`, `reserve_percent`). `capabilities[]` is the version-skew mechanism; it replaces the hand-written *"the server predates auto-resume"* string in `index.html`.
 - **Pairing.** `./start.sh --pair` prints a short-lived (120 s, single-use) code plus the MagicDNS host and the cert fingerprint. **Ship manual entry first.** The ASCII/QR encoder is a realistic 250–400 lines of Reed-Solomon and mask selection — treat it as an optional add-on inside this milestone, not a prerequisite.
-- **Refuse to bind beyond loopback without a token**, as a hard `sys.exit`, not the current advisory stderr warning that `start.sh` redirects into `/tmp/orchestr.log` where nobody sees it.
+- **Refuse to bind beyond loopback without a token**, as a hard `sys.exit`, not the current advisory stderr warning that `start.sh` redirects into `/tmp/orchestra.log` where nobody sees it.
 
 ### iOS
 
@@ -250,7 +250,7 @@ None yet — but this is where you *could* write the 20-line URLSession probe fr
 3. `./start.sh --tailnet --token …` — `curl https://<magicdns>:4242/api/state` returns **401**; with `-H "Authorization: Bearer …"` returns **200**. No `-k` flag needed (the cert is publicly trusted).
 4. Mobile Safari on the iPhone, over Tailscale, loads `https://<magicdns>:4242/` with no certificate warning.
 5. `./start.sh --devices` lists paired devices; `--revoke <id>` takes effect within a second on the running server.
-6. Kill and restart orchestr — paired devices survive.
+6. Kill and restart orchestra — paired devices survive.
 
 **Effort:** M–L (8–12 days; L if the QR encoder is in scope)
 **Unblocks:** M4. Nothing may reach the phone before this.
@@ -280,7 +280,7 @@ groundwork; from here the value is visible on the device in your pocket.
 
 ### iOS
 
-- Xcode project + a local `OrchestrKit` package: `Core` (pure, nonisolated) / `API` (actor client) / `Store` (`@MainActor @Observable`) / `UI`. Zero third-party dependencies, matching the project's identity.
+- Xcode project + a local `OrchestraKit` package: `Core` (pure, nonisolated) / `API` (actor client) / `Store` (`@MainActor @Observable`) / `UI`. Zero third-party dependencies, matching the project's identity.
 - `Codable` for the whole payload, written against the **conditional-keys-are-absent-not-null** reality (`limit`, `handed_to`, `tool_running`, `bg_shell`, `closeout_sent`).
 - Pairing screen (manual host + code; camera QR if M3 shipped it), Keychain storage, `/api/hello` version gate.
 - **Board:** severity-sectioned list, status glyph + word + colour on every row, the triage headline, sessions inline with the desktop's exact line order.
@@ -369,7 +369,7 @@ groundwork; from here the value is visible on the device in your pocket.
 3. Send while the agent is mid-turn — the bubble says *queued*, not *failed*.
 4. Put the phone in airplane mode mid-send — the failure is explicit and the draft survives.
 5. Arm an auto-resume from the phone; watch it fire on the Mac at the stated time.
-6. Adjust a reserve percentage; confirm `orchestr.config.json` changed and the desktop limits page agrees.
+6. Adjust a reserve percentage; confirm `orchestra.config.json` changed and the desktop limits page agrees.
 
 **Effort:** L (9–13 days)
 **Unblocks:** M9's notification actions.
@@ -402,7 +402,7 @@ groundwork; from here the value is visible on the device in your pocket.
 1. Dispatch a mission from the phone; watch `①…⑤ ✓ launched` and then see the agent appear on the desktop board ~30 s later.
 2. Tap Launch twice in quick succession. **Exactly one agent exists.** Verify with `tmux -L fleet ls`.
 3. Finish a worktree with a live agent: the brief is typed, the button flips to `✕ close`, and pressing it early gives a refusal that explains what is unverified.
-4. Kill orchestr mid-finish and restart it. The phone reconciles to a definite answer rather than spinning.
+4. Kill orchestra mid-finish and restart it. The phone reconciles to a definite answer rather than spinning.
 5. Kill a mission from the phone; the tmux session is gone.
 6. Try to finish the same worktree from the phone and the desktop board simultaneously — the second gets a clear "already running" answer.
 
@@ -435,7 +435,7 @@ proves the whole event pipeline for free**, and only the last mile costs $99.
 
 ### Acceptance
 
-1. Install the ntfy app, subscribe to your topic. Close orchestr's app entirely. Lock the phone.
+1. Install the ntfy app, subscribe to your topic. Close orchestra's app entirely. Lock the phone.
 2. On the Mac, get an agent into `needs_input`. **The phone buzzes within ~15 s** with the worktree name and the question.
 3. Answer it at the Mac. No second notification arrives about the same episode.
 4. Trigger six things at once — you get one digest, not six buzzes.
@@ -557,14 +557,14 @@ trunk concurrently collides — and `/api/state` cannot tell you that).
 - Snapshot tests hosted in a real `UIWindow` (not `ImageRenderer`, which does not render `List` correctly and would produce stable, green, meaningless PNGs).
 - A contract artifact generated from the Python side and asserted from both suites, so a change to `scan_sessions` turns something red instead of breaking an app in the field.
 - Log rotation for `dispatch.log.jsonl` and the new ops/events logs (all currently append-only and unbounded).
-- `launchd` LaunchAgent with `KeepAlive` so orchestr survives a crash and a reboot. There is no service manager at all today.
+- `launchd` LaunchAgent with `KeepAlive` so orchestra survives a crash and a reboot. There is no service manager at all today.
 - Onboarding polish, empty states, the manual rendered natively.
 
 ### Acceptance
 
 1. Navigate the entire app with VoiceOver only, and complete a dispatch.
 2. Set text to the largest accessibility size — nothing is clipped or unreachable.
-3. Reboot the Mac; orchestr is running when you next check the phone.
+3. Reboot the Mac; orchestra is running when you next check the phone.
 4. Use the app in direct sunlight and be able to read it.
 
 **Effort:** M (6–10 days)
@@ -582,7 +582,7 @@ Each has a recommendation. **D1, D2 and D4 block M1.**
 | **D2** | **Realtime transport** | SSE · long-poll · WebSockets | **SSE, with the long-poll endpoint as a tested fallback.** SSE has been measured working under this project's exact `ThreadingHTTPServer` shape. WebSockets need ~150 lines of hand-rolled RFC 6455 for a one-directional channel. The long-poll fallback is not wasted work — it is also the tier-2 path when SSE proves unreliable on a relayed cellular route. |
 | **D3** | **When to spend the $99** | now · at M8 · at M9 | **At the start of M8.** M0's spike proves the mechanism with a fake key; M4–M8 all run on free personal provisioning. Buying at M8 means the App ID, capabilities and provisioning profile are ready when M9 starts, without a week of certificate archaeology blocking you. If cash-conscious, M9 is the true hard gate. |
 | **D4** | **iOS deployment target** | 18.0 · 26.0 | **26.0.** This is a single-operator tool on your own devices; you are on macOS 26.2 with Xcode 26.6. Targeting 26 costs nothing here and buys the bottom tab accessory (which fixes the unreachable-thumb-zone problem), Icon Composer, Control Center controls and `onScrollPhaseChange` ergonomics. Fall back to 18 only if your iPhone is not on 26 — **check this in M0**. |
-| **D5** | **Split `orchestr.py` into a package** | now · before M2 · after M7 · never | **Open, and the two documents disagree.** This roadmap says *after M7* — the split is a 20-file diff that relocates `resume.schedule.json` (silently losing every armed schedule) and must not be indistinguishable from a behavioural change. `ARCHITECTURE.md` §4.1/§8 says *before the collector and before auth* (its migration step 5a, gated on `git diff --stat` showing zero changed lines inside function bodies), on the grounds that landing ~1,740 new lines of auth, idempotency, bus and push into a single 2,300-line module puts the security boundary in the middle of a file that also holds AppleScript templates, with `py_compile` as the entire static-analysis budget. **Both are defensible and the choice is real:** deferring means M2 and M3 are written twice-over into a file you then split; splitting first means the riskiest mechanical change lands before any of the work that would justify it. If you split, do it as ARCHITECTURE's **two commits** (pure `git mv` + import rewiring, then everything else) and ship `paths.py`'s `migrate_stray_state()` in the same PR. |
+| **D5** | **Split `orchestra.py` into a package** | now · before M2 · after M7 · never | **Open, and the two documents disagree.** This roadmap says *after M7* — the split is a 20-file diff that relocates `resume.schedule.json` (silently losing every armed schedule) and must not be indistinguishable from a behavioural change. `ARCHITECTURE.md` §4.1/§8 says *before the collector and before auth* (its migration step 5a, gated on `git diff --stat` showing zero changed lines inside function bodies), on the grounds that landing ~1,740 new lines of auth, idempotency, bus and push into a single 2,300-line module puts the security boundary in the middle of a file that also holds AppleScript templates, with `py_compile` as the entire static-analysis budget. **Both are defensible and the choice is real:** deferring means M2 and M3 are written twice-over into a file you then split; splitting first means the riskiest mechanical change lands before any of the work that would justify it. If you split, do it as ARCHITECTURE's **two commits** (pure `git mv` + import rewiring, then everything else) and ship `paths.py`'s `migrate_stray_state()` in the same PR. |
 | **D6** | **Keep ntfy after APNs ships?** | keep · drop | **Keep.** It is ~30 lines behind an interface you are building anyway, it is the only path for anyone without a developer account, and it is a working fallback when your APNs key expires. |
 | **D7** | **Light theme** | dark-only · ship Daylight | **Ship Daylight**, but in M12. You need a light status palette regardless — notification banners, widgets and the Lock Screen render in the OS appearance and `.preferredColorScheme` does not reach them. Once those colours exist, a full light theme is nearly free via the Asset Catalog. |
 | **D8** | **Mac sleep policy** | do nothing · `caffeinate` · LaunchAgent + Energy Saver | **LaunchAgent with `KeepAlive`, plus documenting Energy Saver's "prevent sleeping when the display is off".** A closed lid stops the collector, the resume loop and every notification — and the app cannot tell you, because the thing that would tell you is asleep. This is a change to your machine's behaviour, so it is your call. |
@@ -599,7 +599,7 @@ between releases and the authoritative answer is what your Xcode says today.
 | Capability | Free personal team | Paid ($99/yr) | Needed by |
 |---|---|---|---|
 | Build & run on your own iPhone | ✅ — **7-day expiry**, re-sign weekly, max 3 apps per device | ✅ 1 year | M4 |
-| Custom URL scheme (`orchestr://`) | ✅ | ✅ | M4 |
+| Custom URL scheme (`orchestra://`) | ✅ | ✅ | M4 |
 | ntfy notifications | ✅ (Apple is not involved) | ✅ | M8 |
 | **Push Notifications (APNs)** | ❌ | ✅ | **M9** |
 | **Time Sensitive Notifications entitlement** | ❌ | ✅ | **M9** |
@@ -633,7 +633,7 @@ Named so nobody has to guess, and so the estimates above mean something.
 
 **Function**
 - Aggregating multiple Macs into one board (pair several, view one at a time)
-- Editing `orchestr.config.json` from the phone beyond the reserve percentage. That file is a code-execution sink (`cclimits_cmd` is executed; `resume_message` is typed at an agent) — treat write access to it as equivalent to shell access
+- Editing `orchestra.config.json` from the phone beyond the reserve percentage. That file is a code-execution sink (`cclimits_cmd` is executed; `resume_message` is typed at an agent) — treat write access to it as equivalent to shell access
 - A terminal emulator, or attaching to tmux from the phone
 - `⌖ focus` **as a primary affordance**. It is a GET with a side effect that opens a *new* Terminal window per call, and its payoff is on a screen you are not looking at. Demoted, not deleted: `API.md` §9.15 keeps it as `POST /api/v1/agents/{ag_id}/focus` (a POST, so nothing retries it) and `UX.md` §4.7/§7.2 surfaces it only in the Session Info sheet and the long-press *On studio-mac* submenu, rate-limited to one call per agent per 60 s and never retried. The **primary** action is "send the attach command to the Mac's clipboard" — which needs a server endpoint that `API.md` does not yet define (§0.2)
 - Git operations beyond `finish` — no branch creation, no manual merge, no conflict resolution

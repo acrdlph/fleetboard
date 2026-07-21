@@ -1,12 +1,12 @@
-# orchestr — backend & system architecture
+# orchestra — backend & system architecture
 
-**Status:** design, not yet built. This is the plan of record for evolving orchestr from a
+**Status:** design, not yet built. This is the plan of record for evolving orchestra from a
 loopback-only web board into a system that serves both that board and a native iOS client
-over a Tailscale tailnet, without losing what makes it orchestr.
+over a Tailscale tailnet, without losing what makes it orchestra.
 
 Every number tagged **[M]** was measured on the author's machine against the live fleet
 (9 worktrees / 33 sessions / 8 Claude homes / 697 transcripts / 1.10 GB). Numbers tagged
-**[E]** are estimates and are labelled as such. Line references are `orchestr.py` at the
+**[E]** are estimates and are labelled as such. Line references are `orchestra.py` at the
 commit this document was written against (2302 lines).
 
 > **Path prefix: this document says `/api/v2/…`; the shipping contract is `/api/v1/…`.**
@@ -100,7 +100,7 @@ gets the read side. Both are live vulnerabilities independent of any mobile work
 ### 2.2 The collector only runs when someone asks, and it costs a fortune when they do
 
 `collect_state()` is reachable only through `cached_state()`, which is called only by the
-`/api/state` handler, `_pick_defaults`, and `fire_resume`. **Close the browser and orchestr
+`/api/state` handler, `_pick_defaults`, and `fire_resume`. **Close the browser and orchestra
 computes nothing.** There is nothing to diff, so there is nothing to notify about — a
 background collector is the precondition for push, not an optimisation.
 
@@ -283,7 +283,7 @@ A stale board that still looks alive is the failure to design against.
 The README's claim is *"an agent harness with zero dependencies — one python3 stdlib file."*
 Two clauses, and they are not equally load-bearing.
 
-**The clause that matters is `git clone && python3 orchestr.py`** — no pip, no venv, no wheel,
+**The clause that matters is `git clone && python3 orchestra.py`** — no pip, no venv, no wheel,
 no build step. A directory of `.py` files preserves every bit of that. **The clause that costs
 is "one file."** What it buys beyond the above is `curl | python3`, which nothing in the repo,
 the README, or `start.sh` uses. What it costs, once this design lands (+~1,100 lines of auth,
@@ -291,11 +291,11 @@ idempotency, snapshots, ops, routing, gzip, push), is a 3,400-line module where 
 boundary is a paragraph in the middle of a file that also holds AppleScript templates — with
 no linter and no type checker in CI (`py_compile` is the entire static-analysis budget).
 
-**Decision: split into a stdlib-only package `orchestr/`, keep `orchestr.py` as a 25-line
+**Decision: split into a stdlib-only package `orchestra/`, keep `orchestra.py` as a 25-line
 launcher shim so `./start.sh` and every existing invocation still work. Restate the promise
 precisely, and enforce it mechanically:**
 
-> **orchestr installs nothing. It imports only the Python standard library, and it shells out
+> **orchestra installs nothing. It imports only the Python standard library, and it shells out
 > only to binaries the host already has.**
 
 The second clause is not new — `git`, `tmux`, `ps`, `lsof`, `osascript`, `open` and `cclimits`
@@ -313,8 +313,8 @@ clause. It is the trade the user asked to be made consciously rather than discov
 ### 4.1 File tree
 
 ```
-orchestr.py              25-line shim: sys.path insert + orchestr.cli.main()
-orchestr/
+orchestra.py              25-line shim: sys.path insert + orchestra.cli.main()
+orchestra/
   __init__.py            __version__, API_VERSION — nothing executable
   __main__.py            main()
   paths.py               ROOT, STATE_DIR, every path, migrate_stray_state()   [NEW]
@@ -349,7 +349,7 @@ orchestr/
 ### 4.2 Where state lives — and the bug the move would otherwise introduce
 
 `HERE = Path(__file__).resolve().parent` (L41) drives `RESUME_STATE` and `DISPATCH_LOG`.
-Moving those constants into `orchestr/resume.py` makes `HERE` the *package* dir. On first
+Moving those constants into `orchestra/resume.py` makes `HERE` the *package* dir. On first
 upgrade `load_resumes()` finds nothing, swallows the error (`except (OSError, ValueError)`),
 and **every armed auto-resume silently vanishes.** The live file today holds two `pending`
 schedules armed hours out [M]. Config survives only by the accident that `load_config` falls
@@ -360,11 +360,11 @@ runtime state:
 
 ```python
 ROOT      = Path(__file__).resolve().parent.parent      # repo root, NOT the package dir
-STATE_DIR = Path(os.environ.get("ORCHESTR_STATE_DIR") or
-                 Path.home() / "Library" / "Application Support" / "orchestr")
+STATE_DIR = Path(os.environ.get("ORCHESTRA_STATE_DIR") or
+                 Path.home() / "Library" / "Application Support" / "orchestra")
 
 # repo root — non-secret, user-visible, already gitignored
-CONFIG       = ROOT / "orchestr.config.json"
+CONFIG       = ROOT / "orchestra.config.json"
 RESUME       = ROOT / "resume.schedule.json"
 DISPATCH_LOG = ROOT / "dispatch.log.jsonl"
 OPS_LOG      = ROOT / "ops.jsonl"
@@ -383,7 +383,7 @@ def migrate_stray_state():
     landed beside the code is moved back to ROOT, loudly."""
 ```
 
-Secrets leave `~/Downloads/orchestr` because that directory is commonly Dropbox/iCloud-synced
+Secrets leave `~/Downloads/orchestra` because that directory is commonly Dropbox/iCloud-synced
 and Time-Machined. The registry being hash-only makes its leak survivable; **the TLS private
 key is not hash-only** — with it an attacker stands up a listener presenting the pinned SPKI,
 the phone's pinning delegate accepts it by construction, and the next dispatch delivers the
@@ -537,7 +537,7 @@ from .proc import run             # NO — breaks every mock in the suite
 The route table is late-bound (`getattr(sys.modules[__name__], name)`) for the same reason.
 Two enforcement tests ship with the split:
 
-- **`TestZeroDeps`** — walks every AST in `orchestr/` and `tests/`: imports must be in
+- **`TestZeroDeps`** — walks every AST in `orchestra/` and `tests/`: imports must be in
   `sys.stdlib_module_names`; dynamic `import_module`/`__import__` with a non-constant argument
   fails the test; and every literal `argv[0]` handed to `run()` must be in a declared binary
   allowlist. The previous formulation checked imports only, which would have passed while the
@@ -716,7 +716,7 @@ same key and every paired phone keeps working.
 **The tailnet listener is a supervised background thread, not a boot gate.** `BackendState` is
 `"Stopped"` on the author's own machine right now [M], and Tailscale also stops routinely after
 sleep, network changes and re-auth. A `sys.exit` there kills the local board for a reason
-`start.sh` buries in `/tmp/orchestr.log`. The supervisor retries with backoff and reports state
+`start.sh` buries in `/tmp/orchestra.log`. The supervisor retries with backoff and reports state
 via `/api/health`; loopback binds unconditionally and first.
 
 ### 5.5 Pairing
@@ -813,7 +813,7 @@ cleanest-free worktree (the new agent takes ~30 s to register as busy), and tmux
 worktrees from the free list, and the resolved `worktree_id` is in the 202 response.
 
 The tmux buffer hazard is subtle and severe: `deliver_text` uses one global buffer name
-(`orchestr-kickoff`), while per-agent locks explicitly permit concurrent sends to *different*
+(`orchestra-kickoff`), while per-agent locks explicitly permit concurrent sends to *different*
 agents. A sets, B overwrites, A pastes B's instruction into an agent running
 `--dangerously-skip-permissions`.
 
@@ -1008,7 +1008,7 @@ count silently changes meaning with cadence, and would be slowest exactly when n
 watching.
 
 **`blocked` must be session-scoped.** `skip_perms` is computed per *worktree* across all its
-processes (L685), so the rule is inert for orchestr-dispatched worktrees (every launch path
+processes (L685), so the rule is inert for orchestra-dispatched worktrees (every launch path
 passes `--dangerously-skip-permissions`) and, inversely, one manually-attached `claude` without
 the flag flips **every** pending-tool session in that worktree to `blocked` at once — a
 multi-session P1 burst from an unrelated process that dwell cannot damp. A per-session
@@ -1033,7 +1033,7 @@ reads a cache it never fills (L733–736), so **`status == "limit"` never appear
 `/api/limits` has been called**. So the fetch is load-bearing. But calling it every tick is
 worse than useless:
 
-- Orchestr's TTL is 300 s and cclimits' own is 60 s, so every miss is a **real network refetch
+- Orchestra's TTL is 300 s and cclimits' own is 60 s, so every miss is a **real network refetch
   of all 8 accounts** against a rate-limited endpoint — ~2,300 authenticated GETs/day with
   nobody watching. The feature named after limits would begin by hammering the limits endpoint.
 - `cclimits` **renews expired OAuth logins in place by default**, so a background loop would
@@ -1245,7 +1245,7 @@ dynamically by the client via `hb`.
 background process with its own keepalives, and on carrier CGNAT a direct path to a Mac behind
 residential NAT frequently fails, so Tailscale falls back to **DERP** — a persistent TLS relay,
 100–300 ms per RTT instead of 60–120. The user will see *Tailscale* in the iOS battery list, not
-orchestr. Two supported modes: always-on (the NSE can enrich notification bodies) and
+orchestra. Two supported modes: always-on (the NSE can enrich notification bodies) and
 on-demand scoped to the app (lower battery; the NSE cannot reach the Mac, which is why the
 counts travel **in** the APNs payload rather than behind an NSE fetch).
 
@@ -1462,7 +1462,7 @@ it, or accept a 3,400-line module with the security boundary in the middle.
   raw IP, and gives a server identity independent of the coordination server. Costs a trust
   delegate, a pin-rotation story, and the verified LibreSSL explicit-curve trap.
 - **(c) `tailscale serve --bg --https=443 http://127.0.0.1:4242`** — real Let's Encrypt TLS,
-  orchestr never binds beyond loopback, Tailscale injects identity headers. **Mutually
+  orchestra never binds beyond loopback, Tailscale injects identity headers. **Mutually
   exclusive with the `Host` allowlist as written**: a `serve`-proxied request arrives with
   `Host: <node>.ts.net` and is 403'd on purpose, and allowlisting it means also switching
   `board_auth` to `nonce` or you publish the admin token to the tailnet.
