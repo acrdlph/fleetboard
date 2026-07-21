@@ -174,6 +174,42 @@ class TestClassifySession(unittest.TestCase):
         self.assertEqual(st, "needs_input")
 
 
+class TestCloseoutStep(unittest.TestCase):
+    """Step two (✕ close) when the landing won't verify — the pure decision
+    that breaks the idle-agent / refusing-forever deadlock. One assertion per
+    row of the table, plus the 60s boundary exactly at and just under."""
+
+    def test_any_working_refuses_even_if_paired_is_idle(self):
+        # a working session may be mid-closeout — never type over it, no matter
+        # how the paired session looks or how long ago the brief went out
+        self.assertEqual(
+            fb.closeout_step("waiting", True, sent=0, now=10_000), "refuse")
+
+    def test_stuck_agent_is_sent_to_chat_not_nudged(self):
+        # a nudge typed here would collide with the open question/approval dialog
+        self.assertEqual(
+            fb.closeout_step("needs_input", False, sent=0, now=10_000), "chat")
+        self.assertEqual(
+            fb.closeout_step("blocked", False, sent=0, now=10_000), "chat")
+
+    def test_idle_waiting_past_the_guard_gets_nudged(self):
+        self.assertEqual(
+            fb.closeout_step("waiting", False, sent=0, now=61), "nudge")
+
+    def test_nudge_fires_exactly_at_the_60s_boundary(self):
+        self.assertEqual(
+            fb.closeout_step("waiting", False, sent=0, now=60), "nudge")
+
+    def test_just_under_60s_refuses_the_double_type(self):
+        self.assertEqual(
+            fb.closeout_step("waiting", False, sent=0, now=59.9), "refuse")
+
+    def test_scan_miss_never_types_blind(self):
+        # no session paired with the live pid -> paired_status is None
+        self.assertEqual(
+            fb.closeout_step(None, False, sent=0, now=10_000), "refuse")
+
+
 class TestShellChildren(unittest.TestCase):
     """Attribute Bash-tool wrapper shells to their claude ancestor."""
 
@@ -605,7 +641,8 @@ class TestStartFinish(ConfigGuard):
         fb._closeouts.clear()
         self._saved = {n: getattr(fb, n) for n in
                        ("run", "discover_worktrees", "claude_processes",
-                        "send_to_process", "_base_ref", "start_dispatch")}
+                        "send_to_process", "_base_ref", "start_dispatch",
+                        "scan_sessions")}
         fb.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb._base_ref = lambda root: "origin/main"
@@ -623,8 +660,11 @@ class TestStartFinish(ConfigGuard):
         super().tearDown()
 
     def live(self):
+        # a realistic proc: real claude_processes() always carries "cmd", which
+        # scan_sessions reads when start_finish classifies the live session
         fb.claude_processes = lambda: [
-            {"pid": 1, "cwd": "/w/wt", "tmux_target": "s:0"}]
+            {"pid": 1, "cwd": "/w/wt", "tmux_target": "s:0",
+             "cmd": "claude --dangerously-skip-permissions"}]
 
     def finish(self, **git):
         fb.run = self.git = FakeGit(**git)
@@ -675,6 +715,80 @@ class TestStartFinish(ConfigGuard):
         out = self.finish(landed=True, porcelain=" M src/app.py\n?? tmp\n")
         self.assertEqual(out["mode"], "pending")
         self.assertIn("2 leftover file(s)", out["message"])
+
+    def test_close_nudges_a_stalled_idle_agent(self):
+        # the real deadlock: agent idle ('waiting'), one dirty file it won't
+        # touch, no other session live — ✕ close types the specifics at it
+        # instead of refusing forever
+        import time as _t
+        self.live()
+        fb.scan_sessions = lambda wts, procs, now: {
+            "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
+        self.finish(landed=True, porcelain=" M keep.py\n")   # arms _closeouts
+        fb._closeouts["wt"] = _t.time() - 120                 # briefed 2m ago
+        before = fb._closeouts["wt"]
+        out = self.finish(landed=True, porcelain=" M keep.py\n")
+        self.assertEqual(out["mode"], "nudge")
+        self.assertTrue(out["ok"])
+        self.assertIn("keep.py", self.sent[-1])               # specifics typed
+        self.assertIn("1 leftover file(s)", self.sent[-1])
+        self.assertGreater(fb._closeouts["wt"], before)       # clock restarted
+
+    def test_nudge_lists_porcelain_and_truncates_past_five(self):
+        import time as _t
+        self.live()
+        fb.scan_sessions = lambda wts, procs, now: {
+            "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
+        porc = "".join(f"?? f{i}.tmp\n" for i in range(7))
+        self.finish(landed=True, porcelain=porc)
+        fb._closeouts["wt"] = _t.time() - 120
+        out = self.finish(landed=True, porcelain=porc)
+        self.assertEqual(out["mode"], "nudge")
+        nudged = self.sent[-1]
+        self.assertIn("?? f0.tmp", nudged)
+        self.assertIn("?? f4.tmp", nudged)                    # 5th shown
+        self.assertNotIn("?? f5.tmp", nudged)                 # 6th truncated
+        self.assertIn("… and 2 more", nudged)
+
+    def test_close_sends_you_to_chat_when_the_agent_is_stuck(self):
+        # a nudge would collide with the open question dialog — refuse to chat
+        import time as _t
+        self.live()
+        fb.scan_sessions = lambda wts, procs, now: {
+            "/w/wt": [{"sid": "s1", "pid": 1, "status": "needs_input"}]}
+        self.finish(landed=False)
+        fb._closeouts["wt"] = _t.time() - 120                 # past the guard
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "chat")
+        self.assertFalse(out["ok"])
+        self.assertIn("chat", out["message"])
+        self.assertEqual(out["left"], "branch not landed on origin/main")
+        self.assertEqual(len(self.sent), 1)                   # no nudge typed
+
+    def test_working_session_refuses_close_even_past_the_guard(self):
+        # the agent may be mid-closeout — refuse regardless of the clock
+        import time as _t
+        self.live()
+        fb.scan_sessions = lambda wts, procs, now: {
+            "/w/wt": [{"sid": "s1", "pid": 1, "status": "working"}]}
+        self.finish(landed=False)
+        fb._closeouts["wt"] = _t.time() - 120
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "pending")
+        self.assertEqual(len(self.sent), 1)                   # brief only
+
+    def test_pending_refusal_carries_structured_fields(self):
+        # under the 60s guard: refuse, but the frontend gets left/files/sent
+        self.live()
+        fb.scan_sessions = lambda wts, procs, now: {
+            "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
+        self.finish(landed=True, porcelain=" M a.py\n?? b\n")  # sent = now
+        out = self.finish(landed=True, porcelain=" M a.py\n?? b\n")
+        self.assertEqual(out["mode"], "pending")
+        self.assertEqual(out["left"], "2 leftover file(s)")
+        self.assertEqual(out["files"], [" M a.py", "?? b"])
+        self.assertIn("sent", out)
+        self.assertEqual(len(self.sent), 1)                   # no nudge yet
 
     def test_close_exits_once_the_landing_verifies(self):
         self.live()

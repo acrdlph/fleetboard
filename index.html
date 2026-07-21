@@ -308,6 +308,7 @@ header .wrap { max-width:none; }
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 .wsaid::before { content:"⚙ "; color:var(--green); }
 .pending { color:var(--yellow); font-size:var(--fs-xs); margin-top:3px; }
+.pending.closeout { margin:4px 0 3px; }   /* closeout note sits between card-head and gitline */
 .hand { color:var(--green); font-size:var(--fs-xs); margin-top:3px; }
 .none { color:var(--muted-2); font-size:var(--fs-sm); padding:2px 6px 6px; }
 
@@ -486,6 +487,23 @@ function render(st) {
       </div>`;
     }).join("");
     const finArmed = window._armFinish && window._armFinish.wt === w.name && Date.now() < window._armFinish.until;
+    // closeout in flight → a persistent note between card-head and gitline. It
+    // survives a page reload (closeout_sent + git.dirty come from the state
+    // payload); the FIN_PENDING part is client-only and adds the refusal reason.
+    let note = "";
+    if (w.closeout_sent) {
+      const fin = FIN_PENDING[w.name];
+      let body = `⧗ closeout pending — brief sent ${rel(Math.max(0, Math.floor(now - w.closeout_sent)))} ago`;
+      if (g.dirty) body += ` · Δ${g.dirty} uncommitted`;
+      if (fin) body += ` · blocked: ${esc(fin.left)}`;
+      const ttl = (fin && fin.files && fin.files.length) ? ` title="${esc(fin.files.join("\n"))}"` : "";
+      note = `<div class="pending closeout"${ttl}>${body}</div>`;
+    } else {
+      // no closeout_sent on this render clears the entry — a clean close, the
+      // terminal dying on its own, or a fresh mission. Here so a refactor of the
+      // card-content path can't silently drop it.
+      delete FIN_PENDING[w.name];
+    }
     return `<div class="card-head">
         <span class="badge ${w.availability}">${AVAIL[w.availability]}</span>
         <span class="name">${esc(w.name)}</span>
@@ -503,6 +521,7 @@ function render(st) {
             w.closeout_sent ? (finArmed ? "✕ confirm" : "✕ close")
                             : (finArmed ? "✓ confirm" : "✓ finish")}</button></span>
       </div>
+      ${note}
       <div class="gitline"><span class="branch">${esc(g.branch || "?")}</span>${dirty}${sync}</div>
       <div class="commit" title="${esc(g.commit ? g.commit.subject : "")}">${commit}</div>
       <div class="sessions">${rows || `<div class="none">${w.sessions.length ? w.sessions.length + " ended session(s) hidden" : "no recent sessions"}</div>`}</div>`;
@@ -719,6 +738,11 @@ async function sendChat() {
   toast((res.ok ? "✓ " : "✗ ") + res.message);
 }
 
+// registry of worktrees whose ✕ close was refused (mode:"pending") or nudged
+// (mode:"nudge"): name → {left, files, at}. Feeds the persistent card note so a
+// refused close isn't only a 6s toast. Cleared in render() when closeout_sent drops.
+const FIN_PENDING = {};
+
 // ---- finish: one button hands closeout to an agent -------------------------
 document.addEventListener("click", async (ev) => {
   const b = ev.target.closest ? ev.target.closest(".finish") : null;
@@ -742,6 +766,13 @@ document.addEventListener("click", async (ev) => {
       body: JSON.stringify({ worktree: wt }) });
     const d = await r.json();
     toast((d.ok ? "✓ " : "✗ ") + d.message);
+    // a refused close (pending), an agent stuck on its own dialog (chat), or a
+    // just-sent leftover list (nudge) all mean the blockage is real; remember
+    // why so the card can say so until it clears
+    if (d.mode === "pending" || d.mode === "chat" || d.mode === "nudge") {
+      FIN_PENDING[wt] = { left: d.left || d.message, files: d.files || [], at: Date.now() };
+      if (lastState) render(lastState);   // show the note now, not on the next tick
+    }
     if (d.job) pollFinishJob(d.job);
   } catch (e) { toast("✗ finish request failed"); }
   tick();   // the server drops its state cache on finish — pick up ✓→✕ now
