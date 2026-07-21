@@ -1069,8 +1069,8 @@ class TestFireResume(ResumeGuard):
 
     def setUp(self):
         super().setUp()
-        self._saved = {n: getattr(fb, n) for n in
-                       ("cached_state", "_tmux_resume")}
+        self._saved = {n: getattr(fb, n) for n in ("_tmux_resume",)}
+        self._saved_state = fb.observer.cached_state
         self._saved_git = {"discover_worktrees": fb.gitrepo.discover_worktrees}
         self._saved_homes = fb.transcripts.claude_homes
         self._saved_lau = fb.limits._limit_active_until
@@ -1091,6 +1091,7 @@ class TestFireResume(ResumeGuard):
             setattr(fb, n, f)
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
+        fb.observer.cached_state = self._saved_state
         fb.transcripts.claude_homes = self._saved_homes
         fb.limits._limit_active_until = self._saved_lau
         fb.terminal.send_to_process = self._saved_send
@@ -1103,7 +1104,7 @@ class TestFireResume(ResumeGuard):
         procs = [{"pid": pid, "reachable": reachable}] if pid else []
         if loose_pid:   # someone ELSE's live terminal in the same worktree
             procs.append({"pid": loose_pid, "reachable": True})
-        fb.cached_state = lambda: {"worktrees": [
+        fb.observer.cached_state = lambda: {"worktrees": [
             {"name": "wt", "sessions": [sess] if present else [],
              "live_procs": procs}]}
 
