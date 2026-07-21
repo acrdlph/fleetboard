@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>orchestr — guide</title>
+<title>orchestra — guide</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2224%22 fill=%22%230d0d0d%22/><text x=%2250%22 y=%2272%22 font-size=%2260%22 text-anchor=%22middle%22 fill=%22%23d97757%22 font-family=%22monospace%22>⌁</text></svg>" />
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
 <style>
@@ -115,7 +115,7 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
 </head>
 <body>
 <header><div class="wrap nav">
-  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./orchestr --help</div>
+  <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./orchestra --help</div>
   <a id="missionBtn" href="/?mission">🚀 new mission</a>
 </div></header>
 
@@ -128,7 +128,7 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
 
 <div class="wrap content"><div class="doc">
   <h1>⌁ running a fleet — the runbook</h1>
-  <p class="lede">orchestr is an agent harness with a hard line down the
+  <p class="lede">orchestra is an agent harness with a hard line down the
   middle: <b>watching only reads</b> (transcripts, processes, git) and never
   touches your sessions; <b>acting</b> (chat, resume, dispatch, finish) only
   happens on an explicit click, and always by talking to a terminal. This
@@ -204,7 +204,7 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
   <h2><span class="g">§4</span> closing out a mission</h2>
   <p>One button: <b>✓ finish</b> — on every worktree card, and in a map node's
   panel (click the node). It arms on the first click and runs on the second,
-  so a stray click does nothing. Like every orchestr action, it works by
+  so a stray click does nothing. Like every orchestra action, it works by
   talking to a terminal:</p>
   <ul>
     <li><b>agent alive</b> → it receives the closeout brief: land the branch
@@ -224,7 +224,7 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
       (failure escalates past haiku) and parks as <i>needs you</i>, so a
       failed closeout never reads as free.</li>
     <li><b>terminal gone, branch already landed, worktree clean</b> → no
-      agent at all: orchestr switches the worktree back to the trunk and
+      agent at all: orchestra switches the worktree back to the trunk and
       pulls itself — two git commands don't need an agent. Leftover files,
       even scratch, still go to an agent: droppable is a judgment call.</li>
     <li><b>everything landed, agent idle</b> → <kbd>/exit</kbd> is typed and

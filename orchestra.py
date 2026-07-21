@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""orchestr — local mission control for parallel Claude Code agents.
+"""orchestra — local mission control for parallel Claude Code agents.
 
 Watches your git worktrees, your Claude Code home directories (multi-account
 setups included), and live `claude` processes; serves three views on
@@ -17,10 +17,10 @@ the branch has already landed, finish skips the agent: it parks the worktree
 back on the trunk itself (switch + pull — the one provably-safe case where
 the board runs git write commands). Zero dependencies — python3 stdlib only.
 
-    python3 orchestr.py --root ~/code
-    python3 orchestr.py --demo          # fictional data, for screenshots
+    python3 orchestra.py --root ~/code
+    python3 orchestra.py --demo          # fictional data, for screenshots
 
-Configuration precedence: CLI flags > orchestr.config.json (next to this
+Configuration precedence: CLI flags > orchestra.config.json (next to this
 script, else cwd) > defaults. See README.md.
 """
 
@@ -71,28 +71,28 @@ def load_config(argv=None):
     ap.add_argument("--pattern", metavar="REGEX", help="only watch dirs matching this regex (case-insensitive)")
     ap.add_argument("--home", action="append", metavar="DIR",
                     help="Claude home dir (repeatable; default: auto-discover ~/.claude*)")
-    ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTR_PORT)")
+    ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTRA_PORT)")
     ap.add_argument("--host", help="bind address (default 127.0.0.1 — the board serves your transcript text; do not expose it)")
     ap.add_argument("--window-h", type=float, help="ignore transcripts idle longer than this many hours (default 48)")
-    ap.add_argument("--config", metavar="FILE", help="path to a orchestr.config.json")
+    ap.add_argument("--config", metavar="FILE", help="path to a orchestra.config.json")
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)
 
     global CONFIG_PATH
     candidates = [Path(args.config)] if args.config else [
-        HERE / "orchestr.config.json", Path.cwd() / "orchestr.config.json"]
+        HERE / "orchestra.config.json", Path.cwd() / "orchestra.config.json"]
     for p in candidates:
         if p.is_file():
             try:
                 CFG.update(json.loads(p.read_text()))
             except (ValueError, OSError) as e:
-                sys.exit(f"orchestr: bad config {p}: {e}")
+                sys.exit(f"orchestra: bad config {p}: {e}")
             CONFIG_PATH = p
             break
     if CONFIG_PATH is None:  # where a UI edit will create/persist config
-        CONFIG_PATH = Path(args.config) if args.config else HERE / "orchestr.config.json"
-    if os.environ.get("ORCHESTR_PORT"):
-        CFG["port"] = int(os.environ["ORCHESTR_PORT"])
+        CONFIG_PATH = Path(args.config) if args.config else HERE / "orchestra.config.json"
+    if os.environ.get("ORCHESTRA_PORT"):
+        CFG["port"] = int(os.environ["ORCHESTRA_PORT"])
     if args.root: CFG["roots"] = args.root
     if args.pattern is not None: CFG["pattern"] = args.pattern
     if args.home: CFG["homes"] = args.home
@@ -611,6 +611,35 @@ def classify_session(age_s, alive, pending_tools, delegated,
     return "waiting", False
 
 
+def closeout_step(paired_status, any_working, sent, now, nudge_after_s=60):
+    """Step two of ✓ finish (✕ close) when the landing won't verify: decide,
+    from THIS worktree's live session, whether to refuse, send the user to
+    ✉ chat, or type one nudge at the idle agent. Pure (no subprocess/tmux) so
+    the whole table is unit-testable.
+
+    The deadlock this breaks: an agent finished its closeout but left one dirty
+    file it judged "another session's in-flight work" — and no other session
+    was live, so nothing would ever converge. ✕ close refused forever while the
+    agent idled forever. A nudge that names the leftovers and says they are
+    this agent's to judge is the only exit.
+
+    Ordering is the point. Any working session (it might be mid-closeout)
+    refuses before anything else, so we never type over live work. A stuck
+    agent goes to chat rather than get a nudge typed across its open dialog.
+    Only a plainly idle ('waiting') agent, briefed at least nudge_after_s ago
+    (the anti-double-type guard against rapid clicks), gets nudged. A scan that
+    couldn't pair any session with the live pid returns None here and we refuse
+    — never type into a terminal we can't classify.
+    """
+    if any_working:
+        return "refuse"
+    if paired_status in ("needs_input", "blocked"):
+        return "chat"
+    if paired_status == "waiting":
+        return "nudge" if now - sent >= nudge_after_s else "refuse"
+    return "refuse"
+
+
 def scan_sessions(worktrees, procs, now):
     """All recent sessions across every Claude home, mapped to worktrees."""
     by_wt = {w["path"]: [] for w in worktrees}
@@ -1077,7 +1106,7 @@ def cached_limits(refresh=False):
         if acc.get("config_dir"):
             label = account_label(Path(acc["config_dir"]))
             r = account_reserve(label)
-            acc["fb_label"] = label   # orchestr's label (cclimits slug may differ)
+            acc["fb_label"] = label   # orchestra's label (cclimits slug may differ)
             acc["reserve_percent"] = r
             acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
     _limits["data"], _limits["t"] = data, now
@@ -1429,6 +1458,23 @@ SLIM_CLOSEOUT_TEXT = (
     "4) reply with one line saying what, if anything, was left to do."
 )
 
+# Follow-up typed at a live agent when step two (✕ close) still can't verify a
+# clean landing AND nothing else is working in this worktree — so the leftover
+# files are this agent's call, not "another session's in-flight work" it can
+# quietly ignore. That misjudgment is the exact deadlock this breaks: without
+# the nudge the agent idles forever and ✕ close refuses forever, because no
+# other session exists to ever converge the tree. {files} is up to five raw
+# `git status --porcelain` lines (blank when the branch simply hasn't landed).
+CLOSEOUT_NUDGE_TEXT = (
+    "Step two of the closeout still can't verify a clean landing: {left}. "
+    "{files}"
+    "No other session is working in this worktree, so these files are yours to "
+    "judge — none of them is another session's in-flight work. Commit and land "
+    "anything meaningful, drop scratch, and leave the tree clean on {trunk}. If "
+    "any of it genuinely needs the user's decision, stop and ask explicitly — "
+    "don't just leave it dirty."
+)
+
 # worktree name -> epoch seconds when a closeout brief was typed at its live
 # agent. Step two of ✓ finish: while this is set (and the terminal lives) the
 # board shows ✕ close instead — which only verifies the landing and /exits;
@@ -1511,14 +1557,59 @@ def start_finish(wt_name):
                     if res["ok"] else res["message"]}
         sent = _closeouts.get(wt_name)
         if sent:
-            # step two (✕ close) — but the landing doesn't verify yet. Closing
-            # now would be a guess, and re-typing the brief would interrupt an
-            # agent that may be mid-closeout: report instead of acting.
+            # step two (✕ close), but the landing still doesn't verify. What to
+            # do isn't a fixed refusal — it depends on THIS worktree's live
+            # session. The observed deadlock: the agent finished its closeout
+            # but left one dirty file it took for another session's in-flight
+            # work; nothing else was live, so ✕ close refused forever while the
+            # agent idled forever. classify the session and nudge it out of that.
             left = (f"{len(porcelain)} leftover file(s)" if landed
                     else f"branch not landed on {trunk}")
-            mins = int((time.time() - sent) // 60)
+            files = porcelain[:5]          # ≤5 raw lines, for the agent + UI
+            now = time.time()
+            sessions = scan_sessions([wt], mine, now).get(path, [])
+            paired = next((s for s in sessions
+                           if s.get("pid") == live["pid"]), None)
+            any_working = any(s.get("status") == "working" for s in sessions)
+            step = closeout_step(paired["status"] if paired else None,
+                                 any_working, sent, now)
+            if step == "nudge":
+                # idle agent, nothing else working, briefed ≥60s ago: type the
+                # specifics so it stops treating the leftovers as untouchable.
+                block = "\n".join(files)
+                if len(porcelain) > len(files):
+                    block += f"\n… and {len(porcelain) - len(files)} more"
+                nudge = CLOSEOUT_NUDGE_TEXT.format(
+                    left=left, trunk=trunk, files=(block + "\n") if block else "")
+                res = send_to_process(live["pid"], nudge)
+                if not res["ok"]:
+                    return {"ok": False, "mode": "nudge", "message": res["message"]}
+                _closeouts[wt_name] = time.time()   # restart the "sent Xm ago"
+                _cache["t"] = 0.0                    # clock + re-arm the 60s guard
+                # `left`/`files` ride along so the card note can say what's
+                # blocked without parsing the human message
+                return {"ok": True, "mode": "nudge", "left": left,
+                        **({"files": files} if files else {}), "message":
+                        f"closeout had stalled — sent the agent the specifics "
+                        f"({left}); ✕ close works once it reports clean"}
+            # otherwise refuse, but hand the frontend the specifics too: `left`
+            # (short reason), `files` (≤5 porcelain lines, only when any), and
+            # `sent` (the epoch it was briefed). mode "pending" is a plain
+            # refusal; mode "chat" is a DISTINCT mode meaning the agent is stuck
+            # on a question/approval — a typed nudge would collide with its open
+            # dialog, so the frontend must route the user to ✉ chat instead.
+            extra = {"left": left, "sent": sent}
+            if files:
+                extra["files"] = files
+            if step == "chat":
+                return {"ok": False, "mode": "chat", **extra, "message":
+                        f"can't close yet — {left}, and the agent is stuck on a "
+                        "question or approval. Answer it in ✉ chat — a typed "
+                        "nudge would collide with its open dialog. ✕ close works "
+                        "once the landing verifies."}
+            mins = int((now - sent) // 60)
             ago = f"{mins}m ago" if mins else "under a minute ago"
-            return {"ok": False, "mode": "pending", "message":
+            return {"ok": False, "mode": "pending", **extra, "message":
                     f"can't close yet — {left}. The closeout brief went to "
                     f"the agent {ago}; if it looks stuck, ✉ chat with it. "
                     "✕ close works once the landing verifies."}
@@ -1743,9 +1834,9 @@ def deliver_text(name, text):
     until the send is proven (see kickoff_sent). Pasting atomically (bracketed,
     via a tmux buffer) sidesteps the CLI's paste heuristic, which chops a rapid
     send-keys burst into '[Pasted text #N]' chips that swallow the Enter."""
-    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestr-kickoff", text])
+    run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestra-kickoff", text])
     run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
-         "-b", "orchestr-kickoff", "-t", name])
+         "-b", "orchestra-kickoff", "-t", name])
     time.sleep(1)
     for _ in range(3):
         run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
@@ -2320,14 +2411,14 @@ if __name__ == "__main__":
     args = load_config()
     DEMO = args.demo
     if CFG["host"] not in ("127.0.0.1", "localhost", "::1"):
-        print("orchestr: WARNING — binding beyond loopback serves your "
+        print("orchestra: WARNING — binding beyond loopback serves your "
               "transcript text to the network", file=sys.stderr)
     if not DEMO:
         load_resumes()
         threading.Thread(target=resume_loop, daemon=True).start()
     server = ThreadingHTTPServer((CFG["host"], CFG["port"]), Handler)
     mode = " (demo data)" if DEMO else ""
-    print(f"orchestr up → http://{CFG['host']}:{CFG['port']}{mode}")
+    print(f"orchestra up → http://{CFG['host']}:{CFG['port']}{mode}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
