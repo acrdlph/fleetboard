@@ -10,8 +10,7 @@ import sys
 import threading
 from http.server import ThreadingHTTPServer
 
-import orchestra as app
-from orchestra import config, resume
+from orchestra import config, resume, server
 
 
 def main():
@@ -24,7 +23,7 @@ def main():
         resume.load_resumes()
         threading.Thread(target=resume.resume_loop, daemon=True).start()
     httpd = ThreadingHTTPServer((config.CFG["host"], config.CFG["port"]),
-                                app.Handler)
+                                server.Handler)
     mode = " (demo data)" if config.DEMO else ""
     print(f"orchestra up → http://{config.CFG['host']}:{config.CFG['port']}{mode}")
     try:
