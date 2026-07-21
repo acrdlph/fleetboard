@@ -44,6 +44,49 @@ the dirty file list in **one call, measured at 19 ms**:
 
 That replaces lines 143, 147, 153 and 156. Only `git log -1` remains separate → **5 calls → 2**.
 
+### ⚠️ Two traps in that substitution — verified
+
+An earlier revision of this file presented the collapse as a straight swap. It is not. Both of
+these were reproduced directly:
+
+**1. Detached HEAD loses its label.** On a detached HEAD, porcelain v2 emits the literal string
+`(detached)` and carries no sha:
+
+```
+# branch.oid f89402a2f87c5cf1c5f74ab0049b0ae468cc4fc4
+# branch.head (detached)
+```
+
+The current code (orchestra.py:143–147) falls back to `git rev-parse --short HEAD` and renders
+`detached@f89402a`. A naive port renders the useless string `(detached)` for every detached
+worktree. **Required mapping:** `(detached)` → `detached@<branch.oid[:9]>`.
+
+**2. `# branch.ab` is absent when there is no upstream.** A branch with no tracking ref emits no
+`branch.ab` line at all — not `+0 -0`. A parser that assumes the line exists breaks on every
+un-tracked branch. Verified: both `rev-list --left-right @{u}...HEAD` and `# branch.ab` return
+empty on such a repo.
+
+**3. Ahead/behind orientation inverts.** `# branch.ab +A -B` has left = ahead, right = behind,
+whereas v1's `rev-list --left-right --count @{u}...HEAD` puts the *upstream* on the left, i.e.
+left = behind. Swapping these silently reverses every ahead/behind count on the board.
+
+**Therefore: write a golden-equivalence test that diffs new-vs-old `git_info` field-for-field
+across the real worktrees BEFORE changing anything.** All three traps are silent — the board
+renders confidently wrong values rather than erroring.
+
+### Concurrency is the win; the flag collapse is the garnish
+
+Measured during design, and it reorders the work:
+
+```
+baseline                                   4029 ms
+ThreadPoolExecutor(16), git_info untouched  710 ms   ← the real win
++ collapse 5 spawns to 2                    491 ms   ← the garnish
+serial 2-spawn only                    669–2929 ms   ← barely helps alone
+```
+
+Any plan that leads with the flag collapse is mis-attributing its own numbers.
+
 `branch_topology()` (orchestra.py:~839–882) is worse: ~8 git calls per worktree. Same treatment
 applies.
 

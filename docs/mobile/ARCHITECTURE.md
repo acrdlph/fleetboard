@@ -9,10 +9,10 @@ Every number tagged **[M]** was measured on the author's machine against the liv
 **[E]** are estimates and are labelled as such. Line references are `orchestra.py` at the
 commit this document was written against (2302 lines).
 
-> **Path prefix: this document says `/api/v2/…`; the shipping contract is `/api/v1/…`.**
+> **Path prefix: this document says `/api/v1/…`; the shipping contract is `/api/v1/…`.**
 > `API.md` §0 settled it — the *new* surface is v1 because it is the first versioned API,
 > and the pre-existing unversioned paths (`/api/state`, `/api/send`, …) are frozen legacy,
-> not "v1". Read every `/api/v2/x` below as `/api/v1/x`, and `/api/health` as
+> not "v1". Read every `/api/v1/x` below as `/api/v1/x`, and `/api/health` as
 > `GET /api/v1/health` + `GET /api/v1/meta` (this document's `features[]` splits across the
 > two). `API.md` §0.1 is the full alias table and it wins on every name, field and shape.
 > The reasoning in this document is unaffected; only the spellings are.
@@ -222,10 +222,10 @@ tell "lost" from "failed."
   │  │  tailnet  :4242  ── TLS (self-signed, SPKI-pinned),       │     │
   │  │                     bearer token + scopes, NO HTML        │     │
   │  │                                                           │     │
-  │  │  GET  /api/v2/state ?since= ?wait=   snapshot + delta     │     │
-  │  │  GET  /api/v2/stream                 SSE, field ops       │     │
-  │  │  GET  /api/v2/events ?since=         durable event log    │     │
-  │  │  POST /api/v2/*      Idempotency-Key + expect{}           │     │
+  │  │  GET  /api/v1/state ?since= ?wait=   snapshot + delta     │     │
+  │  │  GET  /api/v1/stream                 SSE, field ops       │     │
+  │  │  GET  /api/v1/events ?since=         durable event log    │     │
+  │  │  POST /api/v1/*      Idempotency-Key + expect{}           │     │
   │  │  GET|POST /api/*                     frozen, adapters     │     │
   │  └──────┬──────────────────────────┬────────────────────────┘     │
   │         │                          │                               │
@@ -340,7 +340,7 @@ orchestra/
   actuate.py             send_to_process, focus_process, start_finish, closeouts
   dispatch.py            start_dispatch, _run_dispatch, dispatch log
   resume.py              schedules (v2 file format), resume_loop
-  api.py                 /api/v2 handlers
+  api.py                 /api/v1 handlers
   legacy.py              /api/* adapters (frozen bodies, no logic)
   server.py              Handler (HTTP/1.1, timeouts, bounded pool, gzip, SSE)
   web/                   index.html map.html limits.html guide.html pair.html
@@ -805,7 +805,7 @@ the worst outcome this product can produce.
 | `send`, `kill` | `agent:<ag_id>` | interleaved keystrokes in one pane |
 | any tmux paste | one global `_tmux_buf` lock, per-op buffer name | **agent A executing agent B's instruction** |
 
-The auto-pick case is the one that must not be missed. `POST /api/v2/dispatches` with
+The auto-pick case is the one that must not be missed. `POST /api/v1/dispatches` with
 `worktree_id: null` is the *primary* phone flow, and if selection happens inside the worker
 after the 202 there is no id to lock. Two auto-dispatches read the same snapshot, pick the same
 cleanest-free worktree (the new agent takes ~30 s to register as busy), and tmux names embed
@@ -967,7 +967,7 @@ gutting the premise.
 |---|---|---|
 | 1 | **APNs** via `curl --http2` + `openssl` | paid Apple account, both binaries present, HTTP/2 probe passes at boot |
 | 2 | **ntfy.sh** via `urllib.request` (JSON publish endpoint) | no Apple account, or either binary missing |
-| 3 | in-app event feed only (`GET /api/v2/events`) | no push configured |
+| 3 | in-app event feed only (`GET /api/v1/events`) | no push configured |
 
 `_notify(events)` is one seam. It is **not** one product, and the guide must say so: under ntfy
 there is no inline reply, no deep link into a card, no notification actions, no Live Activities,
@@ -1019,7 +1019,7 @@ their Mac at 14:01 — and `▲ needs you` sits on the lock screen indefinitely.
 supersedes only *undelivered* pushes. Three mechanisms, because none alone is reliable:
 a **withdrawal background push** on FIRED→COOLDOWN carrying `withdraw: [dedupe_key]`;
 `request.identifier = dedupe_key` so it can be targeted; and a **foreground reconcile** against
-`GET /api/v2/events/open`, which is the reliable path since background pushes are throttled.
+`GET /api/v1/events/open`, which is the reliable path since background pushes are throttled.
 
 Plus a **global budget** (P1 12/hr, P2 6/hr per install, overflow rolls into a digest) and a
 **mute** endpoint. Every notification product that ships without a global budget gets muted at
@@ -1086,8 +1086,8 @@ agents plus a poller is flat in hours. Power Nap does not run third-party daemon
 
 | tier | transport | exit condition |
 |---|---|---|
-| **1** | **SSE** `GET /api/v2/stream` | 2 failures to receive `hello`; buffering detected (≥5 samples); 404 |
-| **2** | long-poll `GET /api/v2/state?since=&wait=25` | 404, or 3 consecutive transport errors |
+| **1** | **SSE** `GET /api/v1/stream` | 2 failures to receive `hello`; buffering detected (≥5 samples); 404 |
+| **2** | long-poll `GET /api/v1/state?since=&wait=25` | 404, or 3 consecutive transport errors |
 | **3** | conditional poll `?since=&wait=0` on the §7.4 cadence | 404 |
 | **4** | legacy `GET /api/state` full poll | server predates v2 |
 
@@ -1375,14 +1375,14 @@ as its only recovery story.
 | **5a** | **Package split, pure move.** `git mv` + import rewiring + `paths.py` + `migrate_stray_state()`. | `git diff --stat` shows zero changed lines inside function bodies; 142 tests green; the live `resume.schedule.json` still loads |
 | **5b** | Test seams, `ConfigGuard` extension, `.gitignore` additions, `TestZeroDeps`, `TestMockability`. | green |
 | **6** | **The state bus + producer.** `cached_state()` becomes a read with `fresh=True`. `index.html` untouched and ~1000× faster per poll. Git split, `_gitdirs`, parallel fan-out, transcript memo, single-flight for `_topo`/`_limits`. | **`collect_state` re-measured**, `BASE_S` re-derived from the real number; the empty-patch test green; linked-worktree git cache test green |
-| **7** | **`/api/v2/state`** — snapshot envelope + `since=` delta + `wait=` long-poll + ETag. Tiers 2–3, fully testable through `urllib.request`. | conditional-request tests |
+| **7** | **`/api/v1/state`** — snapshot envelope + `since=` delta + `wait=` long-poll + ETag. Tiers 2–3, fully testable through `urllib.request`. | conditional-request tests |
 | **8** | **Auth**: state dir, registry, tokens, scopes, rate limits, audit; loopback only; `board_auth: "open"`. All **four** HTML files get the meta tag and the shared `api()` helper (`guide.html:280` fetches `/api/state` too — omitting it silently breaks the user chip). | auth on, real token, `/api/state` without one → 401 |
 | **9** | **TLS**: key + cert generation, pin derivation, boot assertion. **Before pairing**, because the QR carries the pin. | pin stable across a reissue from the same key; `cert_pin()` raises rather than returning stale |
 | **10** | **Pairing**, `qr.py`, `/pair` board view, tailnet supervisor. The phone connects. | QR syndrome test at v5 and v6; a 63-char hostname fits |
 | **11** | **Idempotency + ops + locks**, and **`/api/finish` jobified** to return immediately. **Ships before the phone can actuate anything.** | two concurrent auto-picks never share a worktree; restart → `indeterminate`, never re-execute |
-| **12** | **`/api/v2/stream`** — SSE. **Gated on step 8**: thread-per-connection + long-lived connections + zero auth is a trivial exhaustion vector. | 65 concurrent sockets → 65th gets 503 and the server keeps serving; no `Content-Encoding` |
+| **12** | **`/api/v1/stream`** — SSE. **Gated on step 8**: thread-per-connection + long-lived connections + zero auth is a trivial exhaustion vector. | 65 concurrent sockets → 65th gets 503 and the server keeps serving; no `Content-Encoding` |
 | **13** | **`events.py` + `push/`**. ntfy default; APNs behind config until verified against sandbox on a real device. | a `needs_input` edge lands on a phone in ≤3 s |
-| **14** | **`/api/v2/chat?after=` + ETag**; `parse_qs` replaces the query regexes (the `account` param is never URL-decoded today, L2219). | |
+| **14** | **`/api/v1/chat?after=` + ETag**; `parse_qs` replaces the query regexes (the `account` param is never URL-decoded today, L2219). | |
 | **15** | HTML migrates to v2; `legacy.py` deleted. | `legacy_hits` all zero for a week |
 
 **Compatibility contract**, stated because HTML skew is impossible but phone skew is inevitable

@@ -19,7 +19,7 @@ have read those notes, here is what changed:
 
 | Concept | Track proposals | **Canonical here** |
 |---|---|---|
-| Version prefix | `/api/v1/…`, `/api/v2/…` | **`/api/v1/…`** everywhere |
+| Version prefix | `/api/v1/…`, `/api/v1/…` | **`/api/v1/…`** everywhere |
 | Idempotency header | `Idempotency-Key`, `X-Orchestra-Op-Id`, body `op_id` | **`Idempotency-Key`** header (+ `Idempotency-Issued-At`) |
 | Cursor | `?since=<int>&epoch=<hex>`, `"<epoch>:<seq>"` | **`?since=<epoch>:<seq>`**, one opaque token |
 | Delta encoding | entity upsert/remove lists, field-addressed ops | **field-addressed ops** (`{p,f,v,x}`), one format for SSE *and* long-poll |
@@ -38,9 +38,9 @@ use older spellings. They are **aliases, not alternatives** — this column is t
 |---|---|
 | `/api/hello`, `/api/health` | **`GET /api/v1/health`** (unauthenticated liveness + skew) and **`GET /api/v1/meta`** (`read`; features, budgets, device). The `config{}` block UX §3.1.5/§3.5 needs lives in `meta`. |
 | `capabilities[]`, `caps[]` | **`features[]`** (§9.1, §9.2) |
-| `/api/events`, `/api/v2/stream` | **`GET /api/v1/stream`** (SSE) |
-| `/api/v2/state`, `/api/state` | **`GET /api/v1/state`** |
-| `/api/v2/map` | **`GET /api/v1/topology`** |
+| `/api/events`, `/api/v1/stream` | **`GET /api/v1/stream`** (SSE) |
+| `/api/v1/state`, `/api/state` | **`GET /api/v1/state`** |
+| `/api/v1/map` | **`GET /api/v1/topology`** |
 | `POST /api/send {pid,text}` | **`POST /api/v1/sessions/{sid}/messages`** (identity-addressed; `agents/{ag_id}/messages` for the deliberate cross-agent case) |
 | `POST /api/kill {session}` | **`POST /api/v1/agents/{ag_id}/kill`** |
 | `POST /api/finish {worktree}` | **`POST /api/v1/worktrees/{wid}/finish`** |

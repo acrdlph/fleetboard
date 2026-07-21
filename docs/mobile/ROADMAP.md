@@ -10,10 +10,10 @@ This document only **sequences**. The *what* and *why* live in the sibling speci
 `FRESHNESS.md`, `adr/0001`–`0008`. Where they disagree, the conflict is named in §Decisions
 rather than silently resolved.
 
-> **Endpoint names below are aliases.** This document writes `/api/v2/…`; the shipping prefix
+> **Endpoint names below are aliases.** This document writes `/api/v1/…`; the shipping prefix
 > is **`/api/v1/…`** (`API.md` §0 — the new surface is v1 because it is the first *versioned*
-> API; the unversioned `/api/state` etc. are frozen legacy). Specifically: `/api/v2/stream` →
-> `GET /api/v1/stream`, `/api/v2/state` → `GET /api/v1/state`, `/api/v2/map` →
+> API; the unversioned `/api/state` etc. are frozen legacy). Specifically: `/api/v1/stream` →
+> `GET /api/v1/stream`, `/api/v1/state` → `GET /api/v1/state`, `/api/v1/map` →
 > `GET /api/v1/topology`, `/api/hello` → `GET /api/v1/health` + `GET /api/v1/meta`,
 > `capabilities[]` → `features[]`, `POST /api/kill` →
 > `POST /api/v1/agents/{ag_id}/kill`. `API.md` §0.1 is the full table.
@@ -313,8 +313,8 @@ groundwork; from here the value is visible on the device in your pocket.
 
 - **Canonical projection + field-addressed diffs.** Measured against the live 9-worktree / 33-session fleet: a real 5-second window is **131 bytes**, and **47 bytes** when nothing happened, against 36,326 for a full poll. That is a ~277× reduction and it exists *only* because `active_at` (M2) removed the one field that changes every tick regardless of events.
 - **Cursor = `epoch:seq`**, where `seq` advances only when the projection actually changed — so `since == seq` is a zero-byte freshness proof, and a restart is unambiguously discontinuous.
-- **`GET /api/v2/stream`** (SSE) with a bounded replay history, heartbeats carrying cadence and collector health, keepalive comments for dead-peer detection, and per-device subscriber eviction on reconnect.
-- **`GET /api/v2/state`** with `?since=` (delta), `?wait=` (long-poll) and an ETag — this *is* the fallback ladder, so the work is not wasted if SSE proves unreliable in S3.
+- **`GET /api/v1/stream`** (SSE) with a bounded replay history, heartbeats carrying cadence and collector health, keepalive comments for dead-peer detection, and per-device subscriber eviction on reconnect.
+- **`GET /api/v1/state`** with `?since=` (delta), `?wait=` (long-poll) and an ETag — this *is* the fallback ladder, so the work is not wasted if SSE proves unreliable in S3.
 - Gzip the snapshot. **Never** the deltas (gzip measurably *expands* a 47-byte frame) and never the stream (it breaks incremental delivery).
 - Wake detection: a monotonic-vs-wall-clock jump means the Mac slept — new epoch, resync everyone, and suppress event derivation for two ticks so opening the lid does not produce a burst about three-hour-old transitions.
 
@@ -496,7 +496,7 @@ trunk concurrently collides — and `/api/state` cannot tell you that).
 
 ### Backend
 
-- `GET /api/v2/map` — topology joined with board status server-side, raw float epochs, per-group clamped log axis parameters, plus `role` (diverged / stale / parked) and the `unmapped` worktrees the current code silently drops.
+- `GET /api/v1/map` — topology joined with board status server-side, raw float epochs, per-group clamped log axis parameters, plus `role` (diverged / stale / parked) and the `unmapped` worktrees the current code silently drops.
 - Ship `base_ts` so a per-clone stale `behind` count can be marked rather than presented as fact.
 
 ### iOS
@@ -587,7 +587,7 @@ Each has a recommendation. **D1, D2 and D4 block M1.**
 | **D7** | **Light theme** | dark-only · ship Daylight | **Ship Daylight**, but in M12. You need a light status palette regardless — notification banners, widgets and the Lock Screen render in the OS appearance and `.preferredColorScheme` does not reach them. Once those colours exist, a full light theme is nearly free via the Asset Catalog. |
 | **D8** | **Mac sleep policy** | do nothing · `caffeinate` · LaunchAgent + Energy Saver | **LaunchAgent with `KeepAlive`, plus documenting Energy Saver's "prevent sleeping when the display is off".** A closed lid stops the collector, the resume loop and every notification — and the app cannot tell you, because the thing that would tell you is asleep. This is a change to your machine's behaviour, so it is your call. |
 | **D9** | **Build the branch map at all** | yes at M10 · defer · drop | **Instrument in M4, decide after M8.** Its own design track argues it is the least-opened view and answers laptop-shaped questions. Its one irreplaceable fact — which worktrees share a trunk — could be a single line on the board instead. |
-| **D10** | **API versioning** | evolve `/api/*` · additive `/api/v2/*` | **Additive.** `index.html` is a real client you use daily; breaking it strands your desktop. Freeze v1 bodies, add v2, delete v1 only once the HTML migrates. |
+| **D10** | **API versioning** | evolve `/api/*` · additive `/api/v1/*` | **Additive.** `index.html` is a real client you use daily; breaking it strands your desktop. Freeze v1 bodies, add v2, delete v1 only once the HTML migrates. |
 
 ---
 
