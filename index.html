@@ -977,11 +977,38 @@ function wtOptions() {
   return [{ v: "", t: `worktree: auto (${ruleBasedAutoPick() || (lastState ? "none free" : "…")})` },
     ...all.map(n => ({ v: n, t: n + (frees.includes(n) ? " · free" : "") }))];
 }
+// The number that matters when placing a mission is the WEEKLY budget the
+// chosen model draws on — fable has its own weekly cap on top of the umbrella.
+// cclimits' headroom_percent folds the session window into its min, so a 37%
+// session read as "37% left" of the week. Mirrors _model_remaining's matching
+// rule (model name in the scoped limit's label) so the shown number is the one
+// the backend routes on. Session appears only when it undercuts the week —
+// it binds first, but it resets in hours, not days.
+function acctWeekly(a, model) {
+  const rem = l => l.remaining_percent ?? (100 - (l.percent || 0));
+  const ls = a.limits || [];
+  const umbrella = ls.filter(l => !l.model_scoped && l.group !== "session").map(rem);
+  const scoped = model ? ls.filter(l => l.model_scoped &&
+    (l.label || "").toLowerCase().includes(model)).map(rem) : [];
+  const sess = ls.filter(l => !l.model_scoped && l.group === "session").map(rem);
+  const wk = umbrella.concat(scoped);
+  return { wk: wk.length ? Math.min(...wk) : null,
+           capped: scoped.length && Math.min(...scoped) < (umbrella.length ? Math.min(...umbrella) : 101),
+           sess: sess.length ? Math.min(...sess) : null };
+}
 function acctOptions() {
   const accts = LIMITS && LIMITS.accounts ? LIMITS.accounts.filter(a => a.ok) : [];
+  const model = ($("mModel") && $("mModel").value) || "";
   return [{ v: "", t: "account: auto" + (lastState ? "" : " — loading…") },
-    ...accts.map(a => ({ v: acctLabel(a.config_dir),
-      t: `${acctLabel(a.config_dir)} · ${Math.round(a.headroom_percent ?? 0)}% left` }))];
+    ...accts.map(a => {
+      const r = acctWeekly(a, model);
+      let t = acctLabel(a.config_dir);
+      if (r.wk != null) {
+        t += ` · wk ${Math.round(r.wk)}%${r.capped ? ` (${model} cap)` : ""}`;
+        if (r.sess != null && r.sess < r.wk) t += ` · sess ${Math.round(r.sess)}%`;
+      } else t += ` · ${Math.round(a.headroom_percent ?? 0)}% left`;
+      return { v: acctLabel(a.config_dir), t };
+    })];
 }
 function optionsHtml(opts) {
   return opts.map(o => `<option value="${esc(o.v)}">${esc(o.t)}</option>`).join("");
@@ -1005,7 +1032,7 @@ function missionPickersHtml() {
       <select id="mAcct">${optionsHtml(acctOptions())}</select>
     </div>
     <div class="row">
-      <select id="mModel"><option value="">model — pick one</option>
+      <select id="mModel" onchange="refreshMissionPickers()"><option value="">model — pick one</option>
         <option value="fable">fable</option><option value="opus">opus</option>
         <option value="sonnet">sonnet</option><option value="haiku">haiku</option></select>
       <select id="mEffort"><option value="">effort — pick one</option>
@@ -1041,6 +1068,9 @@ function openMission() {
   renderInFlight();   // a dispatch still running stays visible across reopens
   loadDispatchLog();
   $("dfoot").innerHTML = missionPickersHtml();
+  // the html above was built while the PREVIOUS footer's model pick was still
+  // in the DOM — re-sync so account labels match the fresh (unpicked) select
+  refreshMissionPickers();
   $("drawer").classList.add("open", "wide");
   $("mText").focus();
 }
