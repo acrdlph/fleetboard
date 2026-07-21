@@ -560,7 +560,7 @@ class TestDispatchLog(ConfigGuard):
                 "worktree": f"W{i}", "account": "account2",
                 "mission_original": f"do thing {i}"}) + "\n")
         self.tmp.close()
-        fb.DISPATCH_LOG = Path(self.tmp.name)
+        fb.dispatch.DISPATCH_LOG = Path(self.tmp.name)
         self._run = fb.shell.run
         fb.shell.run = lambda *a, **k: (0, "mission-s2")   # only s2 is "live" in tmux
 
@@ -638,7 +638,8 @@ class TestStartFinish(ConfigGuard):
         super().setUp()
         fb.config.DEMO = False
         fb._closeouts.clear()
-        self._saved = {n: getattr(fb, n) for n in ("run", "start_dispatch")}
+        self._saved = {n: getattr(fb, n) for n in ("run",)}
+        self._saved_dispatch = fb.dispatch.start_dispatch
         self._saved_git = {n: getattr(fb.gitrepo, n) for n in
                            ("discover_worktrees", "_base_ref")}
         self._saved_procs = fb.procs.claude_processes
@@ -652,12 +653,13 @@ class TestStartFinish(ConfigGuard):
         fb.terminal.send_to_process = lambda pid, text: (
             self.sent.append(text) or {"ok": True})
         self.dispatched = []
-        fb.start_dispatch = lambda brief, **kw: (
+        fb.dispatch.start_dispatch = lambda brief, **kw: (
             self.dispatched.append((brief, kw)) or {"ok": True, "job": "j1"})
 
     def tearDown(self):
         for n, f in self._saved.items():
             setattr(fb, n, f)
+        fb.dispatch.start_dispatch = self._saved_dispatch
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
         fb.procs.claude_processes = self._saved_procs
@@ -1318,8 +1320,8 @@ class TestTmuxResume(unittest.TestCase):
 
     def setUp(self):
         self._saved = {n: getattr(fb, n) for n in
-                       ("deliver_text", "_wait_composer_idle",
-                        "_proven_in_transcript")}
+                       ("_wait_composer_idle", "_proven_in_transcript")}
+        self._saved_deliver = fb.dispatch.deliver_text
         self._saved_run = fb.shell.run
         self._sleep = fb.time.sleep
         fb.time.sleep = lambda s: None
@@ -1330,12 +1332,14 @@ class TestTmuxResume(unittest.TestCase):
         self.waits, self.delivered = [], []
         fb.shell.run = lambda cmd, **kw: (0, "")
         fb._wait_composer_idle = lambda name, t: self.waits.append(t) or True
-        fb.deliver_text = lambda name, text: self.delivered.append(text) or True
+        fb.dispatch.deliver_text = lambda name, text: (
+            self.delivered.append(text) or True)
         fb._proven_in_transcript = lambda fp, off, text, timeout_s=20.0: True
 
     def tearDown(self):
         for n, f in self._saved.items():
             setattr(fb, n, f)
+        fb.dispatch.deliver_text = self._saved_deliver
         fb.shell.run = self._saved_run
         fb.time.sleep = self._sleep
 
