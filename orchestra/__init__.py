@@ -36,7 +36,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-from . import config, shell
+from . import config, shell, status
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO and
@@ -45,6 +45,7 @@ from . import config, shell
 # that lies. Reach them as `orchestra.config.DEMO`.
 from .config import CFG, HOME, HERE, load_config, account_label
 from .shell import run
+from .status import classify_session, closeout_step, card_availability
 
 TAIL_BYTES = 128 * 1024
 HEAD_BYTES = 16 * 1024
@@ -489,92 +490,6 @@ def match_worktree(proj_name, wt_prefixes):
     return best
 
 
-def classify_session(age_s, alive, pending_tools, delegated,
-                     skip_perms, working_s, shells=0, *, turn_ended=False,
-                     evidence_age=None, procs_known=True, thinking_s=None,
-                     block_grace_s=None, orphan_grace_s=None):
-    """Base session status from observable signals (before limit/handoff
-    overrides). `delegated` counts pending workflows + background agents.
-    Returns (status, tool_running).
-
-    ORDER IS THE CONTRACT: nothing is decided by a clock before the evidence
-    on disk has been read. The old ladder tested `age_s < working_s` first,
-    so a question already written to the transcript was reported as WORKING
-    until the 90 s window expired — and if it was answered inside that window,
-    NEEDS ANSWER was never shown at all.
-    """
-    pend = pending_tools or []
-    age = age_s if evidence_age is None else evidence_age
-    thinking_s = working_s if thinking_s is None else thinking_s
-    block_grace_s = working_s if block_grace_s is None else block_grace_s
-    # Defaults to working_s so this layer is provably behaviour-identical
-    # apart from the two intended fixes. Tightening it (10 s is the target)
-    # flips a live-but-unpaired session to ENDED, which feeds worktree-FREE
-    # and therefore dispatch targeting — it needs reliable process detection
-    # behind it, so it lands as its own step, not smuggled in here.
-    orphan_grace_s = working_s if orphan_grace_s is None else orphan_grace_s
-
-    if not procs_known:                      # ps/lsof failed wholesale: never
-        return "unknown", False              # claim ENDED, never claim FREE
-
-    if alive and "AskUserQuestion" in pend:  # the question is ON DISK
-        return "needs_input", False
-    if alive and turn_ended and not delegated and not pend:
-        return "waiting", False              # provably not mid-turn
-    if alive and delegated:                  # awaiting its own workflows or
-        return "working", False              # background agents — not the
-                                             # user's turn
-    if alive and shells:                     # a Bash shell is still running —
-        return "working", True               # backgrounded ones leave the
-                                             # transcript idle until they exit
-    if alive and pend:
-        # "awaiting approval" and "tool still running" are the same bytes on
-        # disk. Under --dangerously-skip-permissions there is nothing to
-        # approve; otherwise hold WORKING until the silence outlasts genuine
-        # tool-run silence before calling it BLOCKED.
-        if skip_perms or age < block_grace_s:
-            return "working", True
-        return "blocked", False
-    if not alive:
-        # A fresh write with no observed process is "we have not seen the
-        # process yet" (a just-exec'd agent, or a lagging proc-table read) —
-        # not "ended". This rule was implicit in the old first branch; it is
-        # now named, bounded, and testable.
-        return ("working", False) if age < orphan_grace_s else ("ended", False)
-    if age < thinking_s:
-        return "working", False              # decay, LAST
-    return "waiting", False
-
-
-def closeout_step(paired_status, any_working, sent, now, nudge_after_s=60):
-    """Step two of ✓ finish (✕ close) when the landing won't verify: decide,
-    from THIS worktree's live session, whether to refuse, send the user to
-    ✉ chat, or type one nudge at the idle agent. Pure (no subprocess/tmux) so
-    the whole table is unit-testable.
-
-    The deadlock this breaks: an agent finished its closeout but left one dirty
-    file it judged "another session's in-flight work" — and no other session
-    was live, so nothing would ever converge. ✕ close refused forever while the
-    agent idled forever. A nudge that names the leftovers and says they are
-    this agent's to judge is the only exit.
-
-    Ordering is the point. Any working session (it might be mid-closeout)
-    refuses before anything else, so we never type over live work. A stuck
-    agent goes to chat rather than get a nudge typed across its open dialog.
-    Only a plainly idle ('waiting') agent, briefed at least nudge_after_s ago
-    (the anti-double-type guard against rapid clicks), gets nudged. A scan that
-    couldn't pair any session with the live pid returns None here and we refuse
-    — never type into a terminal we can't classify.
-    """
-    if any_working:
-        return "refuse"
-    if paired_status in ("needs_input", "blocked"):
-        return "chat"
-    if paired_status == "waiting":
-        return "nudge" if now - sent >= nudge_after_s else "refuse"
-    return "refuse"
-
-
 def scan_sessions(worktrees, procs, now):
     """All recent sessions across every Claude home, mapped to worktrees."""
     by_wt = {w["path"]: [] for w in worktrees}
@@ -658,11 +573,13 @@ def scan_sessions(worktrees, procs, now):
             # only an account match is a real attribution; a fallback pairing is
             # a guess and must not be presented as one
             s["pid_certain"] = bool(proc and proc.get("account") == s["account"])
-            status, tool_running = classify_session(
+            # `sess_status`, not `status`: the module object of that name is
+            # what classify_session now hangs off, and a local would shadow it.
+            sess_status, tool_running = status.classify_session(
                 s["age_s"], alive, s["pending_tools"],
                 s["pending_workflows"] + s["pending_bg_agents"],
                 skip_perms, config.CFG["working_s"], shell_n)
-            s["status"] = status
+            s["status"] = sess_status
             if tool_running:
                 s["tool_running"] = True
                 if shell_n and not s["pending_tools"]:
@@ -670,22 +587,6 @@ def scan_sessions(worktrees, procs, now):
         sessions.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
         by_wt[wt] = sessions[: config.CFG["max_sessions"]]
     return by_wt
-
-
-def card_availability(st, has_live):
-    """Card-level triage from its sessions' statuses (post handoff filter)."""
-    if not (has_live or "working" in st):
-        return "free"          # safe to point a new agent here
-    if any(k in st for k in ("needs_input", "blocked")):
-        return "attention"     # hard blocker — needs you
-    if "waiting" in st and "working" not in st:
-        return "attention"     # everyone parked at the prompt — needs direction
-    if "limit" in st and "working" not in st:
-        # out of juice, not out of instructions — nothing you can do until the
-        # limit resets, so it is NOT "needs you". (This card-level "waiting" is
-        # unrelated to the session status "waiting" = idle at the prompt.)
-        return "waiting"
-    return "busy"              # something is actively working
 
 
 def collect_state():
@@ -764,7 +665,7 @@ def collect_state():
         })
 
     for c in cards:
-        c["availability"] = card_availability(
+        c["availability"] = status.card_availability(
             _attention_statuses(c["sessions"]), bool(c["live_procs"]))
         # two-step finish: while a closeout brief is with this card's live
         # agent, the button reads ✕ close. The flag dies with the terminal,
@@ -1506,8 +1407,8 @@ def start_finish(wt_name):
             paired = next((s for s in sessions
                            if s.get("pid") == live["pid"]), None)
             any_working = any(s.get("status") == "working" for s in sessions)
-            step = closeout_step(paired["status"] if paired else None,
-                                 any_working, sent, now)
+            step = status.closeout_step(paired["status"] if paired else None,
+                                        any_working, sent, now)
             if step == "nudge":
                 # idle agent, nothing else working, briefed ≥60s ago: type the
                 # specifics so it stops treating the leftovers as untouchable.
