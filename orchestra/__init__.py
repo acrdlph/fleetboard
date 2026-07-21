@@ -34,7 +34,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 
 from . import (config, shell, status, gitrepo, procs, transcripts, limits,
-               terminal, chat)
+               terminal, chat, finish)
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO and
@@ -59,6 +59,8 @@ from .limits import (cached_limits, account_reserve, _model_remaining,
                      LIMITS_TTL_S, _limits)
 from .terminal import focus_process, send_to_process, _osa_escape
 from .chat import read_chat
+from .finish import (_park_on_trunk, _reachable, _closeouts, CLOSEOUT_TEXT,
+                     SLIM_CLOSEOUT_TEXT, CLOSEOUT_NUDGE_TEXT)
 
 STATE_TTL_S = 4.0              # cache collector output between requests
 _cache = {"t": 0.0, "state": None}
@@ -148,12 +150,12 @@ def collect_state():
         # two-step finish: while a closeout brief is with this card's live
         # agent, the button reads ✕ close. The flag dies with the terminal,
         # so a card never offers to close an agent that no longer exists.
-        ts = _closeouts.get(c["name"])
+        ts = finish._closeouts.get(c["name"])
         if ts:
             if c["live_procs"]:
                 c["closeout_sent"] = ts
             else:
-                _closeouts.pop(c["name"], None)
+                finish._closeouts.pop(c["name"], None)
 
     matched = {p["pid"] for c in cards for p in c["live_procs"]}
     other = [p for p in all_procs if p["pid"] not in matched]
@@ -270,75 +272,6 @@ def cached_state():
 
 # ------------------------------------------------------------- finish
 
-# The full closeout brief, for a branch that still needs landing. ✓ finish
-# hands it to an agent: the live one if a terminal exists, a freshly
-# dispatched one if not. (Once a branch HAS landed, finish stops delegating —
-# see SLIM_CLOSEOUT_TEXT and _park_on_trunk below.)
-CLOSEOUT_TEXT = (
-    "Close out this worktree now: "
-    "1) wait for (or stop) any background agents and workflows you started; "
-    "2) commit remaining meaningful work — drop scratch files; "
-    "3) land the branch: merge {trunk} into it, resolve any conflicts — but "
-    "if a conflict needs real judgment about the code, stop and report it "
-    "instead of guessing — push the branch, then push it to the trunk and "
-    "verify with `git merge-base --is-ancestor HEAD {trunk}`; "
-    "4) switch this worktree to the trunk branch and pull, so it starts the "
-    "next mission clean; "
-    "5) reply with a one-line summary of what landed."
-)
-
-# The slim brief for a branch that already landed (HEAD is an ancestor of the
-# trunk): nothing merged gets re-checked — only whatever is actually left.
-SLIM_CLOSEOUT_TEXT = (
-    "This worktree's branch has already landed on {trunk} — do not re-merge, "
-    "re-push, or re-verify any of that. Close out only what's left: "
-    "1) stop (or wait for) any background agents and workflows you started; "
-    "2) drop scratch files; if meaningful uncommitted work remains, commit it "
-    "and land it on {trunk} like a normal closeout; "
-    "3) switch this worktree to the trunk branch and pull, so it starts the "
-    "next mission clean; "
-    "4) reply with one line saying what, if anything, was left to do."
-)
-
-# Follow-up typed at a live agent when step two (✕ close) still can't verify a
-# clean landing AND nothing else is working in this worktree — so the leftover
-# files are this agent's call, not "another session's in-flight work" it can
-# quietly ignore. That misjudgment is the exact deadlock this breaks: without
-# the nudge the agent idles forever and ✕ close refuses forever, because no
-# other session exists to ever converge the tree. {files} is up to five raw
-# `git status --porcelain` lines (blank when the branch simply hasn't landed).
-CLOSEOUT_NUDGE_TEXT = (
-    "Step two of the closeout still can't verify a clean landing: {left}. "
-    "{files}"
-    "No other session is working in this worktree, so these files are yours to "
-    "judge — none of them is another session's in-flight work. Commit and land "
-    "anything meaningful, drop scratch, and leave the tree clean on {trunk}. If "
-    "any of it genuinely needs the user's decision, stop and ask explicitly — "
-    "don't just leave it dirty."
-)
-
-# worktree name -> epoch seconds when a closeout brief was typed at its live
-# agent. Step two of ✓ finish: while this is set (and the terminal lives) the
-# board shows ✕ close instead — which only verifies the landing and /exits;
-# it never re-types the brief into a mid-closeout agent. The flag dies with
-# the terminal, so a fresh mission never inherits it.
-_closeouts = {}
-
-
-def _park_on_trunk(git_root, trunk):
-    """Landed and clean: park the worktree on the trunk branch right here —
-    two git commands don't need an agent. Returns None if the switch fails so
-    the caller can hand it to an agent instead."""
-    branch = trunk.split("/", 1)[-1]
-    if shell.run(["git", "switch", branch], cwd=git_root, timeout=30)[0] != 0:
-        return None
-    pulled = shell.run(["git", "pull", "--ff-only", "--quiet"], cwd=git_root,
-                       timeout=60)[0] == 0
-    return {"ok": True, "mode": "parked", "message":
-            f"already landed — parked on {branch}, no agent needed"
-            + ("" if pulled else " (pull failed; next dispatch refreshes)")}
-
-
 def closeout_shell(home, model, brief, trunk):
     """The tmux command for a one-shot closeout: run claude headless, then let
     git itself verify the landing. Verified clean -> exit, the tmux session
@@ -356,11 +289,6 @@ def closeout_shell(home, model, brief, trunk):
         # default (stronger) model, so a haiku closeout escalates on failure
         "exec claude --dangerously-skip-permissions --continue\n"
     )
-
-
-def _reachable(p):
-    return bool(p.get("tmux_target")) or (
-        p.get("host") in ("Terminal", "iTerm2") and p.get("tty"))
 
 
 def start_finish(wt_name):
@@ -387,17 +315,17 @@ def start_finish(wt_name):
                                       cwd=git_root)[1].splitlines() if l.strip()]
     mine = [p for p in procs.claude_processes() if p.get("cwd")
             and (p["cwd"] == path or p["cwd"].startswith(path + os.sep))]
-    live = next((p for p in mine if _reachable(p)), None)
+    live = next((p for p in mine if finish._reachable(p)), None)
     if live:
         if landed and not porcelain:
             res = terminal.send_to_process(live["pid"], "/exit")
             if res["ok"]:
-                _closeouts.pop(wt_name, None)
+                finish._closeouts.pop(wt_name, None)
                 _cache["t"] = 0.0    # button reverts on the next poll
             return {"ok": res["ok"], "mode": "exit", "message":
                     "already landed — sent /exit to close the terminal"
                     if res["ok"] else res["message"]}
-        sent = _closeouts.get(wt_name)
+        sent = finish._closeouts.get(wt_name)
         if sent:
             # step two (✕ close), but the landing still doesn't verify. What to
             # do isn't a fixed refusal — it depends on THIS worktree's live
@@ -421,12 +349,12 @@ def start_finish(wt_name):
                 block = "\n".join(files)
                 if len(porcelain) > len(files):
                     block += f"\n… and {len(porcelain) - len(files)} more"
-                nudge = CLOSEOUT_NUDGE_TEXT.format(
+                nudge = finish.CLOSEOUT_NUDGE_TEXT.format(
                     left=left, trunk=trunk, files=(block + "\n") if block else "")
                 res = terminal.send_to_process(live["pid"], nudge)
                 if not res["ok"]:
                     return {"ok": False, "mode": "nudge", "message": res["message"]}
-                _closeouts[wt_name] = time.time()   # restart the "sent Xm ago"
+                finish._closeouts[wt_name] = time.time()   # restart the "sent Xm ago"
                 _cache["t"] = 0.0                    # clock + re-arm the 60s guard
                 # `left`/`files` ride along so the card note can say what's
                 # blocked without parsing the human message
@@ -455,12 +383,12 @@ def start_finish(wt_name):
                     f"can't close yet — {left}. The closeout brief went to "
                     f"the agent {ago}; if it looks stuck, ✉ chat with it. "
                     "✕ close works once the landing verifies."}
-        brief = (SLIM_CLOSEOUT_TEXT if landed else CLOSEOUT_TEXT)
+        brief = (finish.SLIM_CLOSEOUT_TEXT if landed else finish.CLOSEOUT_TEXT)
         res = terminal.send_to_process(live["pid"], brief.format(trunk=trunk))
         if not res["ok"]:
             return {"ok": False, "mode": "slim" if landed else "brief",
                     "message": res["message"]}
-        _closeouts[wt_name] = time.time()
+        finish._closeouts[wt_name] = time.time()
         _cache["t"] = 0.0            # show ✕ close on the next poll, not in 4s
         return {"ok": True, "mode": "slim" if landed else "brief", "message":
                 ("already landed — slim brief sent (tidy scratch and park, "
@@ -468,7 +396,7 @@ def start_finish(wt_name):
                  "closeout brief sent to the live agent")
                 + " — when it reports done, ✕ close verifies the landing "
                   "and closes the terminal"}
-    _closeouts.pop(wt_name, None)    # no live agent — the two-step is moot
+    finish._closeouts.pop(wt_name, None)   # no live agent — the two-step is moot
     if mine:
         return {"ok": False, "message":
                 "a live process exists but its terminal can't be scripted — "
@@ -479,7 +407,7 @@ def start_finish(wt_name):
         if branch == trunk.split("/", 1)[-1]:
             return {"ok": True, "mode": "noop",
                     "message": "already landed and clean — nothing to finish"}
-        parked = _park_on_trunk(git_root, trunk)
+        parked = finish._park_on_trunk(git_root, trunk)
         if parked:
             return parked
         # the switch itself failed — fall through and let an agent sort it out
@@ -488,7 +416,8 @@ def start_finish(wt_name):
     # mechanical run, a landed branch gets the slim brief so nothing already
     # merged is re-checked, and a failed landing escalates itself (see
     # closeout_shell's rescue line)
-    brief = (SLIM_CLOSEOUT_TEXT if landed else CLOSEOUT_TEXT).format(trunk=trunk)
+    brief = (finish.SLIM_CLOSEOUT_TEXT if landed
+             else finish.CLOSEOUT_TEXT).format(trunk=trunk)
     out = start_dispatch(brief, worktree=wt_name,
                          model="haiku", closeout_trunk=trunk)
     out.setdefault("ok", True)
