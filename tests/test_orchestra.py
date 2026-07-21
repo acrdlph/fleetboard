@@ -639,14 +639,15 @@ class TestStartFinish(ConfigGuard):
         fb.config.DEMO = False
         fb._closeouts.clear()
         self._saved = {n: getattr(fb, n) for n in
-                       ("run", "claude_processes", "send_to_process",
+                       ("run", "send_to_process",
                         "start_dispatch", "scan_sessions")}
         self._saved_git = {n: getattr(fb.gitrepo, n) for n in
                            ("discover_worktrees", "_base_ref")}
+        self._saved_procs = fb.procs.claude_processes
         fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.gitrepo._base_ref = lambda root: "origin/main"
-        fb.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda: []
         self.sent = []
         fb.send_to_process = lambda pid, text: (
             self.sent.append(text) or {"ok": True})
@@ -659,12 +660,13 @@ class TestStartFinish(ConfigGuard):
             setattr(fb, n, f)
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
+        fb.procs.claude_processes = self._saved_procs
         super().tearDown()
 
     def live(self):
         # a realistic proc: real claude_processes() always carries "cmd", which
         # scan_sessions reads when start_finish classifies the live session
-        fb.claude_processes = lambda: [
+        fb.procs.claude_processes = lambda: [
             {"pid": 1, "cwd": "/w/wt", "tmux_target": "s:0",
              "cmd": "claude --dangerously-skip-permissions"}]
 
@@ -805,7 +807,7 @@ class TestStartFinish(ConfigGuard):
         # finish drops to the normal no-terminal tiers, not a stale "pending"
         self.live()
         self.finish(landed=False)
-        fb.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda: []
         out = self.finish(landed=False)
         self.assertEqual(out["mode"], "dispatch")
         self.assertNotIn("wt", fb._closeouts)

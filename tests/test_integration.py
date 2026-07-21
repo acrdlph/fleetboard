@@ -88,14 +88,16 @@ class TestCollectPipeline(unittest.TestCase):
         # point orchestra at the fixtures; neutralize live-system inputs
         self._save = {k: fb.CFG.get(k) for k in
                       ("roots", "homes", "pattern", "exclude_accounts", "reserve_percent")}
-        self._demo, self._procs, self._cl = fb.config.DEMO, fb.claude_processes, fb.cached_limits
+        self._demo, self._procs, self._cl = (fb.config.DEMO,
+                                             fb.procs.claude_processes,
+                                             fb.cached_limits)
         fb.config.DEMO = False
         fb.CFG["roots"] = [str(self.root)]
         fb.CFG["homes"] = [str(self.home)]
         fb.CFG["pattern"] = ""
         fb.CFG["exclude_accounts"] = []
         fb.CFG["reserve_percent"] = {}
-        fb.claude_processes = lambda: []                       # no live procs
+        fb.procs.claude_processes = lambda: []                       # no live procs
         fb.cached_limits = lambda refresh=False: {"available": False}
         fb._cache["state"] = None                              # bust the 4s cache
 
@@ -105,7 +107,8 @@ class TestCollectPipeline(unittest.TestCase):
                 fb.CFG.pop(k, None)
             else:
                 fb.CFG[k] = v
-        fb.config.DEMO, fb.claude_processes, fb.cached_limits = self._demo, self._procs, self._cl
+        (fb.config.DEMO, fb.procs.claude_processes,
+         fb.cached_limits) = self._demo, self._procs, self._cl
         fb._cache["state"] = None
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -166,7 +169,7 @@ class TestCollectPipeline(unittest.TestCase):
             turn_end(pending_bg_agents=1)])
         old = time.time() - 3 * fb.CFG["working_s"]     # not "working" by age
         os.utime(fp, (old, old))
-        fb.claude_processes = lambda: [{
+        fb.procs.claude_processes = lambda: [{
             "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
             "cwd": str(self.repo), "cmd": "claude", "account": None,
             "tmux_target": None, "shells": 0}]
@@ -184,7 +187,7 @@ class TestCollectPipeline(unittest.TestCase):
         fb._closeouts.clear()
         fb._closeouts["myapp"] = ts = time.time() - 30
         # terminal alive → the card advertises step two (✕ close)
-        fb.claude_processes = lambda: [{
+        fb.procs.claude_processes = lambda: [{
             "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
             "cwd": str(self.repo), "cmd": "claude --dangerously-skip-permissions",
             "account": None, "tmux_target": "s:0", "shells": 0}]
@@ -192,7 +195,7 @@ class TestCollectPipeline(unittest.TestCase):
         card = fb.collect_state()["worktrees"][0]
         self.assertEqual(card["closeout_sent"], ts)
         # terminal gone → the flag dies; no stale ✕ close on a freed card
-        fb.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda: []
         fb._cache["state"] = None
         card = fb.collect_state()["worktrees"][0]
         self.assertNotIn("closeout_sent", card)
