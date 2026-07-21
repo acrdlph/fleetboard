@@ -639,12 +639,13 @@ class TestStartFinish(ConfigGuard):
         fb.config.DEMO = False
         fb._closeouts.clear()
         self._saved = {n: getattr(fb, n) for n in
-                       ("run", "discover_worktrees", "claude_processes",
-                        "send_to_process", "_base_ref", "start_dispatch",
-                        "scan_sessions")}
-        fb.discover_worktrees = lambda: [
+                       ("run", "claude_processes", "send_to_process",
+                        "start_dispatch", "scan_sessions")}
+        self._saved_git = {n: getattr(fb.gitrepo, n) for n in
+                           ("discover_worktrees", "_base_ref")}
+        fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
-        fb._base_ref = lambda root: "origin/main"
+        fb.gitrepo._base_ref = lambda root: "origin/main"
         fb.claude_processes = lambda: []
         self.sent = []
         fb.send_to_process = lambda pid, text: (
@@ -656,6 +657,8 @@ class TestStartFinish(ConfigGuard):
     def tearDown(self):
         for n, f in self._saved.items():
             setattr(fb, n, f)
+        for n, f in self._saved_git.items():
+            setattr(fb.gitrepo, n, f)
         super().tearDown()
 
     def live(self):
@@ -1064,9 +1067,9 @@ class TestFireResume(ResumeGuard):
         super().setUp()
         self._saved = {n: getattr(fb, n) for n in
                        ("cached_state", "send_to_process", "_tmux_resume",
-                        "_limit_active_until", "discover_worktrees",
-                        "claude_homes")}
-        fb.discover_worktrees = lambda: [
+                        "_limit_active_until", "claude_homes")}
+        self._saved_git = {"discover_worktrees": fb.gitrepo.discover_worktrees}
+        fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.claude_homes = lambda: [Path("/h/.claude-account2")]
         fb._limit_active_until = lambda account, model, now: None
@@ -1080,6 +1083,8 @@ class TestFireResume(ResumeGuard):
     def tearDown(self):
         for n, f in self._saved.items():
             setattr(fb, n, f)
+        for n, f in self._saved_git.items():
+            setattr(fb.gitrepo, n, f)
         super().tearDown()
 
     def board(self, status="limit", pid=None, reachable=True, handed=None,
