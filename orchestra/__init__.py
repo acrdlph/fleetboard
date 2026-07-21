@@ -24,7 +24,6 @@ Configuration precedence: CLI flags > orchestra.config.json (next to this
 script, else cwd) > defaults. See README.md.
 """
 
-import argparse
 import getpass
 import json
 import os
@@ -38,68 +37,19 @@ import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-HOME = Path.home()
-HERE = Path(__file__).resolve().parent.parent  # package lives one level under the repo root
+from . import config
 
-CFG = {
-    "host": "127.0.0.1",       # keep loopback: the board serves transcript text
-    "port": 4242,
-    "roots": [str(Path.cwd())],  # dirs whose git-repo children are watched
-    "pattern": "",             # optional regex filter on worktree dir names
-    "homes": [],               # Claude home dirs; [] = auto-discover ~/.claude*
-    "session_window_h": 48,    # ignore transcripts idle longer than this
-    "working_s": 90,           # transcript written within this => working
-    "max_sessions": 6,         # per worktree card
-    "exclude_accounts": [],    # account labels never AUTO-picked for dispatch
-    "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)
-    "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
-    "resume_message": "continue",  # what auto-resume types at the stalled agent
-}
+# ---- public surface (facade). Re-exported so tests, tools and
+# tests/characterize.py can keep saying `orchestra.<name>`. DEMO and
+# CONFIG_PATH are deliberately NOT re-exported: they are rebound at runtime,
+# so a facade copy would go stale and `orchestra.DEMO = True` would be a patch
+# that lies. Reach them as `orchestra.config.DEMO`.
+from .config import CFG, HOME, HERE, load_config, account_label
 
 TAIL_BYTES = 128 * 1024
 HEAD_BYTES = 16 * 1024
 STATE_TTL_S = 4.0              # cache collector output between requests
 _cache = {"t": 0.0, "state": None}
-DEMO = False
-CONFIG_PATH = None             # the config file in effect (for live edits)
-
-
-def load_config(argv=None):
-    ap = argparse.ArgumentParser(description="local mission control for parallel Claude Code agents")
-    ap.add_argument("--root", action="append", metavar="DIR",
-                    help="directory whose git-repo children are watched (repeatable; default: cwd)")
-    ap.add_argument("--pattern", metavar="REGEX", help="only watch dirs matching this regex (case-insensitive)")
-    ap.add_argument("--home", action="append", metavar="DIR",
-                    help="Claude home dir (repeatable; default: auto-discover ~/.claude*)")
-    ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTRA_PORT)")
-    ap.add_argument("--host", help="bind address (default 127.0.0.1 — the board serves your transcript text; do not expose it)")
-    ap.add_argument("--window-h", type=float, help="ignore transcripts idle longer than this many hours (default 48)")
-    ap.add_argument("--config", metavar="FILE", help="path to a orchestra.config.json")
-    ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
-    args = ap.parse_args(argv)
-
-    global CONFIG_PATH
-    candidates = [Path(args.config)] if args.config else [
-        HERE / "orchestra.config.json", Path.cwd() / "orchestra.config.json"]
-    for p in candidates:
-        if p.is_file():
-            try:
-                CFG.update(json.loads(p.read_text()))
-            except (ValueError, OSError) as e:
-                sys.exit(f"orchestra: bad config {p}: {e}")
-            CONFIG_PATH = p
-            break
-    if CONFIG_PATH is None:  # where a UI edit will create/persist config
-        CONFIG_PATH = Path(args.config) if args.config else HERE / "orchestra.config.json"
-    if os.environ.get("ORCHESTRA_PORT"):
-        CFG["port"] = int(os.environ["ORCHESTRA_PORT"])
-    if args.root: CFG["roots"] = args.root
-    if args.pattern is not None: CFG["pattern"] = args.pattern
-    if args.home: CFG["homes"] = args.home
-    if args.port: CFG["port"] = args.port
-    if args.host: CFG["host"] = args.host
-    if args.window_h: CFG["session_window_h"] = args.window_h
-    return args
 
 
 # ---------------------------------------------------------------- collectors
@@ -118,9 +68,9 @@ def munge(path):
 
 
 def discover_worktrees():
-    pat = re.compile(CFG["pattern"], re.I) if CFG["pattern"] else None
+    pat = re.compile(config.CFG["pattern"], re.I) if config.CFG["pattern"] else None
     wts, seen = [], set()
-    for root in CFG["roots"]:
+    for root in config.CFG["roots"]:
         root = Path(root).expanduser()
         if not root.is_dir():
             continue
@@ -341,7 +291,7 @@ def claude_processes():
         p["cwd"] = cwds.get(p["pid"])
         cfg = cfgdirs.get(p["pid"])
         # bare `claude` with no CLAUDE_CONFIG_DIR set is the default home
-        p["account"] = account_label(Path(cfg)) if cfg else \
+        p["account"] = config.account_label(Path(cfg)) if cfg else \
             ("main" if env_readable else None)
         kind, label = _host_of(p["pid"], table)
         p["host_kind"], p["host"] = kind, label
@@ -366,23 +316,16 @@ def claude_processes():
 def claude_homes():
     # Precedence: --home / config "homes" > CLAUDE_CONFIG_DIRS (colon-separated,
     # same convention as cclimits) > auto-discover ~/.claude*
-    explicit = CFG["homes"] or [
+    explicit = config.CFG["homes"] or [
         h for h in os.environ.get("CLAUDE_CONFIG_DIRS", "").split(":") if h]
     if explicit:
         return [Path(h).expanduser() for h in explicit
                 if (Path(h).expanduser() / "projects").is_dir()]
     homes = []
-    for p in sorted(HOME.iterdir()):
+    for p in sorted(config.HOME.iterdir()):
         if (p.name == ".claude" or p.name.startswith(".claude-")) and (p / "projects").is_dir():
             homes.append(p)
     return homes
-
-
-def account_label(home):
-    name = home.name.lstrip(".")
-    if name == "claude":
-        return "main"
-    return re.sub(r"^claude-?", "", name) or name
 
 
 def _read_chunk(fp, size, from_end):
@@ -644,10 +587,10 @@ def scan_sessions(worktrees, procs, now):
     """All recent sessions across every Claude home, mapped to worktrees."""
     by_wt = {w["path"]: [] for w in worktrees}
     wt_prefixes = {w["path"]: munge(w["path"]) for w in worktrees}
-    window_s = CFG["session_window_h"] * 3600
+    window_s = config.CFG["session_window_h"] * 3600
 
     for home in claude_homes():
-        acct = account_label(home)
+        acct = config.account_label(home)
         for proj in (home / "projects").iterdir():
             wt = match_worktree(proj.name, wt_prefixes)
             if wt is None:
@@ -697,7 +640,7 @@ def scan_sessions(worktrees, procs, now):
                     "last_assistant": tail["last_assistant"],
                     "last_user": tail["last_user"] or find_last_user(fp),
                     "subagent_said": subagent_said,
-                    "subagents_active": bool(sub_mtime and now - sub_mtime < CFG["working_s"]),
+                    "subagents_active": bool(sub_mtime and now - sub_mtime < config.CFG["working_s"]),
                 })
 
     rank = {"needs_input": 0, "blocked": 1, "working": 2, "waiting": 3, "ended": 4}
@@ -726,14 +669,14 @@ def scan_sessions(worktrees, procs, now):
             status, tool_running = classify_session(
                 s["age_s"], alive, s["pending_tools"],
                 s["pending_workflows"] + s["pending_bg_agents"],
-                skip_perms, CFG["working_s"], shell_n)
+                skip_perms, config.CFG["working_s"], shell_n)
             s["status"] = status
             if tool_running:
                 s["tool_running"] = True
                 if shell_n and not s["pending_tools"]:
                     s["bg_shell"] = True     # transcript idle, shell alive
         sessions.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
-        by_wt[wt] = sessions[: CFG["max_sessions"]]
+        by_wt[wt] = sessions[: config.CFG["max_sessions"]]
     return by_wt
 
 
@@ -976,7 +919,7 @@ def demo_topology():
 
 
 def cached_topology():
-    if DEMO:
+    if config.DEMO:
         return demo_topology()
     now = time.time()
     if _topo["data"] is None or now - _topo["t"] > TOPO_TTL_S:
@@ -1055,7 +998,7 @@ def demo_state():
 
 
 def cached_state():
-    if DEMO:
+    if config.DEMO:
         return demo_state()
     now = time.time()
     if _cache["state"] is None or now - _cache["t"] > STATE_TTL_S:
@@ -1071,20 +1014,20 @@ _limits = {"t": 0.0, "data": None}
 
 
 def _cclimits_bin():
-    cmd = CFG.get("cclimits_cmd")
+    cmd = config.CFG.get("cclimits_cmd")
     if cmd:
         return cmd
     found = shutil.which("cclimits")
     if found:
         return found
-    fallback = HOME / ".local" / "bin" / "cclimits"
+    fallback = config.HOME / ".local" / "bin" / "cclimits"
     return str(fallback) if fallback.exists() else None
 
 
 def cached_limits(refresh=False):
     """Per-account usage limits via cclimits (github.com/acrdlph/cclimits).
     Lazy + cached; a network refetch happens only on explicit refresh."""
-    if DEMO:
+    if config.DEMO:
         return demo_limits()
     now = time.time()
     if not refresh and _limits["data"] is not None and now - _limits["t"] < LIMITS_TTL_S:
@@ -1104,7 +1047,7 @@ def cached_limits(refresh=False):
     data["fetched_at"] = now
     for acc in data.get("accounts", []):
         if acc.get("config_dir"):
-            label = account_label(Path(acc["config_dir"]))
+            label = config.account_label(Path(acc["config_dir"]))
             r = account_reserve(label)
             acc["fb_label"] = label   # orchestra's label (cclimits slug may differ)
             acc["reserve_percent"] = r
@@ -1116,7 +1059,7 @@ def cached_limits(refresh=False):
 def account_reserve(label):
     """Headroom % this account must keep free before auto-dispatch treats it
     as full. Per-account override, else '*' default, else 0."""
-    rp = CFG.get("reserve_percent") or {}
+    rp = config.CFG.get("reserve_percent") or {}
     if not isinstance(rp, dict):
         return 0
     return rp.get(label, rp.get("*", 0)) or 0
@@ -1144,15 +1087,15 @@ def _model_remaining(acc, model):
 def model_candidates(model, only_account=None):
     """Accounts that could run `model`, each with remaining headroom and whether
     it clears its reserve buffer. Sorted by most remaining first."""
-    data = _limits["data"] if not DEMO else demo_limits()
+    data = _limits["data"] if not config.DEMO else demo_limits()
     if not data or not data.get("available"):
         return []
-    excl = set(CFG.get("exclude_accounts") or [])
+    excl = set(config.CFG.get("exclude_accounts") or [])
     out = []
     for acc in data.get("accounts", []):
         if not acc.get("ok"):
             continue
-        label = account_label(Path(acc["config_dir"]))
+        label = config.account_label(Path(acc["config_dir"]))
         if only_account:
             if label != only_account:
                 continue
@@ -1169,7 +1112,7 @@ def model_candidates(model, only_account=None):
 
 
 def set_reserve(label, percent):
-    """Set an account's reserve buffer from the UI: update CFG, persist to the
+    """Set an account's reserve buffer from the UI: update config.CFG, persist to the
     config file, and re-apply to the cached limits so it takes effect at once."""
     if not label:
         return {"ok": False, "error": "no account"}
@@ -1177,19 +1120,19 @@ def set_reserve(label, percent):
         percent = max(0, min(95, int(percent)))
     except (TypeError, ValueError):
         return {"ok": False, "error": "percent must be a number"}
-    rp = dict(CFG.get("reserve_percent") or {})
+    rp = dict(config.CFG.get("reserve_percent") or {})
     if percent == 0:
         rp.pop(label, None)
     else:
         rp[label] = percent
-    CFG["reserve_percent"] = rp
+    config.CFG["reserve_percent"] = rp
     # persist: merge into the on-disk config (create if missing)
     try:
         disk = {}
-        if CONFIG_PATH and CONFIG_PATH.is_file():
-            disk = json.loads(CONFIG_PATH.read_text())
+        if config.CONFIG_PATH and config.CONFIG_PATH.is_file():
+            disk = json.loads(config.CONFIG_PATH.read_text())
         disk["reserve_percent"] = rp
-        CONFIG_PATH.write_text(json.dumps(disk, indent=2) + "\n")
+        config.CONFIG_PATH.write_text(json.dumps(disk, indent=2) + "\n")
     except (OSError, ValueError) as e:
         return {"ok": False, "error": f"couldn't write config: {e}"}
     # re-enrich cached limits so the change shows without a refetch
@@ -1197,7 +1140,7 @@ def set_reserve(label, percent):
     if data and data.get("accounts"):
         for acc in data["accounts"]:
             if acc.get("config_dir"):
-                r = account_reserve(account_label(Path(acc["config_dir"])))
+                r = account_reserve(config.account_label(Path(acc["config_dir"])))
                 acc["reserve_percent"] = r
                 acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
     return {"ok": True, "label": label, "percent": percent}
@@ -1213,7 +1156,7 @@ def limits_by_account():
     account whose Fable is gone but that still has 40% all-model headroom stays
     pickable for an Opus/Sonnet mission. Collapsing every limit into one
     exhausted flag wrote such accounts off wholesale."""
-    data = _limits["data"] if not DEMO else demo_limits()
+    data = _limits["data"] if not config.DEMO else demo_limits()
     if not data or not data.get("available"):
         return {}
     fetched = (data.get("fetched_at") or time.time())
@@ -1221,7 +1164,7 @@ def limits_by_account():
     for acc in data.get("accounts", []):
         if not acc.get("ok"):
             continue
-        label = account_label(Path(acc["config_dir"]))
+        label = config.account_label(Path(acc["config_dir"]))
         ex = [l for l in acc.get("limits", []) if l.get("exhausted_now")]
         blocking = [l for l in ex if not l.get("model_scoped")]   # session / umbrella weekly
         worst = min(blocking, key=lambda l: l.get("resets_in_seconds") or 0) if blocking else None
@@ -1400,7 +1343,7 @@ def _osa_escape(text):
 
 def send_to_process(pid, text):
     """Type `text` + Enter into the terminal hosting a claude process."""
-    if DEMO:
+    if config.DEMO:
         return {"ok": False, "message": "demo mode — no live agents to talk to"}
     text = re.sub(r"\s*\n\s*", " ", text).strip()
     if not text:
@@ -1529,7 +1472,7 @@ def start_finish(wt_name):
     right here, no agent; anything else -> launch a one-shot closeout agent
     (headless; frees the card itself, or parks as needs-you if the landing
     doesn't verify)."""
-    if DEMO:
+    if config.DEMO:
         return {"ok": False, "message": "demo mode — nothing to finish"}
     wt = next((w for w in discover_worktrees() if w["name"] == wt_name), None)
     if not wt:
@@ -1661,7 +1604,7 @@ def start_finish(wt_name):
 
 def read_chat(account, sid, limit=40):
     """Last conversation turns of a session, from its transcript."""
-    home = next((h for h in claude_homes() if account_label(h) == account), None)
+    home = next((h for h in claude_homes() if config.account_label(h) == account), None)
     if not home:
         return {"ok": False, "error": f"unknown account {account}"}
     fp = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
@@ -1698,7 +1641,7 @@ def read_chat(account, sid, limit=40):
 # --------------------------------------------------------------- dispatch
 
 FLEET_SOCK = "fleet"
-DISPATCH_LOG = HERE / "dispatch.log.jsonl"
+DISPATCH_LOG = config.HERE / "dispatch.log.jsonl"
 
 
 def read_dispatch_log(limit=25):
@@ -1739,7 +1682,7 @@ def _pick_defaults(model=None):
     if model:
         acct = next((c["label"] for c in model_candidates(model) if c["ok"]), None)
     if acct is None:
-        excl = set(CFG.get("exclude_accounts") or [])
+        excl = set(config.CFG.get("exclude_accounts") or [])
         accounts = [(a, d) for a, d in limits.items() if d["available"] and a not in excl]
         accounts.sort(key=lambda x: -(x[1]["headroom"] or 0))
         acct = accounts[0][0] if accounts else None
@@ -1773,7 +1716,7 @@ def start_dispatch(mission, worktree=None, account=None,
                 "nothing is chosen for you"}
     # closeouts skip the headroom dialog: ✓ finish must always just run, and
     # _pick_defaults already prefers an account with headroom for the model
-    if not DEMO and model and not force_model and not closeout_trunk:
+    if not config.DEMO and model and not force_model and not closeout_trunk:
         cached_limits()
         cands = model_candidates(model, only_account=account)
         if not any(c["ok"] for c in cands):
@@ -1854,7 +1797,7 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
             job["result"] = result
             job["done"] = True
 
-    if DEMO:
+    if config.DEMO:
         return finish({"ok": False, "message": "demo mode — dispatch disabled"})
     mission = (mission or "").strip()
     if not mission:
@@ -1872,7 +1815,7 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
     wt = next((w for w in discover_worktrees() if w["name"] == worktree), None)
     if not wt:
         return finish({"ok": False, "message": f"unknown worktree {worktree}"})
-    home = next((h for h in claude_homes() if account_label(h) == account), None)
+    home = next((h for h in claude_homes() if config.account_label(h) == account), None)
     if not home:
         return finish({"ok": False, "message": f"unknown account {account}"})
 
@@ -1994,7 +1937,7 @@ def dispatch_status(job_id):
 # persisted to resume.schedule.json, and pending entries whose time passed
 # while the server was down fire on the first loop pass after boot.
 
-RESUME_STATE = HERE / "resume.schedule.json"
+RESUME_STATE = config.HERE / "resume.schedule.json"
 RESUME_POLL_S = 5.0
 RESUME_MAX_ATTEMPTS = 10       # re-arms on "still limited" before giving up
 _resumes = {}                  # "worktree|sid" -> schedule dict
@@ -2031,7 +1974,7 @@ def _resume_set(key, **updates):
 
 def resume_public():
     """The schedules, shaped for the board (rides along on /api/state)."""
-    if DEMO:
+    if config.DEMO:
         return demo_resumes()
     with _resumes_lock:
         return {k: dict(r) for k, r in _resumes.items()}
@@ -2049,14 +1992,14 @@ def schedule_resume(worktree, sid, account, model=None, delay_s=None,
     """Arm (or re-arm) an auto-resume. The due time is `due_at` when given
     (the user picked an exact time), else the limit reset + delay. Refuses —
     asking for an exact time — when no reset timestamp is known."""
-    if DEMO:
+    if config.DEMO:
         return {"ok": False, "message": "demo mode — nothing to schedule"}
     if not (worktree and sid and account):
         return {"ok": False, "message": "need worktree, sid and account"}
     now = time.time()
     try:
         delay = float(delay_s if delay_s is not None
-                      else CFG.get("resume_delay_s", 60))
+                      else config.CFG.get("resume_delay_s", 60))
     except (TypeError, ValueError):
         return {"ok": False, "message": "delay must be a number of seconds"}
     delay = max(0.0, min(86400.0, delay))
@@ -2210,7 +2153,7 @@ def _tmux_resume(worktree, cwd, home, sid):
     attach = f"tmux -L {FLEET_SOCK} attach -t {name}"
     where = f"no scriptable terminal — resumed in tmux · {attach}"
     fp = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
-    msg = CFG.get("resume_message", "continue")
+    msg = config.CFG.get("resume_message", "continue")
     _wait_composer_idle(name, RESUME_READY_S)
     for attempt in range(3):
         if attempt:   # the last paste vanished — let the CLI settle, try again
@@ -2242,7 +2185,7 @@ def fire_resume(key):
     if not r or r.get("status") != "pending":
         return
     now = time.time()
-    if DEMO:
+    if config.DEMO:
         return _resume_set(key, status="failed", fired_at=now,
                            message="demo mode")
     worktree, sid, account = r["worktree"], r["sid"], r["account"]
@@ -2266,14 +2209,14 @@ def fire_resume(key):
                            attempts=attempts, message=
                            "still limited — re-armed for the next reset")
 
-    msg = CFG.get("resume_message", "continue")
+    msg = config.CFG.get("resume_message", "continue")
     if proc and proc.get("reachable"):
         res = send_to_process(proc["pid"], msg)
         if res.get("ok"):
             return _resume_set(key, status="done", fired_at=now,
                                message=f"sent '{msg}' — {res['message']}")
     wt = next((w for w in discover_worktrees() if w["name"] == worktree), None)
-    home = next((h for h in claude_homes() if account_label(h) == account), None)
+    home = next((h for h in claude_homes() if config.account_label(h) == account), None)
     if not wt or not home:
         return _resume_set(key, status="failed", fired_at=now, message=
                            "worktree or account no longer known — nothing sent")
@@ -2346,16 +2289,16 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(result).encode()
             ctype = "application/json"
         elif self.path.split("?", 1)[0] in ("/", "/index", "/index.html"):
-            body = (HERE / "index.html").read_bytes()
+            body = (config.HERE / "index.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         elif self.path.startswith("/map"):
-            body = (HERE / "map.html").read_bytes()
+            body = (config.HERE / "map.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         elif self.path.startswith("/limits"):
-            body = (HERE / "limits.html").read_bytes()
+            body = (config.HERE / "limits.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         elif self.path.startswith("/guide"):
-            body = (HERE / "guide.html").read_bytes()
+            body = (config.HERE / "guide.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         else:
             self.send_error(404)

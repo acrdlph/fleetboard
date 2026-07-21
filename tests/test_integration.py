@@ -88,8 +88,8 @@ class TestCollectPipeline(unittest.TestCase):
         # point orchestra at the fixtures; neutralize live-system inputs
         self._save = {k: fb.CFG.get(k) for k in
                       ("roots", "homes", "pattern", "exclude_accounts", "reserve_percent")}
-        self._demo, self._procs, self._cl = fb.DEMO, fb.claude_processes, fb.cached_limits
-        fb.DEMO = False
+        self._demo, self._procs, self._cl = fb.config.DEMO, fb.claude_processes, fb.cached_limits
+        fb.config.DEMO = False
         fb.CFG["roots"] = [str(self.root)]
         fb.CFG["homes"] = [str(self.home)]
         fb.CFG["pattern"] = ""
@@ -105,7 +105,7 @@ class TestCollectPipeline(unittest.TestCase):
                 fb.CFG.pop(k, None)
             else:
                 fb.CFG[k] = v
-        fb.DEMO, fb.claude_processes, fb.cached_limits = self._demo, self._procs, self._cl
+        fb.config.DEMO, fb.claude_processes, fb.cached_limits = self._demo, self._procs, self._cl
         fb._cache["state"] = None
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -222,15 +222,15 @@ class TestTopologyPipeline(unittest.TestCase):
         git(self.repo, "commit", "-q", "-m", "c2")
 
         self._save = {k: fb.CFG.get(k) for k in ("roots", "pattern")}
-        self._demo = fb.DEMO
-        fb.DEMO = False
+        self._demo = fb.config.DEMO
+        fb.config.DEMO = False
         fb.CFG["roots"] = [str(self.root)]; fb.CFG["pattern"] = ""
         fb._topo["data"] = None
 
     def tearDown(self):
         for k, v in self._save.items():
             fb.CFG[k] = v if v is not None else fb.CFG.pop(k, None)
-        fb.DEMO = self._demo
+        fb.config.DEMO = self._demo
         fb._topo["data"] = None
         shutil.rmtree(self.tmp, ignore_errors=True)
 

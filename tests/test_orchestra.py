@@ -43,14 +43,14 @@ class ConfigGuard(unittest.TestCase):
     def setUp(self):
         self._cfg = dict(fb.CFG)
         self._limits = dict(fb._limits)
-        self._demo = fb.DEMO
-        self._cpath = fb.CONFIG_PATH
+        self._demo = fb.config.DEMO
+        self._cpath = fb.config.CONFIG_PATH
 
     def tearDown(self):
         fb.CFG.clear(); fb.CFG.update(self._cfg)
         fb._limits.clear(); fb._limits.update(self._limits)
-        fb.DEMO = self._demo
-        fb.CONFIG_PATH = self._cpath
+        fb.config.DEMO = self._demo
+        fb.config.CONFIG_PATH = self._cpath
 
 
 # ---------------------------------------------------------------- text utils
@@ -384,7 +384,7 @@ class TestModelHeadroom(ConfigGuard):
         self.assertIsNone(fb._model_remaining(acc("/h/.claude", ok=False), "opus"))
 
     def test_model_candidates_respects_reserve_and_exclude(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {"account3": 20}
         fb._limits["data"] = {"available": True, "accounts": [
@@ -400,7 +400,7 @@ class TestModelHeadroom(ConfigGuard):
         self.assertEqual(fb.model_candidates("opus")[0]["label"], "account4")
 
     def test_model_candidates_only_account_ignores_exclude(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {}
         fb._limits["data"] = {"available": True, "accounts": [
@@ -414,7 +414,7 @@ class TestModelHeadroom(ConfigGuard):
 
 class TestLimitsByAccount(ConfigGuard):
     def test_reserve_blocked_and_available(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {"main": 20}
         fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
             acc("/h/.claude", headroom=15, limits=[lim("Weekly", 85)]),           # 15 < 20 → blocked
@@ -431,7 +431,7 @@ class TestLimitsByAccount(ConfigGuard):
         self.assertEqual(out["account5"]["worst"], "Weekly")
 
     def test_skips_not_ok_accounts(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
         fb._limits["data"] = {"available": True, "accounts": [acc("/h/.claude", ok=False)]}
         self.assertEqual(fb.limits_by_account(), {})
@@ -442,7 +442,7 @@ class TestLimitsByAccount(ConfigGuard):
         account stays available for an Opus/Sonnet mission. Regression: the
         model-blind exhausted flag wrote account8 (41% left, only Fable gone)
         off wholesale, so the router reported it exhausted."""
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
         fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
             acc("/h/.claude-account8", headroom=41, limits=[
@@ -461,7 +461,7 @@ class TestLimitsByAccount(ConfigGuard):
     def test_account_wide_exhaustion_still_blocks(self):
         """The umbrella Weekly (non-model-scoped) being gone DOES take the whole
         account out — every model shares that cap."""
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
         fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
             acc("/h/.claude-account5", headroom=0, limits=[
@@ -479,7 +479,7 @@ class TestLimitsByAccount(ConfigGuard):
         Accounts that only lost Fable must stay available; only the
         umbrella-Weekly ones drop out — and an Opus mission routes to the
         most-headroom survivor rather than failing outright."""
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {}
 
@@ -519,7 +519,7 @@ class TestSetReserve(ConfigGuard):
         self.tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump({"pattern": "confid", "reserve_percent": {}}, self.tmp)
         self.tmp.close()
-        fb.CONFIG_PATH = Path(self.tmp.name)
+        fb.config.CONFIG_PATH = Path(self.tmp.name)
         fb.CFG["reserve_percent"] = {}
         fb._limits["data"] = None
 
@@ -585,7 +585,7 @@ class TestDispatchContract(ConfigGuard):
     """Routing is deterministic and model + effort are the caller's job."""
     def setUp(self):
         super().setUp()
-        fb.DEMO = True   # a refusal must come back before any thread launches
+        fb.config.DEMO = True   # a refusal must come back before any thread launches
 
     def test_missing_model_or_effort_is_refused_cleanly(self):
         for kw in ({}, {"model": "opus"}, {"effort": "high"}):
@@ -636,7 +636,7 @@ class TestStartFinish(ConfigGuard):
 
     def setUp(self):
         super().setUp()
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb._closeouts.clear()
         self._saved = {n: getattr(fb, n) for n in
                        ("run", "discover_worktrees", "claude_processes",
@@ -906,7 +906,7 @@ class ResumeGuard(ConfigGuard):
     """Isolate the auto-resume registry and its on-disk state file."""
     def setUp(self):
         super().setUp()
-        fb.DEMO = False
+        fb.config.DEMO = False
         self.tmpdir = tempfile.mkdtemp(prefix="fb-resume-")
         self._state_path = fb.RESUME_STATE
         fb.RESUME_STATE = Path(self.tmpdir) / "resume.schedule.json"
@@ -977,7 +977,7 @@ class TestScheduleResume(ResumeGuard):
         self.assertAlmostEqual(out["due_at"], now + 3600 + 60, delta=2)
 
     def test_demo_refuses(self):
-        fb.DEMO = True
+        fb.config.DEMO = True
         self.assertFalse(fb.schedule_resume("wt", "s1", "a")["ok"])
 
     def test_cancel(self):
@@ -1356,7 +1356,7 @@ class TestTmuxResume(unittest.TestCase):
 class TestDemoState(ConfigGuard):
     def setUp(self):
         super().setUp()
-        fb.DEMO = True
+        fb.config.DEMO = True
 
     def test_demo_state_shape(self):
         st = fb.cached_state()
@@ -1373,7 +1373,7 @@ class TestHTTPSmoke(ConfigGuard):
     """Spin the real server in DEMO mode (no subprocess) and hit it."""
     def setUp(self):
         super().setUp()
-        fb.DEMO = True
+        fb.config.DEMO = True
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), fb.Handler)
         self.port = self.srv.server_address[1]
         self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
