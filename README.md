@@ -14,7 +14,7 @@ one silently hit a usage limit an hour ago? Which worktree is free for the
 next feature — and on which account? orchestra answers all of it on one dark
 board, and (when you click) acts on it too.
 
-It's an agent **harness** with zero dependencies — one python3 stdlib file.
+It's an agent **harness** that installs nothing — python3 stdlib only.
 
 ```bash
 git clone https://github.com/acrdlph/orchestra && cd orchestra

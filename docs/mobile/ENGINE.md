@@ -4,6 +4,12 @@
 document. Where it contradicts an earlier ADR, this document wins and an ADR is raised to record
 the reversal (see §11).
 
+> **`orchestra.py:NNN` citations throughout are historical.**
+> [ADR 0010](adr/0010-split-into-a-package.md) split that file into the `orchestra/` package;
+> the line numbers were true at the 2,302-line commit this was written against. Grep for the
+> symbol name. §2.1, §2.8, §9 and §10 carry inline notes where the split actually reversed a
+> decision rather than merely moved a line.
+
 It decides four things and does not reopen them:
 
 1. **Two components, not three.** `OBSERVER` (knows) and `SERVER` (tells and does), sitting on a
@@ -11,7 +17,10 @@ It decides four things and does not reopen them:
 2. **Stateless per sweep stays the source of truth.** The engine becomes *continuous*, not
    *accumulating*. Byte-offset incremental parsing is rejected on measurement.
 3. **Per-target leases, never a global mutation mutex.**
-4. **One process, one file, background threads, supervised by launchd.**
+4. **One process, background threads, supervised by launchd.** (Originally *"one process, one
+   file"* — the *one file* clause was reversed by [ADR 0010](adr/0010-split-into-a-package.md)
+   and the code is now the `orchestra/` package. Everything else here is unaffected: it was
+   always an argument about process count, not file count.)
 
 ---
 
@@ -87,8 +96,9 @@ edits fix most of it and none of them is architectural:
 | `working_s` 90 → 25 | removes the dominant staleness term |
 
 What makes the architecture worth doing is the **combination**: the iOS client is coming, and the
-wire contract it binds to is decided by this work. Refactoring `orchestra.py` is always cheap —
-one file, 1,634 lines of tests. Refactoring an App Store binary is not. So the test for "does
+wire contract it binds to is decided by this work. Refactoring the engine is always cheap —
+1,634 lines of tests, and (since ADR 0010) a package whose seams the import graph enforces.
+Refactoring an App Store binary is not. So the test for "does
 this land now" is not *is it elegant* but **would shipping iOS before it force iOS to be rebuilt**.
 Four things pass that test (§8), and all four are cheap. Everything else in this document is
 internal and could, in principle, be deferred — it is landed anyway because the migration order
@@ -137,9 +147,15 @@ This is the only criterion on the table that is falsifiable, so it is the one us
 ```
 
 The arrow from OBSERVER to SERVER is `snapshot()` / `wait_for()`. The arrow back is `nudge()` and
-`hook()` — evidence, never commands. **OBSERVER must never reference a SERVER symbol.** Both live
-in `orchestra.py` at module scope (§2.7); the direction is enforced by a grep test, not by the
-import system, and that is a conscious trade recorded in §10.
+`hook()` — evidence, never commands. **OBSERVER must never reference a SERVER symbol.**
+
+> **Updated by [ADR 0010](adr/0010-split-into-a-package.md) — shipped.** This paragraph used to
+> read *"Both live in `orchestra.py` at module scope (§2.7); the direction is enforced by a grep
+> test, not by the import system."* They no longer do. `observer.py` and `server.py` are separate
+> modules and the import system enforces the direction: `server` imports `observer`, never the
+> reverse. The one back-edge that exists — `observer.collect_state` reaping `finish._closeouts` —
+> is a **deliberate, commented function-local import**, which is exactly the kind of thing a grep
+> test could not have caught. The rule is unchanged; its enforcement got stronger.
 
 ### 2.2 Why ENGINE / BROKER / ACTUATOR was rejected
 
@@ -497,8 +513,9 @@ and no audit row. Journal `phase: creating` with the tmux name *before* the side
 
 ### 2.8 Deployment
 
-**One process, two components, one file, background threads, under launchd `KeepAlive` +
-`RunAtLoad` — not `nohup` (start.sh:10).**
+**One process, two components, background threads, under launchd `KeepAlive` +
+`RunAtLoad` — not `nohup` (start.sh:10).** (Said *"one file"* until ADR 0010; process count is
+what this section argues, and that is unchanged.)
 
 Process count and supervision are orthogonal axes and only the first was ever argued. The gap
 "no client attached" is closed by a background thread, in-process. The gap "no process running" is
@@ -1161,13 +1178,30 @@ nghttp2 1.67.1. Both binaries ship with macOS. No package.
 ## 9. Migration
 
 Every step is independently shippable, independently valuable and independently revertable. Every
-step keeps all 142 stdlib `unittest` tests green — which constrains the design: **all functions stay
-at module scope in `orchestra.py`**, because the suite loads the file by path via
-`importlib.util.spec_from_file_location` and monkeypatches module globals (`fb.run`, `fb.git_info`,
-`fb.claude_processes`, `fb.send_to_process`, `fb._cache`, `fb._closeouts`, `fb._resumes`, `fb.CFG`).
-Splitting into `probes.py` / `observer.py` / `server.py` would break that patch point in ~40 setUps
-in the same commit that moves 2,300 lines of behaviour — deleting the safety net and doing the
-dangerous thing simultaneously. See §10.
+step keeps the stdlib `unittest` suite green.
+
+> **The "one file" constraint is OBSOLETE — superseded by
+> [ADR 0010](adr/0010-split-into-a-package.md), shipped.** This section used to add: *"which
+> constrains the design: **all functions stay at module scope in `orchestra.py`**, because the
+> suite loads the file by path via `importlib.util.spec_from_file_location` and monkeypatches
+> module globals … Splitting into `probes.py` / `observer.py` / `server.py` would break that
+> patch point in ~40 setUps in the same commit that moves 2,300 lines of behaviour — deleting
+> the safety net and doing the dangerous thing simultaneously."*
+>
+> The objection was real about the hazard and wrong about the remedy, and ADR 0010 answers it
+> with two measures taken **before** any code moved:
+>
+> 1. `tests/characterize.py` — 1,589 cases across 13 functions, byte-compared against a recorded
+>    golden, monkeypatching **nothing**. The split could not disarm it, and it resolves either
+>    layout, so it doubles as proof the facade is complete. It was verified to actually fail by
+>    reintroducing a known regression.
+> 2. **Import modules, not names** — every cross-module reference goes through the module object
+>    (`from . import gitrepo` … `gitrepo.git_info(…)`), which keeps attribute lookup late and so
+>    keeps every patch point alive. The 67 patch sites migrated to their canonical module
+>    (`fb.shell.run`, `fb.procs.claude_processes`, `fb.config.DEMO`, …), one module per commit.
+>
+> The steps below are otherwise unaffected — they were always about behaviour, not file layout.
+> Their `orchestra.py:NNN` citations are historical; grep for the symbol instead.
 
 Baseline before starting: 142 tests, 15.4 s, one pre-existing environmental failure
 (`test_send_keys_reaches_the_shell`, tmux).
@@ -1297,7 +1331,7 @@ moves.
 |---|---|
 | **ENGINE / BROKER / ACTUATOR** | cut on verbs; ACTUATOR fails every clause of the component rule (§2.2). Its two headline rules — global serialisation and actuator-must-not-read-engine — are respectively fatal and already satisfied |
 | **A fact store with independent producers** | breaks the one-pass consistency `pair_sessions_with_procs`:186–199 and the succession pass at :735–745 require (§2.3). Its three best payload ideas are adopted |
-| **Splitting into `probes.py` / `observer.py` / `server.py`** | breaks the module-global monkeypatch idiom all 142 tests are built on, for a boundary that would still be a convention. Revisit only after step 2 exists, when the publish point already marks the seam. Enforced meanwhile by a load-time assert and a symbol-grep test |
+| ~~**Splitting into `probes.py` / `observer.py` / `server.py`**~~ **— REVERSED, and built.** [ADR 0010](adr/0010-split-into-a-package.md) | the original entry read: *"breaks the module-global monkeypatch idiom all 142 tests are built on, for a boundary that would still be a convention."* Both halves were answered rather than waited out: `tests/characterize.py` (1,589 cases, patches nothing) replaced the monkeypatch idiom as the safety net, and module-object imports (`from . import gitrepo`, never `from .gitrepo import git_info`) kept every patch point alive at its canonical module. The boundary is now the import graph, not a convention |
 | **Byte-offset incremental parsing** | 5.8 % of the collect; the 128 KB tail it replaces costs 0.9 ms; the stat-keyed memo recovers ~98 % for free; and it forfeits the file's best property — no bug outlives one sweep (§4.2) |
 | **kqueue watches** | a full stat sweep over 532 transcripts is **7.8 ms** and exactly **one** file changes in a 5 s window. A directory watch says the directory changed, not which entry; subagent `.jsonl` are *created* (~982/day, peak 4,123) in nested dirs, so per-file watches cannot see them. **If ever built: nudge-only, hard-capped at 256 fds, never a source of truth.** Note the fd correction below |
 | **Per-client delta computation as a protocol** | 32,381-byte payload on loopback; `reconcileGrid` already diffs per card. Kept only as a byproduct of per-card versioning, behind the `type` field |
@@ -1317,9 +1351,10 @@ deferred for the measurement reasons above regardless, and capped at 256 fds if 
 
 - The `mutating()` thread-local does not follow a thread spawned inside an actuation. The dispatch
   worker sets it explicitly; the backstop for everything else is a grep test, not the type system.
-- Two components in one file makes the import-direction rule a convention. Chosen deliberately over
-  the single-file zero-dependency identity; the substitute is a load-time assert plus a symbol-grep
-  test.
+- ~~Two components in one file makes the import-direction rule a convention.~~ **No longer a
+  weakness** — ADR 0010 split the file, so `server` imports `observer` and the import system
+  enforces the direction. Zero dependencies survived intact; only the *one file* clause was
+  traded.
 - Per-target leases that fail fast can tell a user "busy, try again". For a 40 ms tmux write that is
   worse than a 50 ms queue wait. Bounded at 2 s with the holder named; the right policy is a UX
   judgement to settle by watching the user hit it (§11).

@@ -7,7 +7,9 @@ over a Tailscale tailnet, without losing what makes it orchestra.
 Every number tagged **[M]** was measured on the author's machine against the live fleet
 (9 worktrees / 33 sessions / 8 Claude homes / 697 transcripts / 1.10 GB). Numbers tagged
 **[E]** are estimates and are labelled as such. Line references are `orchestra.py` at the
-commit this document was written against (2302 lines).
+commit this document was written against (2302 lines) — that file no longer exists: ADR 0010
+split it into the `orchestra/` package, so every `orchestra.py:NNN` citation below is a
+historical pointer, not a place to look. Grep for the symbol name instead.
 
 > **Path prefix: this document says `/api/v1/…`; the shipping contract is `/api/v1/…`.**
 > `API.md` §0 settled it — the *new* surface is v1 because it is the first versioned API,
@@ -280,10 +282,19 @@ A stale board that still looks alive is the failure to design against.
 
 ### On "one file, zero dependencies"
 
-The README's claim is *"an agent harness with zero dependencies — one python3 stdlib file."*
+> **SUPERSEDED by [ADR 0010](adr/0010-split-into-a-package.md) — shipped.** The *reasoning*
+> below stands and is why the split happened: the installs-nothing clause is the one that
+> matters, the file-count clause is the one that costs. The *mechanics* below do not. ADR 0010
+> keeps **no `orchestra.py` shim** (a stray module beside the `orchestra/` package shadows it
+> ambiguously — the entry point is `python3 -m orchestra`, and `start.sh` was repointed), and
+> its module names follow `ENGINE.md`'s component model, not the `paths.py` / `cli.py` /
+> `gitx.py` / `sessions.py` / `state.py` tree in §4.1. Read the ADR for the layout as built.
+> Everything below is kept for the argument, not the instructions.
+
+The README's claim was *"an agent harness with zero dependencies — one python3 stdlib file."*
 Two clauses, and they are not equally load-bearing.
 
-**The clause that matters is `git clone && python3 orchestra.py`** — no pip, no venv, no wheel,
+**The clause that matters is `git clone && python3 -m orchestra`** — no pip, no venv, no wheel,
 no build step. A directory of `.py` files preserves every bit of that. **The clause that costs
 is "one file."** What it buys beyond the above is `curl | python3`, which nothing in the repo,
 the README, or `start.sh` uses. What it costs, once this design lands (+~1,100 lines of auth,
@@ -291,9 +302,10 @@ idempotency, snapshots, ops, routing, gzip, push), is a 3,400-line module where 
 boundary is a paragraph in the middle of a file that also holds AppleScript templates — with
 no linter and no type checker in CI (`py_compile` is the entire static-analysis budget).
 
-**Decision: split into a stdlib-only package `orchestra/`, keep `orchestra.py` as a 25-line
-launcher shim so `./start.sh` and every existing invocation still work. Restate the promise
-precisely, and enforce it mechanically:**
+**Decision: split into a stdlib-only package `orchestra/`.** (This document's original wording
+added *"keep `orchestra.py` as a 25-line launcher shim"* — ADR 0010 rejected the shim; the entry
+point moved to `python3 -m orchestra` instead.) **Restate the promise precisely, and enforce it
+mechanically:**
 
 > **orchestra installs nothing. It imports only the Python standard library, and it shells out
 > only to binaries the host already has.**
@@ -312,8 +324,15 @@ clause. It is the trade the user asked to be made consciously rather than discov
 
 ### 4.1 File tree
 
+> **SUPERSEDED by [ADR 0010](adr/0010-split-into-a-package.md) for the modules that exist
+> today.** The shim line and the `paths.py` / `cli.py` / `proc.py` / `gitx.py` / `sessions.py` /
+> `state.py` names below were never built; the shipped package is `config, shell, gitrepo,
+> procs, transcripts, status, observer, limits, terminal, chat, finish, dispatch, resume,
+> server` plus a facade `__init__.py` and `__main__.py`. The `[NEW]` rows (`bus.py`, `ids.py`,
+> `ops.py`, `push.py`, …) are still proposals and still belong to this design.
+
 ```
-orchestra.py              25-line shim: sys.path insert + orchestra.cli.main()
+orchestra.py              ✗ NOT BUILT — no shim; entry point is `python3 -m orchestra`
 orchestra/
   __init__.py            __version__, API_VERSION — nothing executable
   __main__.py            main()

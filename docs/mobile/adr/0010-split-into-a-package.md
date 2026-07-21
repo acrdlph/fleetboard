@@ -1,6 +1,6 @@
 # ADR 0010 — Split `orchestra.py` into a stdlib-only package
 
-**Date:** 2026-07-21 · **Status:** Accepted
+**Date:** 2026-07-21 · **Status:** Accepted — **shipped**, in 17 commits, one module per commit.
 
 ## Context
 
@@ -67,6 +67,39 @@ orchestra/
                   ── serve: the part that tells
   server.py       Handler, routing
 ```
+
+### As built — two deliberate deviations from the tree above
+
+The tree, taken literally, contains two import cycles. Both were broken the same way: **move the
+shared helper down**, to the module that already sits below both ends of the cycle.
+
+| symbol | ADR says | shipped in | why |
+|---|---|---|---|
+| `account_label` | `transcripts.py` | **`config.py`** | `procs.claude_processes` calls it, and `transcripts.scan_sessions` calls `procs.pair_sessions_with_procs` — so `transcripts` owning it makes procs↔transcripts mutual. It is a four-line pure string function on a home-dir name with zero dependencies, called from six modules. It is a shared leaf helper, not transcript logic. Direction becomes `config → procs → transcripts`, which is the order this ADR intended. |
+| `closeout_shell` | `finish.py` (implied by "the closeout saga") | **`dispatch.py`** | `finish.start_finish` calls `dispatch.start_dispatch`, and `dispatch._run_dispatch` was the only caller of `closeout_shell` — mutual. It is a pure f-string builder for the tmux command a dispatch runs, takes the brief as a parameter and touches none of the `CLOSEOUT_*` constants, so it carries nothing with it. Direction becomes `finish → dispatch`, one way. |
+
+**The one true cycle, and the one late import.** `observer.collect_state` reaps `finish._closeouts`;
+`finish.start_finish` invalidates `observer._cache`. This ADR pins `_closeouts`→finish and
+`_cache`→observer, so neither could simply move. It is broken at *import* time only: `finish`
+imports `observer` at module level (act depends on observe — the correct direction), and
+`collect_state` reaches `finish` through a single, commented, function-local import. Python
+resolves it from `sys.modules` at call time for free. To keep every intermediate commit
+self-consistent, `finish.py` was extracted in two commits — state and pure helpers first (a leaf,
+depending only on `shell`), then `start_finish` after `observer` and `dispatch` existed. The result
+is a strict import-time DAG at every single commit and exactly one call-time back-edge.
+
+**`HERE` moved up, not down.** `Path(__file__).resolve().parent` became `.parent.parent` in the
+first commit. The package lives one level under the repo root, so without that change
+`orchestra.config.json`, `dispatch.log.jsonl`, `resume.schedule.json` and the four served HTML
+assets would all have silently relocated into `orchestra/` — losing every armed resume schedule and
+404-ing the board on `/`. No test covered it; it was verified by hand.
+
+**Four scalars are deliberately absent from the facade** — `DEMO`, `CONFIG_PATH`, `RESUME_STATE`,
+`DISPATCH_LOG`. They are rebound at runtime, so a facade re-export would be a stale snapshot and
+`orchestra.DEMO = True` would be a patch that lies — the exact failure mode this ADR exists to
+prevent. Reach them at `orchestra.config.DEMO` and friends. Everything else is re-exported,
+including the mutable containers, which the facade binds as the *same object* so in-place test
+mutation keeps working untouched.
 
 ## Consequences
 

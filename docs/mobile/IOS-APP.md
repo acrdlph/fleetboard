@@ -1,7 +1,9 @@
 # orchestra for iOS — engineering plan
 
 Status: **plan**. Written against `/Users/achill/Downloads/orchestr/orchestra.py` at HEAD
-(2302 lines). The client is built for the **versioned, op-addressed, SSE-streamed API** the
+(2302 lines) — since [ADR 0010](adr/0010-split-into-a-package.md) that file is the `orchestra/`
+package, so every `orchestra.py:NNN` citation below is a historical pointer; grep for the symbol
+name, and read `python3 -m orchestra` wherever the entry point is named. The client is built for the **versioned, op-addressed, SSE-streamed API** the
 backend ships first — `Orchestra-Api: 1.0`, served under `/api/v1/`. There is no legacy mode;
 see §5.6.
 

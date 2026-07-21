@@ -3,6 +3,11 @@
 Measured directly on the user's machine (macOS 25.2.0 / Darwin, python 3.14.5), 2026-07-21.
 These are **empirical**, not recalled — the design docs must not contradict them.
 
+> The `orchestra.py:NNN` citations below are historical. ADR 0010 split that file into the
+> `orchestra/` package; the *measurements* are unaffected, only the addresses. Today:
+> `STATE_TTL_S` → `orchestra/observer.py`, `CFG["working_s"]` → `orchestra/config.py`,
+> `git_info` and `branch_topology` → `orchestra/gitrepo.py`.
+
 ## Baseline performance
 
 ```

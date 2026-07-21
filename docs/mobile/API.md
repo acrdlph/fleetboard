@@ -1,8 +1,8 @@
 # orchestra HTTP API — v1
 
 **Status:** specification. This document is the contract. Where it disagrees with
-`orchestra.py` at HEAD, the code is wrong and must be changed; where it disagrees with
-an earlier design note, this document wins.
+the `orchestra/` package at HEAD, the code is wrong and must be changed; where it
+disagrees with an earlier design note, this document wins.
 
 **Audience:** the Swift engineer writing the iOS client, and the Python engineer
 implementing the server. Both should be able to work from this file alone.
@@ -316,7 +316,7 @@ tailnet node. Do not do half of it.
 ### 3.1 Flow
 
 ```
-Mac (board /pair, or `python3 orchestra.py --pair`)      iPhone
+Mac (board /pair, or `python3 -m orchestra --pair`)      iPhone
 ──────────────────────────────────────────────────      ──────
 1. admin taps "＋ pair a device"
 2. POST /api/v1/devices/pair/open

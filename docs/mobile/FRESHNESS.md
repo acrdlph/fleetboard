@@ -4,6 +4,12 @@
 **Outranked by:** [`VERIFIED-FACTS.md`](VERIFIED-FACTS.md). If this document contradicts a
 measurement there, this document is wrong.
 
+> `orchestra.py:NNN` citations throughout are historical —
+> [ADR 0010](adr/0010-split-into-a-package.md) split that file into the `orchestra/` package.
+> Grep for the symbol name. The one substantive change: the suite no longer loads a file by
+> path, so the passages about `tests/` importing `orchestra.py` via `importlib` now read
+> `import orchestra`.
+
 This is the specification for the state layer that both the web board and the coming iOS client
 read. It covers one thing: making what they display **fresh** — low-latency, accurate, and cheap
 enough to push. The API contract, auth, and the phone's UX live in their own documents.

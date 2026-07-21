@@ -37,9 +37,10 @@ GOLDEN = ROOT / "tests" / "golden" / "characterization.json"
 def load_orchestra():
     """Import the app under either layout.
 
-    Single file today (`orchestra.py`); a package after the split
-    (`orchestra/__init__.py`). Everything this harness touches must be reachable from the
-    top-level name in both, which is the facade contract.
+    A package today (`orchestra/__init__.py`); a single `orchestra.py` before ADR 0010.
+    Everything this harness touches must be reachable from the top-level name in both,
+    which is the facade contract. The single-file branch is kept so the harness still runs
+    against a pre-split commit — that is how "identical on both sides" was proved.
     """
     pkg_init = ROOT / "orchestra" / "__init__.py"
     single = ROOT / "orchestra.py"

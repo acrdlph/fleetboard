@@ -17,7 +17,7 @@ are.
 | | |
 |---|---|
 | **Phase** | A — design (nearly settled) · first code shipped |
-| **Shipped** | **Layer 0** — classifier ladder reordered (orchestra.py `classify_session`). 142 tests pass; input-space diff confirms only the two intended changes. |
+| **Shipped** | **Layer 0** — classifier ladder reordered (`classify_session`, now `orchestra/status.py`). 142 tests pass; input-space diff confirms only the two intended changes. · **ADR 0010** — `orchestra.py` split into the `orchestra/` package, behaviour-identical against `tests/characterize.py` (1,589 pinned cases). |
 | **Next milestone** | collapse the git subprocess storm (see *Development path*, step 1) |
 | **Last updated** | 2026-07-21 |
 
@@ -51,8 +51,8 @@ treat it as draft.
 
 ## The problem, in one screen
 
-orchestra computes state **lazily** — only when a client asks (`cached_state()`,
-orchestra.py:1000). Measured on a 9-worktree fleet:
+orchestra computes state **lazily** — only when a client asks
+(`cached_state()`, now `orchestra/observer.py`). Measured on a 9-worktree fleet:
 
 ```
 collect_state()          1641 ms
@@ -139,9 +139,8 @@ sequencing in ADR 0004.
 
    ```bash
    python3 - <<'EOF'
-   import time, importlib.util
-   spec = importlib.util.spec_from_file_location("o", "orchestra.py")
-   o = importlib.util.module_from_spec(spec); spec.loader.exec_module(o)
+   import time
+   import orchestra as o          # run from the repo root; ADR 0010 made it a package
    o.load_config()
    t = time.time(); o.collect_state()
    print(f"collect_state: {(time.time()-t)*1000:.0f} ms")
