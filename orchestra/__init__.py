@@ -33,7 +33,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler
 
-from . import config, shell, status, gitrepo, procs, transcripts, limits, terminal
+from . import (config, shell, status, gitrepo, procs, transcripts, limits,
+               terminal, chat)
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO and
@@ -57,6 +58,7 @@ from .limits import (cached_limits, account_reserve, _model_remaining,
                      demo_limits, _limit_active_until, _cclimits_bin,
                      LIMITS_TTL_S, _limits)
 from .terminal import focus_process, send_to_process, _osa_escape
+from .chat import read_chat
 
 STATE_TTL_S = 4.0              # cache collector output between requests
 _cache = {"t": 0.0, "state": None}
@@ -495,46 +497,6 @@ def start_finish(wt_name):
                    "no live terminal — launched a one-shot closeout agent; "
                    "the card frees itself once the landing verifies")
     return out
-
-
-# ------------------------------------------------------------- chat reader
-
-def read_chat(account, sid, limit=40):
-    """Last conversation turns of a session, from its transcript."""
-    home = next((h for h in transcripts.claude_homes()
-                 if config.account_label(h) == account), None)
-    if not home:
-        return {"ok": False, "error": f"unknown account {account}"}
-    fp = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
-    if not fp:
-        return {"ok": False, "error": "transcript not found"}
-    msgs = []
-    for line in transcripts._read_chunk(fp, 512 * 1024, from_end=True).splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if e.get("isSidechain") or e.get("isMeta"):
-            continue
-        msg = e.get("message")
-        if not isinstance(msg, dict):
-            continue
-        c = msg.get("content")
-        if e.get("type") == "user":
-            texts = [c] if isinstance(c, str) else [
-                b.get("text", "") for b in c
-                if isinstance(b, dict) and b.get("type") == "text"] if isinstance(c, list) else []
-            for t in texts:
-                if transcripts._real_prompt(t):
-                    msgs.append({"role": "you", "text": transcripts._clean(t, 900),
-                                 "ts": e.get("timestamp")})
-        elif e.get("type") == "assistant" and isinstance(c, list):
-            parts = [b["text"] for b in c
-                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
-            if parts:
-                msgs.append({"role": "agent", "text": transcripts._clean(" ".join(parts), 900),
-                             "ts": e.get("timestamp")})
-    return {"ok": True, "messages": msgs[-limit:]}
 
 
 # --------------------------------------------------------------- dispatch
@@ -1160,7 +1122,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/chat"):
             qa = re.search(r"account=([^&]+)", self.path)
             qs = re.search(r"sid=([0-9a-fA-F-]+)", self.path)
-            result = read_chat(qa.group(1), qs.group(1)) if qa and qs else \
+            result = chat.read_chat(qa.group(1), qs.group(1)) if qa and qs else \
                 {"ok": False, "error": "need account & sid"}
             body = json.dumps(result).encode()
             ctype = "application/json"
