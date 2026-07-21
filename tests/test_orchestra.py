@@ -917,15 +917,15 @@ class ResumeGuard(ConfigGuard):
         super().setUp()
         fb.config.DEMO = False
         self.tmpdir = tempfile.mkdtemp(prefix="fb-resume-")
-        self._state_path = fb.RESUME_STATE
-        fb.RESUME_STATE = Path(self.tmpdir) / "resume.schedule.json"
+        self._state_path = fb.resume.RESUME_STATE
+        fb.resume.RESUME_STATE = Path(self.tmpdir) / "resume.schedule.json"
         self._resumes = dict(fb._resumes)
         fb._resumes.clear()
 
     def tearDown(self):
         fb._resumes.clear()
         fb._resumes.update(self._resumes)
-        fb.RESUME_STATE = self._state_path
+        fb.resume.RESUME_STATE = self._state_path
         import shutil as _sh
         _sh.rmtree(self.tmpdir, ignore_errors=True)
         super().tearDown()
@@ -940,7 +940,7 @@ class TestScheduleResume(ResumeGuard):
         self.assertAlmostEqual(out["due_at"], reset + 60, delta=1)
         r = fb._resumes["wt|s1"]
         self.assertEqual(r["status"], "pending")
-        self.assertTrue(fb.RESUME_STATE.exists())     # persisted at once
+        self.assertTrue(fb.resume.RESUME_STATE.exists())     # persisted at once
 
     def test_custom_delay_and_exact_time(self):
         import time as _t
@@ -1071,7 +1071,7 @@ class TestFireResume(ResumeGuard):
 
     def setUp(self):
         super().setUp()
-        self._saved = {n: getattr(fb, n) for n in ("_tmux_resume",)}
+        self._saved = {n: getattr(fb.resume, n) for n in ("_tmux_resume",)}
         self._saved_state = fb.observer.cached_state
         self._saved_git = {"discover_worktrees": fb.gitrepo.discover_worktrees}
         self._saved_homes = fb.transcripts.claude_homes
@@ -1084,13 +1084,13 @@ class TestFireResume(ResumeGuard):
         self.sent, self.tmuxed = [], []
         fb.terminal.send_to_process = lambda pid, text: (
             self.sent.append((pid, text)) or {"ok": True, "message": "sent via tmux"})
-        fb._tmux_resume = lambda wt, cwd, home, sid: (
+        fb.resume._tmux_resume = lambda wt, cwd, home, sid: (
             self.tmuxed.append((wt, cwd, str(home), sid))
             or {"ok": True, "message": "resumed in tmux"})
 
     def tearDown(self):
         for n, f in self._saved.items():
-            setattr(fb, n, f)
+            setattr(fb.resume, n, f)
         for n, f in self._saved_git.items():
             setattr(fb.gitrepo, n, f)
         fb.observer.cached_state = self._saved_state
@@ -1197,7 +1197,7 @@ class TestFireResume(ResumeGuard):
         self.assertEqual(self.tmuxed[0][1], "/w/wt")   # falls back to the worktree path
 
     def test_tmux_failure_is_reported_not_swallowed(self):
-        fb._tmux_resume = lambda *a: {"ok": False, "message": "tmux failed"}
+        fb.resume._tmux_resume = lambda *a: {"ok": False, "message": "tmux failed"}
         self.board()
         fb.fire_resume(self.arm())
         self.assertEqual(fb._resumes["wt|s1"]["status"], "failed")
@@ -1319,7 +1319,7 @@ class TestTmuxResume(unittest.TestCase):
     """The fallback resume believes nothing but the transcript."""
 
     def setUp(self):
-        self._saved = {n: getattr(fb, n) for n in
+        self._saved = {n: getattr(fb.resume, n) for n in
                        ("_wait_composer_idle", "_proven_in_transcript")}
         self._saved_deliver = fb.dispatch.deliver_text
         self._saved_run = fb.shell.run
@@ -1331,14 +1331,14 @@ class TestTmuxResume(unittest.TestCase):
         (proj / "s1.jsonl").write_text("")
         self.waits, self.delivered = [], []
         fb.shell.run = lambda cmd, **kw: (0, "")
-        fb._wait_composer_idle = lambda name, t: self.waits.append(t) or True
+        fb.resume._wait_composer_idle = lambda name, t: self.waits.append(t) or True
         fb.dispatch.deliver_text = lambda name, text: (
             self.delivered.append(text) or True)
-        fb._proven_in_transcript = lambda fp, off, text, timeout_s=20.0: True
+        fb.resume._proven_in_transcript = lambda fp, off, text, timeout_s=20.0: True
 
     def tearDown(self):
         for n, f in self._saved.items():
-            setattr(fb, n, f)
+            setattr(fb.resume, n, f)
         fb.dispatch.deliver_text = self._saved_deliver
         fb.shell.run = self._saved_run
         fb.time.sleep = self._sleep
@@ -1351,7 +1351,7 @@ class TestTmuxResume(unittest.TestCase):
         self.assertIn("attach", out["message"])
 
     def test_vanished_paste_retries_then_fails_honestly(self):
-        fb._proven_in_transcript = lambda *a, **kw: False
+        fb.resume._proven_in_transcript = lambda *a, **kw: False
         out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
         self.assertFalse(out["ok"])
         self.assertEqual(len(self.delivered), 3)           # three real attempts

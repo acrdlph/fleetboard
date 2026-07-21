@@ -11,7 +11,7 @@ import threading
 from http.server import ThreadingHTTPServer
 
 import orchestra as app
-from orchestra import config
+from orchestra import config, resume
 
 
 def main():
@@ -21,8 +21,8 @@ def main():
         print("orchestra: WARNING — binding beyond loopback serves your "
               "transcript text to the network", file=sys.stderr)
     if not config.DEMO:
-        app.load_resumes()
-        threading.Thread(target=app.resume_loop, daemon=True).start()
+        resume.load_resumes()
+        threading.Thread(target=resume.resume_loop, daemon=True).start()
     httpd = ThreadingHTTPServer((config.CFG["host"], config.CFG["port"]),
                                 app.Handler)
     mode = " (demo data)" if config.DEMO else ""
