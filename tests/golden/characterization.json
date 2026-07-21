@@ -18,7 +18,7 @@
   },
   "_real_prompt": {
    "cases": 13,
-   "sha256": "e379a6f88f64b9e7"
+   "sha256": "074d944fc7cf482e"
   },
   "account_label": {
    "cases": 5,
@@ -306,7 +306,7 @@
    },
    {
     "in": "This session is being continued from a previous conversation that ran out of context.",
-    "out": "This session is being continued from a previous conversation that ran out of context."
+    "out": null
    },
    {
     "in": "The user opened the file /tmp/x.py in the IDE.",

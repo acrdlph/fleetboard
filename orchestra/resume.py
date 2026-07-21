@@ -29,6 +29,7 @@ facade — reach it as `resume.RESUME_STATE`.
 """
 
 import json
+import os
 import re
 import shlex
 import threading
@@ -182,14 +183,31 @@ def _wait_composer_idle(name, timeout_s):
     return False
 
 
-def _proven_in_transcript(fp, offset, text, timeout_s=20.0):
+def _proven_in_transcript(fp, offset, text, timeout_s=20.0, ident=None):
     """True once the session file gains a user entry carrying `text` beyond
-    `offset` — receipt at the source, not read off the screen."""
+    `offset` — receipt at the source, not read off the screen.
+
+    `offset` is only meaningful while the file it was measured against is still
+    the same file, still at least that long. A transcript that gets rotated,
+    truncated or replaced (compaction rewrites one) leaves the old offset past
+    the new EOF — and seeking past EOF is perfectly legal, so the read returns
+    empty, the proof is never found, and the caller re-sends. Unattended that
+    costs three sends of real usage for one resume. So verify identity and
+    length, and fall back to reading the whole file rather than nothing:
+    over-reading can only cost a false positive on text we ourselves just sent,
+    while under-reading silently triples the spend."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
             with open(fp, "rb") as f:
-                f.seek(offset)
+                st = os.fstat(f.fileno())
+                if ident is not None and (st.st_dev, st.st_ino) != ident:
+                    start = 0        # different file now — the offset is meaningless
+                elif st.st_size < offset:
+                    start = 0        # truncated or rewritten — ditto
+                else:
+                    start = offset
+                f.seek(start)
                 chunk = f.read()
         except OSError:
             return False
@@ -238,11 +256,15 @@ def _tmux_resume(worktree, cwd, home, sid):
         if attempt:   # the last paste vanished — let the CLI settle, try again
             _wait_composer_idle(name, 90.0)
         try:
-            offset = fp.stat().st_size if fp else 0
+            # identity rides along with the offset: together they are what makes
+            # the offset trustworthy on the next read
+            stt = fp.stat() if fp else None
+            offset = stt.st_size if stt else 0
+            ident = (stt.st_dev, stt.st_ino) if stt else None
         except OSError:
-            fp, offset = None, 0
+            fp, offset, ident = None, 0, None
         sent = dispatch.deliver_text(name, msg)
-        if fp and _proven_in_transcript(fp, offset, msg):
+        if fp and _proven_in_transcript(fp, offset, msg, ident=ident):
             return {"ok": True, "message": where}
         if not fp and sent:
             return {"ok": True, "message":
@@ -274,9 +296,23 @@ def fire_resume(key):
     if s and s.get("handed_to"):
         return _resume_set(key, status="done", fired_at=now, message=
                            f"work already continued by [{s['handed_to']}] — nothing sent")
-    if s and s["status"] != "limit":
+    # Mid-something: 'continue' typed at an agent that is working, blocked, or
+    # holding a question is an injected instruction, not a resume.
+    if s and s["status"] in ("working", "blocked", "needs_input"):
         return _resume_set(key, status="done", fired_at=now, message=
                            f"session is {s['status']} — no resume needed")
+    # Everything else is decided on evidence, not on the status string. This
+    # used to read `status != "limit" -> done`, which cancelled the very resume
+    # it was armed for: the limit join reads a cache only /api/limits populates,
+    # so at 3am with no board open a limit-parked session reads WAITING, not
+    # LIMIT — and even with a warm cache the flag clears the instant the limit
+    # resets, which is precisely when we fire. An idle prompt looks identical
+    # whether the agent ran out of juice or finished its turn. A write *after we
+    # armed* is the thing that actually proves it moved on under its own steam.
+    age = s.get("age_s") if s else None
+    if age is not None and now - float(age) > float(r.get("created_at") or 0):
+        return _resume_set(key, status="done", fired_at=now, message=
+                           f"session moved on since arming ({s['status']}) — nothing sent")
 
     until = limits._limit_active_until(account, r.get("model"), now)
     if until:

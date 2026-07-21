@@ -77,7 +77,17 @@ def _clean(text, limit=240):
 
 _MACHINE_TEXT = re.compile(
     r"<local-command-stdout>|<command-message>|<system-reminder>|"
-    r"task-notification|\btoolu_[A-Za-z0-9]|\[SYSTEM NOTIFICATION")
+    r"task-notification|\btoolu_[A-Za-z0-9]|\[SYSTEM NOTIFICATION|"
+    # The compaction preamble. The CLI writes it as a *user* entry, so without
+    # this the board quotes the harness back to you as "the last thing you told
+    # it" — on precisely the long-running sessions you most need to read.
+    r"This session is being continued from a previous conversation|"
+    # Agent-to-agent messages injected by a teammate harness: another machine
+    # talking, not this user.
+    r"<teammate-message\b|"
+    # Terminal mouse-tracking escapes that leak into the transcript when a
+    # click lands in the composer (observed: "<64;58;44M58;44M/exit").
+    r"<\d+;\d+;\d+[Mm]")
 
 
 def _real_prompt(text):

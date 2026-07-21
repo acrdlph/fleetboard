@@ -10,6 +10,7 @@ globals (CFG, _limits, DEMO); tests set those and restore them.
 """
 
 import json
+import pathlib
 import shlex
 import sys
 import tempfile
@@ -1100,9 +1101,11 @@ class TestFireResume(ResumeGuard):
         super().tearDown()
 
     def board(self, status="limit", pid=None, reachable=True, handed=None,
-              present=True, loose_pid=None):
+              present=True, loose_pid=None, age_s=7200):
+        # age_s defaults to "parked two hours" — what a limit-hit session looks
+        # like. Tests that mean "the agent moved on" pass a small age.
         sess = {"sid": "s1", "status": status, "pid": pid, "cwd": "/w/wt/sub",
-                "handed_to": handed}
+                "handed_to": handed, "age_s": age_s}
         procs = [{"pid": pid, "reachable": reachable}] if pid else []
         if loose_pid:   # someone ELSE's live terminal in the same worktree
             procs.append({"pid": loose_pid, "reachable": True})
@@ -1110,18 +1113,49 @@ class TestFireResume(ResumeGuard):
             {"name": "wt", "sessions": [sess] if present else [],
              "live_procs": procs}]}
 
-    def arm(self):
+    def arm(self, armed_ago_s=3600):
+        """Arm as it really happens: hours before the reset, not microseconds.
+        Backdating created_at is what makes 'has it written since we armed?'
+        a meaningful question at all."""
         import time as _t
         fb.schedule_resume("wt", "s1", "account2", model="opus-4-8",
                            resets_at=_t.time() - 100)
+        fb._resumes["wt|s1"]["created_at"] = _t.time() - armed_ago_s
         return "wt|s1"
 
     def test_already_resumed_session_is_left_alone(self):
-        self.board(status="working", pid=9)
+        self.board(status="working", pid=9, age_s=5)
         fb.fire_resume(self.arm())
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
         self.assertEqual(self.sent, [])
         self.assertEqual(self.tmuxed, [])
+
+    def test_cold_limits_cache_does_not_cancel_the_resume(self):
+        """3am, no browser has hit /api/limits, so the limit join never ran and
+        the parked session reads 'waiting' instead of 'limit'. The old guard
+        (status != "limit" -> done) cancelled the very resume it was armed for."""
+        self.board(status="waiting", pid=42, age_s=7200)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.sent, [(42, "continue")])
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+
+    def test_session_that_wrote_since_arming_is_left_alone(self):
+        """Movement is proven by a write after we armed — not by the status
+        string, which the cold cache makes unreliable."""
+        self.board(status="waiting", pid=42, age_s=1)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+
+    def test_mid_turn_agent_is_never_interrupted(self):
+        """'continue' typed at a working agent is an injected instruction."""
+        for st in ("working", "blocked", "needs_input"):
+            with self.subTest(status=st):
+                fb._resumes.clear()
+                self.sent.clear()
+                self.board(status=st, pid=42, age_s=7200)
+                fb.fire_resume(self.arm())
+                self.assertEqual(self.sent, [])
 
     def test_handed_off_session_is_left_alone(self):
         self.board(handed="account5")
@@ -1268,6 +1302,41 @@ class TestComposerIdle(unittest.TestCase):
         self.assertFalse(fb.composer_idle(""))
 
 
+class TestMachineTextFilter(unittest.TestCase):
+    """Every string here was observed in the user's real transcript corpus:
+    27 of 654 sessions were quoting the harness back as '→ the last thing you
+    told it'."""
+
+    MACHINE = [
+        "This session is being continued from a previous conversation that ran "
+        "out of context. The summary below covers the earlier portion",
+        '<teammate-message teammate_id="team-lead" summary="Please send your '
+        'L2-8 audit report"> Your idle notification arrived',
+        "<64;58;44M58;44M/exit",
+        "<system-reminder>noise</system-reminder>",
+        "<local-command-stdout>output</local-command-stdout>",
+    ]
+
+    REAL = [
+        # contains "summarize" but is unmistakably a person asking
+        "Okay, can you summarize what we did here in this entire session? I "
+        "think it went on far beyond what we had originally intended",
+        "fix the flaky test in tests/test_integration.py",
+        "why is the board showing WORKING when the agent stopped?",
+        "continue",
+    ]
+
+    def test_machine_text_is_filtered(self):
+        for s in self.MACHINE:
+            with self.subTest(text=s[:48]):
+                self.assertIsNone(fb._real_prompt(s))
+
+    def test_real_prompts_survive(self):
+        for s in self.REAL:
+            with self.subTest(text=s[:48]):
+                self.assertIsNotNone(fb._real_prompt(s))
+
+
 class TestProvenInTranscript(unittest.TestCase):
     """The only accepted receipt for a resume send: the session file itself."""
 
@@ -1297,6 +1366,47 @@ class TestProvenInTranscript(unittest.TestCase):
         # appended after it count
         self.assertFalse(fb._proven_in_transcript(
             self.fp, self.offset, "continue", timeout_s=0.1))
+
+    def test_truncated_transcript_still_proves_delivery(self):
+        """Compaction rewrites the file shorter. seek(stale_offset) lands past
+        EOF and read() returns b'' — which the old code scored as 'not
+        delivered', so _tmux_resume re-sent. Unattended that is 3x the usage
+        for one resume, which is why a false negative here costs more than a
+        false positive."""
+        st = self.fp.stat()
+        big = self.offset + 10_000
+        self.fp.write_text(json.dumps(
+            {"type": "user", "message": {"content": "continue"}}) + "\n")
+        self.assertLess(self.fp.stat().st_size, big)
+        self.assertTrue(fb._proven_in_transcript(
+            self.fp, big, "continue", timeout_s=0.1,
+            ident=(st.st_dev, st.st_ino)))
+
+    def test_replaced_file_still_proves_delivery(self):
+        """Same path, new inode. Sized so the offset still lands INSIDE the new
+        file — only the identity check can catch this one, which is why it is
+        separate from the truncation case."""
+        self.fp.write_text(json.dumps(
+            {"type": "user", "message": {"content": "pad " * 400}}) + "\n")
+        st = self.fp.stat()
+        offset = st.st_size                       # ~1.6 KB into the OLD file
+        self.fp.unlink()                          # new inode from here on
+        self.fp.write_text(
+            json.dumps({"type": "user", "message": {"content": "continue"}}) + "\n"
+            + json.dumps({"type": "user", "message": {"content": "tail " * 500}}) + "\n")
+        self.assertGreater(self.fp.stat().st_size, offset)   # offset lands inside
+        self.assertNotEqual(self.fp.stat().st_ino, st.st_ino)
+        self.assertTrue(fb._proven_in_transcript(
+            self.fp, offset, "continue", timeout_s=0.1,
+            ident=(st.st_dev, st.st_ino)))
+
+    def test_intact_file_still_honours_the_offset(self):
+        """The rotation fallback must not become 'always read everything' —
+        a pre-offset 'continue' must still fail to prove."""
+        st = self.fp.stat()
+        self.assertFalse(fb._proven_in_transcript(
+            self.fp, self.offset, "continue", timeout_s=0.1,
+            ident=(st.st_dev, st.st_ino)))
 
     def test_assistant_text_does_not_prove(self):
         self.append({"type": "assistant", "message":
@@ -1334,7 +1444,7 @@ class TestTmuxResume(unittest.TestCase):
         fb.resume._wait_composer_idle = lambda name, t: self.waits.append(t) or True
         fb.dispatch.deliver_text = lambda name, text: (
             self.delivered.append(text) or True)
-        fb.resume._proven_in_transcript = lambda fp, off, text, timeout_s=20.0: True
+        fb.resume._proven_in_transcript = lambda *a, **kw: True
 
     def tearDown(self):
         for n, f in self._saved.items():
