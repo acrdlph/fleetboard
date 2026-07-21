@@ -25,7 +25,6 @@ script, else cwd) > defaults. See README.md.
 """
 
 import json
-import os
 import re
 import shlex
 import threading
@@ -59,151 +58,12 @@ from .limits import (cached_limits, account_reserve, _model_remaining,
 from .observer import collect_state, cached_state, demo_state, _cache, STATE_TTL_S
 from .terminal import focus_process, send_to_process, _osa_escape
 from .chat import read_chat
-from .finish import (_park_on_trunk, _reachable, _closeouts, CLOSEOUT_TEXT,
-                     SLIM_CLOSEOUT_TEXT, CLOSEOUT_NUDGE_TEXT)
+from .finish import (start_finish, _park_on_trunk, _reachable, _closeouts,
+                     CLOSEOUT_TEXT, SLIM_CLOSEOUT_TEXT, CLOSEOUT_NUDGE_TEXT)
 from .dispatch import (start_dispatch, dispatch_status, read_dispatch_log,
                        deliver_text, kickoff_sent, composer_idle,
                        closeout_shell, _pick_defaults, _run_dispatch,
                        _jobs, FLEET_SOCK)
-
-
-# ------------------------------------------------------------- finish
-
-def start_finish(wt_name):
-    """One button, tiered by what's actually left to do:
-    live agent -> type a brief at it — the slim one if the branch already
-    landed, the full closeout otherwise; everything landed and an agent
-    idling -> type /exit; no terminal + landed + clean -> park on the trunk
-    right here, no agent; anything else -> launch a one-shot closeout agent
-    (headless; frees the card itself, or parks as needs-you if the landing
-    doesn't verify)."""
-    if config.DEMO:
-        return {"ok": False, "message": "demo mode — nothing to finish"}
-    wt = next((w for w in gitrepo.discover_worktrees() if w["name"] == wt_name), None)
-    if not wt:
-        return {"ok": False, "message": f"unknown worktree '{wt_name}'"}
-    path, git_root = wt["path"], wt["git"]
-    trunk = gitrepo._base_ref(git_root)
-    if not trunk:
-        return {"ok": False, "message": "no trunk ref found for this repo"}
-    shell.run(["git", "fetch", "--quiet", "origin"], cwd=git_root, timeout=30)
-    landed = shell.run(["git", "merge-base", "--is-ancestor", "HEAD", trunk],
-                       cwd=git_root)[0] == 0
-    porcelain = [l for l in shell.run(["git", "status", "--porcelain"],
-                                      cwd=git_root)[1].splitlines() if l.strip()]
-    mine = [p for p in procs.claude_processes() if p.get("cwd")
-            and (p["cwd"] == path or p["cwd"].startswith(path + os.sep))]
-    live = next((p for p in mine if finish._reachable(p)), None)
-    if live:
-        if landed and not porcelain:
-            res = terminal.send_to_process(live["pid"], "/exit")
-            if res["ok"]:
-                finish._closeouts.pop(wt_name, None)
-                observer._cache["t"] = 0.0    # button reverts on the next poll
-            return {"ok": res["ok"], "mode": "exit", "message":
-                    "already landed — sent /exit to close the terminal"
-                    if res["ok"] else res["message"]}
-        sent = finish._closeouts.get(wt_name)
-        if sent:
-            # step two (✕ close), but the landing still doesn't verify. What to
-            # do isn't a fixed refusal — it depends on THIS worktree's live
-            # session. The observed deadlock: the agent finished its closeout
-            # but left one dirty file it took for another session's in-flight
-            # work; nothing else was live, so ✕ close refused forever while the
-            # agent idled forever. classify the session and nudge it out of that.
-            left = (f"{len(porcelain)} leftover file(s)" if landed
-                    else f"branch not landed on {trunk}")
-            files = porcelain[:5]          # ≤5 raw lines, for the agent + UI
-            now = time.time()
-            sessions = transcripts.scan_sessions([wt], mine, now).get(path, [])
-            paired = next((s for s in sessions
-                           if s.get("pid") == live["pid"]), None)
-            any_working = any(s.get("status") == "working" for s in sessions)
-            step = status.closeout_step(paired["status"] if paired else None,
-                                        any_working, sent, now)
-            if step == "nudge":
-                # idle agent, nothing else working, briefed ≥60s ago: type the
-                # specifics so it stops treating the leftovers as untouchable.
-                block = "\n".join(files)
-                if len(porcelain) > len(files):
-                    block += f"\n… and {len(porcelain) - len(files)} more"
-                nudge = finish.CLOSEOUT_NUDGE_TEXT.format(
-                    left=left, trunk=trunk, files=(block + "\n") if block else "")
-                res = terminal.send_to_process(live["pid"], nudge)
-                if not res["ok"]:
-                    return {"ok": False, "mode": "nudge", "message": res["message"]}
-                finish._closeouts[wt_name] = time.time()   # restart the "sent Xm ago"
-                observer._cache["t"] = 0.0           # clock + re-arm the 60s guard
-                # `left`/`files` ride along so the card note can say what's
-                # blocked without parsing the human message
-                return {"ok": True, "mode": "nudge", "left": left,
-                        **({"files": files} if files else {}), "message":
-                        f"closeout had stalled — sent the agent the specifics "
-                        f"({left}); ✕ close works once it reports clean"}
-            # otherwise refuse, but hand the frontend the specifics too: `left`
-            # (short reason), `files` (≤5 porcelain lines, only when any), and
-            # `sent` (the epoch it was briefed). mode "pending" is a plain
-            # refusal; mode "chat" is a DISTINCT mode meaning the agent is stuck
-            # on a question/approval — a typed nudge would collide with its open
-            # dialog, so the frontend must route the user to ✉ chat instead.
-            extra = {"left": left, "sent": sent}
-            if files:
-                extra["files"] = files
-            if step == "chat":
-                return {"ok": False, "mode": "chat", **extra, "message":
-                        f"can't close yet — {left}, and the agent is stuck on a "
-                        "question or approval. Answer it in ✉ chat — a typed "
-                        "nudge would collide with its open dialog. ✕ close works "
-                        "once the landing verifies."}
-            mins = int((now - sent) // 60)
-            ago = f"{mins}m ago" if mins else "under a minute ago"
-            return {"ok": False, "mode": "pending", **extra, "message":
-                    f"can't close yet — {left}. The closeout brief went to "
-                    f"the agent {ago}; if it looks stuck, ✉ chat with it. "
-                    "✕ close works once the landing verifies."}
-        brief = (finish.SLIM_CLOSEOUT_TEXT if landed else finish.CLOSEOUT_TEXT)
-        res = terminal.send_to_process(live["pid"], brief.format(trunk=trunk))
-        if not res["ok"]:
-            return {"ok": False, "mode": "slim" if landed else "brief",
-                    "message": res["message"]}
-        finish._closeouts[wt_name] = time.time()
-        observer._cache["t"] = 0.0   # show ✕ close on the next poll, not in 4s
-        return {"ok": True, "mode": "slim" if landed else "brief", "message":
-                ("already landed — slim brief sent (tidy scratch and park, "
-                 "no re-merge)" if landed else
-                 "closeout brief sent to the live agent")
-                + " — when it reports done, ✕ close verifies the landing "
-                  "and closes the terminal"}
-    finish._closeouts.pop(wt_name, None)   # no live agent — the two-step is moot
-    if mine:
-        return {"ok": False, "message":
-                "a live process exists but its terminal can't be scripted — "
-                "finish from that terminal, or close it and ✓ finish again"}
-    if landed and not porcelain:
-        branch = shell.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                           cwd=git_root)[1].strip()
-        if branch == trunk.split("/", 1)[-1]:
-            return {"ok": True, "mode": "noop",
-                    "message": "already landed and clean — nothing to finish"}
-        parked = finish._park_on_trunk(git_root, trunk)
-        if parked:
-            return parked
-        # the switch itself failed — fall through and let an agent sort it out
-    # any leftover file — even untracked scratch — goes to an agent: whether
-    # it's droppable is a judgment call, not ours. haiku is enough for the
-    # mechanical run, a landed branch gets the slim brief so nothing already
-    # merged is re-checked, and a failed landing escalates itself (see
-    # closeout_shell's rescue line)
-    brief = (finish.SLIM_CLOSEOUT_TEXT if landed
-             else finish.CLOSEOUT_TEXT).format(trunk=trunk)
-    out = dispatch.start_dispatch(brief, worktree=wt_name,
-                                  model="haiku", closeout_trunk=trunk)
-    out.setdefault("ok", True)
-    out["mode"] = "dispatch"
-    out.setdefault("message",
-                   "no live terminal — launched a one-shot closeout agent; "
-                   "the card frees itself once the landing verifies")
-    return out
 
 
 # -------------------------------------------------------- scheduled resumes
@@ -589,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/send"):
             result = terminal.send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
         elif self.path.startswith("/api/finish"):
-            result = start_finish(payload.get("worktree") or "")
+            result = finish.start_finish(payload.get("worktree") or "")
         elif self.path.startswith("/api/dispatch"):
             result = dispatch.start_dispatch(
                 payload.get("mission"), payload.get("worktree") or None,
