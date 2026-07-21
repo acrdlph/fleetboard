@@ -555,28 +555,60 @@ def match_worktree(proj_name, wt_prefixes):
 
 
 def classify_session(age_s, alive, pending_tools, delegated,
-                     skip_perms, working_s, shells=0):
+                     skip_perms, working_s, shells=0, *, turn_ended=False,
+                     evidence_age=None, procs_known=True, thinking_s=None,
+                     block_grace_s=None, orphan_grace_s=None):
     """Base session status from observable signals (before limit/handoff
     overrides). `delegated` counts pending workflows + background agents.
-    Returns (status, tool_running)."""
+    Returns (status, tool_running).
+
+    ORDER IS THE CONTRACT: nothing is decided by a clock before the evidence
+    on disk has been read. The old ladder tested `age_s < working_s` first,
+    so a question already written to the transcript was reported as WORKING
+    until the 90 s window expired — and if it was answered inside that window,
+    NEEDS ANSWER was never shown at all.
+    """
     pend = pending_tools or []
-    if age_s < working_s:
-        return "working", False
-    if alive and "AskUserQuestion" in pend:
+    age = age_s if evidence_age is None else evidence_age
+    thinking_s = working_s if thinking_s is None else thinking_s
+    block_grace_s = working_s if block_grace_s is None else block_grace_s
+    # Defaults to working_s so this layer is provably behaviour-identical
+    # apart from the two intended fixes. Tightening it (10 s is the target)
+    # flips a live-but-unpaired session to ENDED, which feeds worktree-FREE
+    # and therefore dispatch targeting — it needs reliable process detection
+    # behind it, so it lands as its own step, not smuggled in here.
+    orphan_grace_s = working_s if orphan_grace_s is None else orphan_grace_s
+
+    if not procs_known:                      # ps/lsof failed wholesale: never
+        return "unknown", False              # claim ENDED, never claim FREE
+
+    if alive and "AskUserQuestion" in pend:  # the question is ON DISK
         return "needs_input", False
+    if alive and turn_ended and not delegated and not pend:
+        return "waiting", False              # provably not mid-turn
     if alive and delegated:                  # awaiting its own workflows or
         return "working", False              # background agents — not the
                                              # user's turn
     if alive and shells:                     # a Bash shell is still running —
         return "working", True               # backgrounded ones leave the
                                              # transcript idle until they exit
-    if alive and pend and skip_perms:        # long tool run, nothing to approve
-        return "working", True
     if alive and pend:
+        # "awaiting approval" and "tool still running" are the same bytes on
+        # disk. Under --dangerously-skip-permissions there is nothing to
+        # approve; otherwise hold WORKING until the silence outlasts genuine
+        # tool-run silence before calling it BLOCKED.
+        if skip_perms or age < block_grace_s:
+            return "working", True
         return "blocked", False
-    if alive:
-        return "waiting", False
-    return "ended", False
+    if not alive:
+        # A fresh write with no observed process is "we have not seen the
+        # process yet" (a just-exec'd agent, or a lagging proc-table read) —
+        # not "ended". This rule was implicit in the old first branch; it is
+        # now named, bounded, and testable.
+        return ("working", False) if age < orphan_grace_s else ("ended", False)
+    if age < thinking_s:
+        return "working", False              # decay, LAST
+    return "waiting", False
 
 
 def scan_sessions(worktrees, procs, now):
