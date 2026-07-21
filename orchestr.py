@@ -498,14 +498,18 @@ def parse_session_tail(fp):
     main = [e for e in entries if isinstance(e, dict) and not e.get("isSidechain")]
 
     out = {"cwd": None, "branch": None, "model": None, "pending_tools": [],
-           "last_assistant": None, "last_user": None, "pending_workflows": 0}
+           "last_assistant": None, "last_user": None, "pending_workflows": 0,
+           "pending_bg_agents": 0}
     pending = {}  # tool_use id -> tool name
     for e in main:
         out["cwd"] = e.get("cwd") or out["cwd"]
         out["branch"] = e.get("gitBranch") or out["branch"]
         if e.get("type") == "system" and e.get("subtype") == "turn_duration":
-            # a turn that ended still awaiting workflows is NOT the user's turn
+            # a turn that ended still awaiting workflows or background agents
+            # ("✻ Waiting for 1 background agent to finish") is NOT the user's
+            # turn — the harness resumes the session when they report back
             out["pending_workflows"] = e.get("pendingWorkflowCount") or 0
+            out["pending_bg_agents"] = e.get("pendingBackgroundAgentCount") or 0
         msg = e.get("message")
         if not isinstance(msg, dict):
             continue
@@ -550,17 +554,19 @@ def match_worktree(proj_name, wt_prefixes):
     return best
 
 
-def classify_session(age_s, alive, pending_tools, pending_workflows,
+def classify_session(age_s, alive, pending_tools, delegated,
                      skip_perms, working_s, shells=0):
     """Base session status from observable signals (before limit/handoff
-    overrides). Returns (status, tool_running)."""
+    overrides). `delegated` counts pending workflows + background agents.
+    Returns (status, tool_running)."""
     pend = pending_tools or []
     if age_s < working_s:
         return "working", False
     if alive and "AskUserQuestion" in pend:
         return "needs_input", False
-    if alive and pending_workflows:          # delegated to its own workflows
-        return "working", False
+    if alive and delegated:                  # awaiting its own workflows or
+        return "working", False              # background agents — not the
+                                             # user's turn
     if alive and shells:                     # a Bash shell is still running —
         return "working", True               # backgrounded ones leave the
                                              # transcript idle until they exit
@@ -625,6 +631,7 @@ def scan_sessions(worktrees, procs, now):
                     "model": (tail["model"] or "").replace("claude-", ""),
                     "pending_tools": tail["pending_tools"],
                     "pending_workflows": tail["pending_workflows"],
+                    "pending_bg_agents": tail["pending_bg_agents"],
                     "topic": session_topic(fp),
                     "last_assistant": tail["last_assistant"],
                     "last_user": tail["last_user"] or find_last_user(fp),
@@ -656,7 +663,8 @@ def scan_sessions(worktrees, procs, now):
             # a guess and must not be presented as one
             s["pid_certain"] = bool(proc and proc.get("account") == s["account"])
             status, tool_running = classify_session(
-                s["age_s"], alive, s["pending_tools"], s["pending_workflows"],
+                s["age_s"], alive, s["pending_tools"],
+                s["pending_workflows"] + s["pending_bg_agents"],
                 skip_perms, CFG["working_s"], shell_n)
             s["status"] = status
             if tool_running:

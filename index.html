@@ -466,6 +466,7 @@ function render(st) {
           ${s.branch && s.branch !== g.branch ? `<span class="meta"> ${esc(s.branch)}</span>` : ""}
           ${s.subagents_active ? `<span class="subag">⚙ subagents running</span>`
             : s.pending_workflows ? `<span class="subag">⚙ awaiting ${s.pending_workflows} workflow${s.pending_workflows > 1 ? "s" : ""}</span>`
+            : s.pending_bg_agents ? `<span class="subag">⚙ awaiting ${s.pending_bg_agents} background agent${s.pending_bg_agents > 1 ? "s" : ""}</span>`
             : s.tool_running ? `<span class="subag">⚙ running: ${esc(s.bg_shell ? "background shell" : (s.pending_tools[0] || "tool"))}</span>` : ""}
           <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
             ${sessProc(w, s)}

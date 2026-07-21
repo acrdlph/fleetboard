@@ -62,9 +62,10 @@ def assistant_msg(text=None, tool=None):
             "model": "claude-fable-5", "content": content}}
 
 
-def turn_end(pending_workflows=0):
+def turn_end(pending_workflows=0, pending_bg_agents=0):
     return {"type": "system", "subtype": "turn_duration",
-            "durationMs": 1000, "pendingWorkflowCount": pending_workflows}
+            "durationMs": 1000, "pendingWorkflowCount": pending_workflows,
+            "pendingBackgroundAgentCount": pending_bg_agents}
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")
@@ -156,6 +157,27 @@ class TestCollectPipeline(unittest.TestCase):
         fb._cache["state"] = None
         s = fb.collect_state()["worktrees"][0]["sessions"][0]
         self.assertEqual(s["pending_workflows"], 1)
+
+    def test_pending_background_agent_keeps_working(self):
+        # the ConfidAi8 case: tmux shows "✻ Waiting for 1 background agent to
+        # finish", transcript idle for minutes — with a live process that is
+        # delegated work still in flight, not "needs you"
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("build the lesson"), assistant_msg(text="L88 is building"),
+            turn_end(pending_bg_agents=1)])
+        old = time.time() - 3 * fb.CFG["working_s"]     # not "working" by age
+        os.utime(fp, (old, old))
+        fb.claude_processes = lambda: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": "claude", "account": None,
+            "tmux_target": None, "shells": 0}]
+        fb._cache["state"] = None
+        st = fb.collect_state()
+        card = next(w for w in st["worktrees"] if w["name"] == "myapp")
+        s = card["sessions"][0]
+        self.assertEqual(s["pending_bg_agents"], 1)
+        self.assertEqual(s["status"], "working")
+        self.assertEqual(card["availability"], "busy")
 
     def test_closeout_flag_rides_the_card_and_dies_with_the_terminal(self):
         write_transcript(self.home, self.repo, "main", sid="s1", entries=[
