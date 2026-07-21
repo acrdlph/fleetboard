@@ -324,7 +324,8 @@ header .wrap { max-width:none; }
   <div class="brand"><span class="prompt" id="brandUser">fleet</span><span class="path">:~</span><span class="prompt">$</span> <span class="cmd">./orchestr --watch</span></div>
   <div class="navr">
   <button id="missionBtn" onclick="openMission()">🚀 new mission</button>
-  <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span></div></div>
+  <div class="sync" id="sync"><span class="dot"></span><span id="syncText">connecting…</span><span id="holdNote"
+    title="the board wants to re-sort, but never moves cards while your pointer is on it — it re-sorts when you move away"></span></div></div>
 </div></header>
 
 <div id="drawer">
@@ -440,7 +441,7 @@ function render(st) {
     <div class="tile"><div class="k">⌁ live agents</div><div class="v">${st.worktrees.reduce((n,w)=>n+w.live_procs.length,0) + st.other_procs.length}</div>
       <div class="sub">claude processes on ${esc(st.hostname)}</div></div>`;
 
-  $("grid").innerHTML = st.worktrees.map(w => {
+  reconcileGrid(st, (w) => {
     const g = w.git || {};
     const sync = (g.ahead != null) ? `<span class="sync-count">↑${g.ahead} ↓${g.behind}</span>` : "";
     const dirty = g.dirty ? `<span class="delta">Δ${g.dirty} uncommitted</span>` : "";
@@ -485,8 +486,7 @@ function render(st) {
       </div>`;
     }).join("");
     const finArmed = window._armFinish && window._armFinish.wt === w.name && Date.now() < window._armFinish.until;
-    return `<div class="card ${w.availability === "attention" ? "attention" : ""}">
-      <div class="card-head">
+    return `<div class="card-head">
         <span class="badge ${w.availability}">${AVAIL[w.availability]}</span>
         <span class="name">${esc(w.name)}</span>
         <span class="procs">${(() => {
@@ -505,9 +505,8 @@ function render(st) {
       </div>
       <div class="gitline"><span class="branch">${esc(g.branch || "?")}</span>${dirty}${sync}</div>
       <div class="commit" title="${esc(g.commit ? g.commit.subject : "")}">${commit}</div>
-      <div class="sessions">${rows || `<div class="none">${w.sessions.length ? w.sessions.length + " ended session(s) hidden" : "no recent sessions"}</div>`}</div>
-    </div>`;
-  }).join("");
+      <div class="sessions">${rows || `<div class="none">${w.sessions.length ? w.sessions.length + " ended session(s) hidden" : "no recent sessions"}</div>`}</div>`;
+  });
 
   // stamp countdown state on the fresh buttons NOW — waiting for the 1s
   // ticker flashed them clickable ("▶ resume") for up to a second per refresh
@@ -518,6 +517,100 @@ function render(st) {
       st.other_procs.map(p => `<div>⌁ <button class="pidbtn" onclick="focusPid(${p.pid})">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button> ${p.cpu.toFixed(1)}% cpu · up ${esc(p.etime)} · ${esc(p.cwd || "?")}</div>`).join("")
     : "";
 }
+
+// ---- grid reconciliation: cards never move under your cursor ---------------
+// The board is triage-sorted, so cards MOVE when a status flips — and a card
+// that swaps into place mid-aim takes a finish click meant for another one.
+// Three layered defenses:
+//   1. keyed per-card DOM — a tick rewrites only cards whose data changed,
+//      never the whole grid, so the element under your cursor survives
+//   2. layout holds while the pointer is on the board — re-sorts, arrivals
+//      and removals wait for the cursor to leave (or the tab to hide), then
+//      apply with a glide so the movement is visible, not a teleport
+//   3. a click shield — a card that shifted in the last 600ms swallows the
+//      first click on any of its buttons and names itself, so a click can
+//      never silently land on a card that just moved into position
+let gridHover = false, structureHeld = false;
+let cardRects = new Map();   // wt -> page-coords position at the last render
+
+function reconcileGrid(st, contentFor) {
+  const grid = $("grid");
+  const names = st.worktrees.map(w => w.name);
+  const want = new Set(names);
+  const have = new Map([...grid.children].map(el => [el.dataset.wt, el]));
+  structureHeld = false;
+  for (const [name, el] of have) {
+    if (want.has(name)) continue;
+    if (gridHover) structureHeld = true;   // removal shifts every card after it
+    else { el.remove(); have.delete(name); }
+  }
+  for (const w of st.worktrees) {
+    let el = have.get(w.name);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "card";
+      el.dataset.wt = w.name;
+      grid.appendChild(el);   // the end of the grid never shifts existing cards
+      have.set(w.name, el);
+    }
+    const html = contentFor(w);
+    if (el._html !== html) { el._html = html; el.innerHTML = html; }
+    el.classList.toggle("attention", w.availability === "attention");
+  }
+  const desired = names.filter(n => have.has(n));
+  const current = [...grid.children].map(el => el.dataset.wt).filter(n => want.has(n));
+  if (desired.join("\n") !== current.join("\n")) {
+    if (gridHover) structureHeld = true;
+    else flipReorder(grid, desired.map(n => have.get(n)));
+  }
+  $("holdNote").textContent = structureHeld ? " · ⌗ re-sort held" : "";
+  stampMoves(grid);
+}
+// re-sort with the old positions animating into the new — movement you can track
+function flipReorder(grid, ordered) {
+  const before = new Map(ordered.map(el => [el, el.getBoundingClientRect()]));
+  ordered.forEach(el => grid.appendChild(el));
+  for (const el of ordered) {
+    const b = before.get(el), a = el.getBoundingClientRect();
+    const dx = b.left - a.left, dy = b.top - a.top;
+    if (dx || dy) el.animate(
+      [{ transform: `translate(${dx}px,${dy}px)` }, { transform: "none" }],
+      { duration: 300, easing: "cubic-bezier(0.22,1,0.36,1)" });
+  }
+}
+// page coordinates, not viewport — scrolling between renders is not a shift
+function stampMoves(grid) {
+  const next = new Map();
+  for (const el of grid.children) {
+    const r = el.getBoundingClientRect();
+    const pos = { x: r.left + window.scrollX, y: r.top + window.scrollY };
+    const prev = cardRects.get(el.dataset.wt);
+    if (prev && (Math.abs(prev.x - pos.x) > 4 || Math.abs(prev.y - pos.y) > 4))
+      el._movedAt = performance.now();
+    next.set(el.dataset.wt, pos);
+  }
+  cardRects = next;
+}
+$("grid").addEventListener("pointerenter", () => { gridHover = true; });
+$("grid").addEventListener("pointerleave", () => {
+  gridHover = false;
+  if (structureHeld && lastState) render(lastState);
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden || !gridHover) return;
+  gridHover = false;   // nobody is aiming at a hidden tab — apply the re-sort
+  if (structureHeld && lastState) render(lastState);
+});
+// the shield: capture-phase, so it runs before every button's own handler
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest && ev.target.closest(".card button");
+  if (!btn) return;
+  const card = btn.closest(".card");
+  if (card && card._movedAt && performance.now() - card._movedAt < 600) {
+    ev.stopPropagation(); ev.preventDefault();
+    toast(`⚠ the board shifted — that click landed on “${card.dataset.wt}”; click again if that's the card you meant`);
+  }
+}, true);
 
 let toastTimer = null;
 function toast(msg) {
@@ -635,7 +728,9 @@ document.addEventListener("click", async (ev) => {
   const closing = !!b.dataset.close;
   if (!armed) {
     window._armFinish = { wt, until: Date.now() + 6000 };
-    b.classList.add("armed"); b.textContent = closing ? "✕ confirm" : "✓ confirm";
+    // arm and disarm through real renders — a hand-edited button would fall
+    // out of sync with the per-card html cache and outlive its 6s window
+    if (lastState) render(lastState);
     setTimeout(() => { if (lastState) render(lastState); }, 6200);
     return;
   }

@@ -179,7 +179,13 @@ table.vocab td:first-child { font-family:var(--mono); font-weight:600; font-size
   to read it in full.</p>
 
   <h2><span class="g">§3</span> while it runs</h2>
-  <p>The board refreshes every 5 s and sorts by attention. <b>✉ chat</b> shows
+  <p>The board refreshes every 5 s and sorts by attention — but never under
+  your cursor: while the pointer is on the board, cards refresh in place and
+  any re-sort waits (the header shows <i>⌗ re-sort held</i>) until you move
+  away, then the cards glide to their new spots. If a card does shift in the
+  instant before a click, that click is swallowed and a toast names the card
+  it would have hit — so a finish can't land on a card that just moved into
+  position. <b>✉ chat</b> shows
   the transcript and types straight into the agent's terminal — it is exactly
   as if you typed there yourself. <b>⌖ pid</b> jumps to the terminal window.
   Both act on <i>that session's own</i> terminal: sessions are paired to
