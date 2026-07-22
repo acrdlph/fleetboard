@@ -287,7 +287,8 @@ def scan_sessions(worktrees, all_procs, now):
                         subagent_said = last_assistant_text(sf)
                         if subagent_said:
                             break
-                age = now - max(mtime, sub_mtime)
+                last_write = max(mtime, sub_mtime)
+                age = now - last_write
                 if age > window_s:
                     continue
                 tail = parse_session_tail(fp)
@@ -296,6 +297,15 @@ def scan_sessions(worktrees, all_procs, now):
                     "id": fp.stem[:8],
                     "sid": fp.stem,
                     "account": acct,
+                    # ABSOLUTE, not now-derived: ENGINE.md §3.4. A field that
+                    # moves with the clock makes every card differ on every
+                    # publish, so the equality diff the version bump rests on
+                    # degenerates to "everything changed". It also lets the
+                    # client animate "wrote 2.3s ago" off Date.now() at frame
+                    # rate instead of stepping once per poll.
+                    # `age_s` ships alongside it for one release (index.html,
+                    # map.html and the suite still read it); removed in step 6.
+                    "last_write_at": last_write,
                     "age_s": int(age),
                     "cwd": cwd,
                     "subdir": os.path.relpath(cwd, wt) if cwd != wt else None,

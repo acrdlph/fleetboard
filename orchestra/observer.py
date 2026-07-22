@@ -177,7 +177,8 @@ def demo_state():
     def sess(status, acct, model, age, topic, said, subdir=None, pend=None, sid=None):
         seq[0] += 1
         return {"id": "demo0000", "sid": sid or f"demo-{seq[0]}",
-                "account": acct, "status": status, "age_s": age,
+                "account": acct, "status": status,
+                "last_write_at": now - age, "age_s": age,
                 "cwd": "/demo", "subdir": subdir, "branch": None, "model": model,
                 "pending_tools": pend or [], "topic": topic, "last_assistant": said}
 

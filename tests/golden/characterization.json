@@ -54,7 +54,7 @@
   },
   "state_payload": {
    "cases": 1,
-   "sha256": "222e3e69a18a0771"
+   "sha256": "c1d504297a70f614"
   }
  },
  "snapshot": {
@@ -25668,6 +25668,7 @@
          "id": "sess-alp",
          "last_assistant": "working on alpha",
          "last_user": "build the alpha feature",
+         "last_write_at": "<float>",
          "model": "opus-4-8",
          "pending_bg_agents": 0,
          "pending_tools": [],
@@ -25708,6 +25709,7 @@
          "id": "sess-bet",
          "last_assistant": "working on beta",
          "last_user": "build the beta feature",
+         "last_write_at": "<float>",
          "model": "opus-4-8",
          "pending_bg_agents": 0,
          "pending_tools": [],
@@ -25748,6 +25750,7 @@
          "id": "sess-gam",
          "last_assistant": "working on gamma",
          "last_user": "build the gamma feature",
+         "last_write_at": "<float>",
          "model": "opus-4-8",
          "pending_bg_agents": 0,
          "pending_tools": [],

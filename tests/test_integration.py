@@ -135,6 +135,40 @@ class TestCollectPipeline(unittest.TestCase):
         self.assertEqual(s["topic"], "Build a login screen")  # slash stub skipped
         self.assertEqual(s["last_assistant"], "Working on the login screen now")
 
+    def test_last_write_at_is_absolute_not_now_derived(self):
+        # ENGINE.md §3.4: no wire field may be derived from now(). last_write_at
+        # is the transcript's own mtime, so two collections a second apart yield
+        # the SAME number — which is what lets the equality diff mean something.
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end()])
+        stamp = time.time() - 30
+        os.utime(fp, (stamp, stamp))
+        fb._cache["state"] = None
+        s = fb.collect_state()["worktrees"][0]["sessions"][0]
+        self.assertAlmostEqual(s["last_write_at"], stamp, places=3)
+        fb._cache["state"] = None
+        again = fb.collect_state()["worktrees"][0]["sessions"][0]
+        self.assertEqual(again["last_write_at"], s["last_write_at"])
+
+    def test_last_write_at_follows_the_subagent_tree(self):
+        # a Workflow writes only under <sid>/ while the main transcript sits
+        # untouched — the same max() age_s is built from, so the absolute must
+        # track it too or the client animates the wrong clock.
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("delegate everything"), assistant_msg(text="delegated"),
+            turn_end()])
+        old = time.time() - 600
+        os.utime(fp, (old, old))
+        sub = fp.with_suffix("")
+        sub.mkdir()
+        sf = sub / "agent-1.jsonl"
+        sf.write_text(json.dumps(assistant_msg(text="subagent reporting")) + "\n")
+        fresh = time.time() - 5
+        os.utime(sf, (fresh, fresh))
+        fb._cache["state"] = None
+        s = fb.collect_state()["worktrees"][0]["sessions"][0]
+        self.assertAlmostEqual(s["last_write_at"], fresh, places=3)
+
     def test_fresh_session_working_old_session_ended(self):
         fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
             user_msg("do a thing"), assistant_msg(text="done"), turn_end()])
