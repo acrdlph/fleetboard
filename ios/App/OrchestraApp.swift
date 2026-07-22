@@ -6,6 +6,7 @@ import UIKit
 @main
 struct OrchestraApp: App {
     @State private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -18,6 +19,9 @@ struct OrchestraApp: App {
                 .preferredColorScheme(.dark)
                 .accessibilityIgnoresInvertColors(true)
                 .task { await model.start() }
+                .onChange(of: scenePhase) { _, phase in
+                    Task { await model.scenePhaseChanged(to: phase) }
+                }
         }
     }
 }
@@ -29,12 +33,14 @@ final class AppModel {
     let client: OrchestraClient
     let pairing: PairingStore
     let fleet: FleetStore
+    let limits: LimitsStore
 
     init() {
         let client = OrchestraClient()
         self.client = client
         self.pairing = PairingStore(client: client)
         self.fleet = FleetStore(client: client)
+        self.limits = LimitsStore(client: client)
     }
 
     func start() async {
@@ -42,6 +48,31 @@ final class AppModel {
         #if DEBUG
         await pairFromLaunchEnvironment()
         #endif
+        if pairing.isPaired { fleet.start() }
+    }
+
+    /// **Backgrounding drops the stream; foregrounding resyncs.** A phone is not
+    /// a browser tab: a suspended app cannot read a socket, and what iOS does
+    /// instead of keeping one alive for it is leave the Mac holding one of its
+    /// 32 subscriber slots for a client that is not there.
+    ///
+    /// The trigger is `.background` and **not `.inactive`** — that phase is
+    /// Control Center, the app switcher, a call banner, a permission alert. A
+    /// stream torn down every time a notification banner slid past would
+    /// reconnect a dozen times an hour for nothing.
+    func scenePhaseChanged(to phase: ScenePhase) async {
+        guard pairing.isPaired else { return }
+        switch phase {
+        case .background:
+            fleet.stop()
+        case .active:
+            // Idempotent by construction: `start()` will not open a second
+            // socket, and the resync costs one delta because the version we
+            // still hold goes back as `Last-Event-ID`.
+            await fleet.resume()
+        default:
+            break
+        }
     }
 
     #if DEBUG

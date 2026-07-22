@@ -15,8 +15,8 @@ import Foundation
 public actor OrchestraClient {
     private let session: URLSession
     private let decoder: JSONDecoder
-    private var profile: ServerProfile?
-    private var tokens: any TokenSource
+    private(set) var profile: ServerProfile?
+    private(set) var tokens: any TokenSource
 
     public init(profile: ServerProfile? = nil,
                 tokens: any TokenSource = StaticTokenSource(nil),
@@ -60,6 +60,18 @@ public actor OrchestraClient {
 
     public func fleetState() async throws -> FleetState {
         try await send(.state, to: profile, as: FleetState.self)
+    }
+
+    /// One session's conversation. Addressed by `(account, sid)` — never a pid.
+    public func chat(account: String, sid: String) async throws -> ChatTranscript {
+        try await send(.chat(account: account, sid: sid), to: profile, as: ChatTranscript.self)
+    }
+
+    /// Per-account usage. The cache read only: `refresh=1` is a 90-second
+    /// whole-fleet subprocess and is not something a phone should be able to
+    /// start by accident.
+    public func limits() async throws -> LimitsReport {
+        try await send(.limits, to: profile, as: LimitsReport.self)
     }
 
     /// Exchange a pairing code for a device token.

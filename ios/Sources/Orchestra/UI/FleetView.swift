@@ -2,12 +2,16 @@ import SwiftUI
 
 /// The Fleet board. Answer "who needs me" in under a second.
 ///
-/// Phase 1 fetches `/api/state` once and on pull-to-refresh; the stream is the
-/// next phase. The 1 s ticker is here already because ages are a client-side
-/// animation by design — `age_s` left the wire so the payload is time-invariant,
-/// and the phone is what makes it move.
+/// It is **told**, not asked: `FleetStore` holds one `GET /api/events` socket
+/// and this view renders whatever the last frame left behind. The 1 s ticker is
+/// not a poll and never was — `age_s` left the wire (step 5 phase 5) so the
+/// payload is time-invariant end to end, and the phone is what makes every "12s
+/// ago" move. That is why a board can sit for an hour with no traffic and still
+/// animate correctly, and it is also why a frozen age is a real symptom rather
+/// than a cosmetic one.
 public struct FleetView: View {
     @Bindable private var store: FleetStore
+    private let client: OrchestraClient
     private let serverLabel: String
     private let onUnpair: () -> Void
 
@@ -15,20 +19,30 @@ public struct FleetView: View {
     /// would not be cheap is anything that changes a row's SIZE on this tick,
     /// which is why the age slot has a fixed minimum width.
     @State private var now = Date()
+    @State private var path: [FleetRoute] = []
     @State private var collapsed: Set<BoardSection> = Set(
         BoardSection.allCases.filter(\.collapsedByDefault)
     )
+    /// A destination to push once, on appear. Nil in every shipping path; it is
+    /// how a script reaches a screen a simulator cannot be tapped into.
+    private let initialRoute: FleetRoute?
 
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    public init(store: FleetStore, serverLabel: String, onUnpair: @escaping () -> Void) {
+    public init(store: FleetStore, client: OrchestraClient, serverLabel: String,
+                initialRoute: FleetRoute? = nil,
+                onUnpair: @escaping () -> Void) {
         self.store = store
+        self.client = client
         self.serverLabel = serverLabel
+        self.initialRoute = initialRoute
         self.onUnpair = onUnpair
     }
 
+    private var staleness: Staleness { store.staleness(now: now) }
+
     public var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack {
                 Palette.canvas.ignoresSafeArea()
                 BodyWash()
@@ -47,9 +61,24 @@ public struct FleetView: View {
                     }
                 }
             }
+            .navigationDestination(for: FleetRoute.self) { route in
+                switch route {
+                case .worktree(let name):
+                    WorktreeDetailView(name: name, store: store, client: client)
+                case .chat(let worktree, let account, let sid):
+                    ChatView(worktree: worktree, account: account, sid: sid,
+                             store: store, client: client)
+                }
+            }
         }
-        .task { await store.refresh() }
+        // One environment write, and every status pill on every screen below
+        // reads it. A dimming rule threaded by hand through four initialisers is
+        // a rule that gets applied to three of them.
+        .environment(\.boardIsStale, staleness.isStale)
         .onReceive(ticker) { now = $0 }
+        .task {
+            if let initialRoute, path.isEmpty { path = [initialRoute] }
+        }
     }
 
     @ViewBuilder
@@ -74,18 +103,21 @@ public struct FleetView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Space.md, pinnedViews: [.sectionHeaders]) {
                 headline
-                if let error = store.lastError {
+                if staleness.isStale, let error = store.lastError {
                     // The board stayed on screen; say WHY it is not moving.
-                    StaleBanner(error: error, since: store.lastGoodAt, now: now)
+                    StaleBanner(error: error, since: store.lastFrameAt ?? store.lastGoodAt, now: now)
                 }
                 ForEach(store.groups) { group in
                     SwiftUI.Section {
                         if !collapsed.contains(group.section) {
                             ForEach(group.cards) { card in
-                                WorktreeCardView(card: card,
-                                                 section: group.section,
-                                                 now: now,
-                                                 resumes: resumes(for: card))
+                                NavigationLink(value: FleetRoute.worktree(card.name)) {
+                                    WorktreeCardView(card: card,
+                                                     section: group.section,
+                                                     now: now,
+                                                     resumes: resumes(for: card))
+                                }
+                                .buttonStyle(.plain)
                             }
                         }
                     } header: {

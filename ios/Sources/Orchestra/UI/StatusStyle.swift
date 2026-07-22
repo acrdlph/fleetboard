@@ -106,6 +106,7 @@ public struct StatusPill: View {
     private let style: StatusStyle
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.boardIsStale) private var stale
 
     public init(_ style: StatusStyle) { self.style = style }
 
@@ -137,7 +138,23 @@ public struct StatusPill: View {
                         .stroke(style.hue.opacity(fillAlpha == 0 ? 0.75 : 0.35), lineWidth: 1)
                 )
         )
+        // **Statuses dim; ages do not** (IOS-APP.md §5.5). An age derives from an
+        // absolute transcript write stamp, so "8m ago" stays literally true with
+        // a dead stream and degrades in the SAFE direction — counting up towards
+        // "we don't know". A `● WORKING` badge on a four-minute-old board is a
+        // lie, and it is the only thing here that is.
+        .opacity(stale ? 0.45 : 1)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(style.word.lowercased())
+        .accessibilityLabel(stale ? "\(style.word.lowercased()), not current"
+                                  : style.word.lowercased())
     }
+}
+
+/// Whether the board on screen is known to be behind.
+///
+/// It travels in the environment rather than as a parameter for the reason
+/// `Palette` resolves its variants in one place: a rule threaded by hand through
+/// four view initialisers is a rule that gets applied to three of them.
+public extension EnvironmentValues {
+    @Entry var boardIsStale: Bool = false
 }

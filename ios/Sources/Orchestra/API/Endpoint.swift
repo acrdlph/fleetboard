@@ -38,6 +38,40 @@ public struct Endpoint: Sendable {
     public static let state = Endpoint(method: .get, path: "/api/state",
                                        timeout: 8, requiresToken: true)
 
+    /// `GET /api/events` — the stream.
+    ///
+    /// **The timeout is 70 s and it is the most load-bearing number in this
+    /// file.** `URLRequest.timeoutInterval` is not a deadline on the response;
+    /// it is the maximum silence between packets. orchestra writes `: keepalive`
+    /// only after `sse_keepalive_s` — **25 s** — of a composed view that has not
+    /// changed, which on a quiet fleet is the only traffic on the socket. The
+    /// board's normal request timeout is 10 s, so a stream opened on the normal
+    /// session would be torn down by the phone every ten seconds of quiet,
+    /// reconnected, torn down again — and the symptom is a board that looks
+    /// perfect and burns a subscriber slot on a loop. 70 s is two keepalives
+    /// plus slack, so a stream dies only when two consecutive keepalives are
+    /// missed, which is a real death.
+    public static let events = Endpoint(method: .get, path: "/api/events",
+                                        timeout: 70, requiresToken: true)
+
+    /// `GET /api/chat?account=&sid=` — the last 40 turns of one conversation.
+    ///
+    /// Identity-addressed like every other session-scoped route (ADR 0008): a
+    /// pid does not appear, and could not be used if it did.
+    public static func chat(account: String, sid: String) -> Endpoint {
+        Endpoint(method: .get, path: "/api/chat",
+                 query: [URLQueryItem(name: "account", value: account),
+                         URLQueryItem(name: "sid", value: sid)],
+                 timeout: 10, requiresToken: true)
+    }
+
+    /// `GET /api/limits`. Without `refresh=1` this is a cache read and is fast;
+    /// `refresh=1` shells out to `cclimits` for EVERY account under a 90 s
+    /// server-side timeout, which is why this build never sends it. See
+    /// `LimitsStore`.
+    public static let limits = Endpoint(method: .get, path: "/api/limits",
+                                        timeout: 15, requiresToken: true)
+
     /// The claim. `Content-Type: application/json` is not optional here: the
     /// server refuses any mutation without it with a **415
     /// `content_type_required`**, which is the CSRF guard — a JSON body forces a

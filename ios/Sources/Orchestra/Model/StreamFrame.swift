@@ -32,7 +32,18 @@ public struct StreamFrame: Sendable, Equatable, Decodable {
     public let order: [String]
     /// On a delta this carries ONLY the changed cards. Everything else on the
     /// frame rides whole, so applying it reconstructs the snapshot exactly.
-    public let cards: [String: Worktree]
+    ///
+    /// **The value is optional and `nil` means REMOVED.** `delta_since` builds
+    /// this as `{k: snap.cards.get(k) for k in keys}` over a ring of changed
+    /// card NAMES — a name in the ring that is no longer in the snapshot is a
+    /// worktree that went away, and `dict.get` yields `None`, which serialises
+    /// as JSON `null`. Phase 1 modelled this as `[String: Worktree]`, which
+    /// decodes `{"gone": null}` as `valueNotFound` and throws the whole frame
+    /// away — so the ONE frame that says "that worktree is gone" was the one
+    /// frame the client could not read, and the card would have stayed on the
+    /// board until the next reconnect. `stream.js` has the same rule spelled
+    /// `if (f.cards[k] === null) delete this.cards[k]`.
+    public let cards: [String: Worktree?]
     public let counts: Counts
     public let otherProcs: [OtherProc]
     /// How old each KIND of probe is. Moves with no version bump — that is the
@@ -40,7 +51,7 @@ public struct StreamFrame: Sendable, Equatable, Decodable {
     public let freshness: Freshness
 
     public init(type: Kind, v: Int, base: Int?, at: Double, order: [String],
-                cards: [String: Worktree], counts: Counts,
+                cards: [String: Worktree?], counts: Counts,
                 otherProcs: [OtherProc], freshness: Freshness) {
         self.type = type
         self.v = v
@@ -65,10 +76,26 @@ public struct StreamFrame: Sendable, Equatable, Decodable {
         base = try c.decodeIfPresent(Int.self, forKey: .base)
         at = try c.decodeIfPresent(Double.self, forKey: .at) ?? 0
         order = try c.decodeIfPresent([String].self, forKey: .order) ?? []
-        cards = try c.decodeIfPresent([String: Worktree].self, forKey: .cards) ?? [:]
+        cards = try c.decodeIfPresent([String: Worktree?].self, forKey: .cards) ?? [:]
         counts = try c.decodeIfPresent(Counts.self, forKey: .counts) ?? Counts()
         otherProcs = try c.decodeIfPresent([OtherProc].self, forKey: .otherProcs) ?? []
         freshness = try c.decodeIfPresent(Freshness.self, forKey: .freshness) ?? Freshness()
+    }
+
+    /// The cards this frame asserts a value for.
+    public var changedCards: [String: Worktree] {
+        cards.compactMapValues { $0 }
+    }
+
+    /// The card names this frame says are gone.
+    public var removedCards: [String] {
+        cards.filter { $0.value == nil }.map(\.key)
+    }
+
+    /// Decode one `data:` payload. Kept here so the store never holds a
+    /// `JSONDecoder` and every frame in the app is decoded by one line of code.
+    public static func decode(_ data: Data) throws -> StreamFrame {
+        try JSONDecoder().decode(StreamFrame.self, from: data)
     }
 }
 
