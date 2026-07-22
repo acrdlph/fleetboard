@@ -18,8 +18,8 @@ are.
 |---|---|
 | **Phase** | B — backend, in flight |
 | **Shipped** | steps 0–3 + 5 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core. An ended turn is read off the transcript rather than waited out, and delegated work — including the background tasks the CLI's own counts miss — holds the turn open |
-| **Next** | step 4 (SSE) — see *Development path* |
-| **Tests** | 435 · characterization 5,656 cases (18 sections) |
+| **Next** | step 4 phase 2 — move `index.html` off `setInterval(tick, 5000)` and onto the stream |
+| **Tests** | 464 · characterization 5,656 cases (18 sections) |
 | **Last updated** | 2026-07-22 |
 
 Design documents are being generated and reconciled. Until each is listed as **settled** below,
@@ -27,6 +27,8 @@ treat it as draft.
 
 | document | covers | status |
 |---|---|---|
+| [`METHOD.md`](METHOD.md) | how to change this system without shipping a silent bug — the traps, each with the incident that found it | **settled** |
+| [`TRANSCRIPT-FORMAT.md`](TRANSCRIPT-FORMAT.md) | Claude Code's on-disk format as *observed*, with counts — the reference the whole observer rests on | **settled** |
 | [`VERIFIED-FACTS.md`](VERIFIED-FACTS.md) | measurements and platform capabilities, taken empirically on the dev machine | **settled** |
 | [`ENGINE.md`](ENGINE.md) | the component decomposition — what knows, what tells, what does | **settled** |
 | [`FRESHNESS.md`](FRESHNESS.md) | killing the status lag: collector, event-driven invalidation, the status model | **settled** |
@@ -128,7 +130,7 @@ even if the phone client were cancelled.
 | **3** ✅ | kqueue watcher — react to writes instead of sweeping | idle **5.3%** of a core; write→board ~1 s (was a 30 s cadence); 220 fds |
 | **—** ✅ | identity-addressed mutations (ADR 0008) | a recycled pid is refused, not delivered to the wrong agent |
 | **5** ✅ | **status model — `working_s = 90`** | phase 1: the CLI's own end-of-turn marker is read positionally and wired into `classify_session`, so **84 %** of in-window sessions resolve by observation and stop waiting out the window (median lateness removed: the full 90 s). Phase 2: the residual 16 % fall to `quiet_s = 45`, chosen off the misfire table (2.71 % against 5.80 % at ENGINE.md's 25), with `settle()` making escalation instant and de-escalation dwell 3 s. Phase 3: `delegated` stops under-counting — a tool_use that LAUNCHED background work counts until its `<task-notification>` arrives (`delegated_s = 600`), taking the end-of-turn misfire rate from **5.09 % to 4.42 %** over 904 replayed claims at no measured cost. Phase 4: the last two inherited numbers stop being `working_s` under another name — `block_grace_s = 60` (the p95–p99 band of genuine tool-run silence, 1.03 % false ■ BLOCKED against 0.82 % at 90, and free on the board's own working set), and `orphan_grace_s` stays at **90** because the measurement says the timer is standing in for a guard that does not exist. Phase 5: `age_s` leaves the wire — both clients animate from `last_write_at`, and the payload is time-invariant end to end (`_UNDIFFED_SESSION_KEYS` is now empty, so a session is diffed WHOLE and a write bumps the version where a clock tick never can). The last inherited number gets its own key: `subagent_grace_s = 180`, measured on 18,145 subagent runs where the tree writes an order of magnitude denser than a conversation (p99 27 s against 408 s) — the ⚙ stopped blinking off mid-flight on 1 run in 15 (6.57 % → 1.17 %). |
-| **4** ⬜ | SSE + delta protocol; retire the 5 s browser poll | the browser finally sees the ~1 s the server already knows |
+| **4** ◐ | SSE + delta protocol; retire the 5 s browser poll | **phase 1 (server) shipped**: `GET /api/events` streams one frame per version bump off the existing publish Condition — never a poll, so a sweep that changes nothing sends nothing. A snapshot on connect, `Last-Event-ID` resumed through `delta_since` (delta in the ring, full snapshot when unknown, too old, or *ahead* of a restarted server), `: keepalive` on idle, and a hard `sse_max_subscribers = 32`, refused with a 503 that names the cap. Measured against the real handler: bump → bytes at **32** clients p50 **1.30 ms** / p95 1.73 ms, `GET /api/state` **0.7 ms** alongside them, 34 threads and **0.21 %** of a core, and every slot and thread back after 32 rude RSTs. Phase 2 — the browser — is next, and `index.html` still polls until it lands |
 | **6** ⬜ | Claude Code hooks; reconcile signal sources by rank | `BLOCKED`/`YOUR TURN` become observed, not inferred |
 | **7** ⬜ | auth, device pairing, tailnet bind | safe to reach from a phone |
 | **8** ⬜ | APNs event pipeline | alerts reach a locked phone |
@@ -154,6 +156,7 @@ could only ask "is the mtime within 90 s?" — precise write timestamps now exis
 | `dirty` cannot be memoised | it is the working tree; no cheap stat sees an edit. Bounded by `GIT_S` and dated by `freshness["git"]` | ADR 0011 |
 | a dispatch's new branch is not nudged | the branch is cut by the launched agent minutes later, with no signal back; bounded by `GIT_S` | `dispatch.py` |
 | `ENGINE.md` is stale in seven places, `FRESHNESS.md` in two | nine rows in ADR 0011's table now, not the four this row used to claim — steps 5.3–5.5 added `delegated`'s definition, `block_grace_s`'s derivation and `orphan_grace_s = 10`. Measurement supersedes them; the docs are a design record, not rewritten | ADR 0011 |
+| a delta whose only change was `other_procs` tells the client nothing | `publish` bumps the version when `other_procs` differs (`new_o != self._dother`), but `changed` is built from CARD keys only, and `delta_since`'s delta branch returns `cards`/`counts`/`freshness` and **no `other_procs` at all** — the snapshot branch does. So a bump caused solely by a stray `claude` appearing or exiting reaches a resuming client as `{"cards": {}}`, and its `other_procs` stays stale until the cursor falls out of the 512-version ring and earns a full snapshot. Harmless while the browser polls; it becomes real the moment a client's only input is the stream. Two lines to fix, but they are in step 2's `delta_since` and want their own mutations and their own commit rather than riding along inside the transport change | `observer.py`:964–986 |
 | the transcript corpus is ~5 GB / 18,773 files, +1,000/day | orchestra's own inputs are a slow disk leak; wants a retention policy | — |
 
 **The load-bearing interface is the delta/event format introduced at step 4.** The browser
@@ -162,6 +165,22 @@ against it. Design it once, correctly, for all three consumers — that is the w
 sequencing in ADR 0004.
 
 ---
+
+## Start with these two
+
+The ADRs record *decisions* and `VERIFIED-FACTS.md` records *numbers*. The transferable knowledge
+is in two other places, and a newcomer should read them before touching code:
+
+- **[METHOD.md](METHOD.md)** — every defect in this rebuild was something that *looked fine and
+  was quietly wrong*: a monkeypatch silently disarmed by a module split, a test that could not
+  have failed, a stale `.pyc` making a mutation appear caught, a safety net pointed at demo mode
+  and therefore at nothing. Ten rules, each with the incident that earned it, plus the technique
+  that did most of the work: **counterfactual replay** — scoring new logic against a corpus whose
+  answers are already written down.
+- **[TRANSCRIPT-FORMAT.md](TRANSCRIPT-FORMAT.md)** — what Claude Code actually writes to disk,
+  measured with counts. The turn-boundary marker that reads as 3 % or 82 % depending on which
+  question you ask; why `run_in_background: true` is neither necessary nor sufficient; the three
+  on-disk shapes a task notification takes; why file mtime is a lying clock.
 
 ## How to pick this work up
 

@@ -279,6 +279,72 @@ CFG = {
     "watch_min_interval_s": 1.0,   # min seconds between event nudges (the rate limit)
     "watch_max_window_s": 2.0,     # never defer a nudge longer than this
     "watch_rebuild_s": 30.0,   # re-enumerate the watch set on this clock too
+    # The event stream (`GET /api/events`, ADR 0005). Thread-per-client is what
+    # that ADR measured and accepted, so a subscriber is a THREAD held for the
+    # subscriber's whole lifetime — a resource, not a statistic, and the reason
+    # this is a cap and not a comment.
+    #
+    # ADR 0005 measured where the box breaks, against a real
+    # ThreadingHTTPServer but not against this loop:
+    #
+    #     streams   threads   RSS      p95 event   unrelated GET /ping
+    #        50        53     21.7 MB    0.3 ms     12 ms
+    #       500       503     49.3 MB    1.1 ms     19 ms   <- supported ceiling
+    #       800       809     93.4 MB    4.2 ms   5005 ms   <- the box breaks
+    #
+    # Re-measured here, against THIS handler, bump -> bytes at every client:
+    #
+    #     streams   threads   p50       p95       GET /api/state   idle CPU
+    #         1         3     0.051 ms  0.088 ms   0.6 ms          0.024 %
+    #        12        14     0.719 ms  0.851 ms   0.6 ms          0.069 %
+    #        32        34     1.303 ms  1.725 ms   0.7 ms          0.213 %
+    #
+    # (threads = one per stream + main + accept; idle CPU is a share of one
+    # core with nothing happening at all.) The requirement is a browser in a
+    # few tabs plus a phone, and the BROWSER gives out long before the server
+    # does: 6 connections per origin means one EventSource per tab starves
+    # POSTs at 3 tabs (ENGINE.md §5.4). So 32 sits an order of magnitude above
+    # the need and an order below the measured ceiling, and costs a fifth of a
+    # percent of a core to hold open. Over it the stream is REFUSED with a 503
+    # naming the cap; the alternative is degrading every subscriber already
+    # connected, which is the one outcome nobody can diagnose from outside.
+    "sse_max_subscribers": 32,
+    # How long a stream may go silent before a `: keepalive` comment frame.
+    # Nothing on this side needs it — the server is happy to hold an idle
+    # socket for hours. It exists for what sits BETWEEN: a NAT or a proxy reaps
+    # an idle connection without telling either end, and EventSource cannot
+    # distinguish that from a fleet where nothing is happening, which on this
+    # board is the normal case. 25 s is under the shortest common NAT idle
+    # timeout (30 s) and costs three bytes.
+    "sse_keepalive_s": 25.0,
+    # How often a SILENT stream checks that its client is still there. It is
+    # not a second keepalive and writes nothing: it is one `select` plus one
+    # `MSG_PEEK` on a socket that already exists.
+    #
+    # It has to exist because a dead peer is otherwise only discovered by
+    # WRITING to it, and on a quiet fleet the next write is the keepalive —
+    # which is the normal case, not an edge one. Measured, 12 rude RSTs, time
+    # until every slot came back:
+    #
+    #     discovered by the next write only   > 20,000 ms  (the probe's own cap;
+    #                                                       the true bound is
+    #                                                       sse_keepalive_s)
+    #     discovered by this check at 1.0 s        198 ms
+    #
+    # And the window is the CAP's problem, not a cosmetic one: EventSource
+    # retries about every 3 s, so one flapping client parks ~8 dead slots
+    # inside a 25 s keepalive and four of them park all 32 — the cap would
+    # then refuse live clients on behalf of clients that had already left.
+    #
+    # What closing it costs, 32 idle streams, 8 s windows, share of one core:
+    #
+    #     liveness 1.0 s   0.213 %
+    #     liveness off     0.197 %
+    #
+    # i.e. inside the run-to-run noise of the measurement (at 12 streams the
+    # ordering reverses, 0.069 % against 0.082 %), because the check is one
+    # `select` and one `MSG_PEEK` per stream per second and writes nothing.
+    "sse_liveness_s": 1.0,
     "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
     "resume_message": "continue",  # what auto-resume types at the stalled agent
 }

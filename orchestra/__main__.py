@@ -8,7 +8,6 @@ never through imported names: config.DEMO is rebound here at startup, and a
 """
 import sys
 import threading
-from http.server import ThreadingHTTPServer
 
 from orchestra import config, observer, resume, server
 
@@ -28,8 +27,12 @@ def main():
         # own kind of hell. Not calling this degrades to exactly the old lazy
         # collect-on-request — that is the rollback story, one line long.
         observer.start_observer()
-    httpd = ThreadingHTTPServer((config.CFG["host"], config.CFG["port"]),
-                                server.Handler)
+    # server.Server, not a bare ThreadingHTTPServer: the listen backlog and the
+    # dropped-subscriber handling that `/api/events` needs live on the class,
+    # and a board started with the stock one would stream perfectly and then
+    # spam stderr the first time a phone changed network.
+    httpd = server.Server((config.CFG["host"], config.CFG["port"]),
+                          server.Handler)
     mode = " (demo data)" if config.DEMO else ""
     print(f"orchestra up → http://{config.CFG['host']}:{config.CFG['port']}{mode}")
     try:
