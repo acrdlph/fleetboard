@@ -43,7 +43,9 @@ from .gitrepo import (munge, match_worktree, discover_worktrees, git_info,
                       _base_ref, branch_topology, demo_topology,
                       cached_topology, TOPO_TTL_S, _topo)
 from .procs import (claude_processes, pair_sessions_with_procs, shell_children,
-                    _pid_cwds, _pid_config_dirs, _host_of, _tmux_pane_map)
+                    _pid_cwds, _pid_config_dirs, _host_of, _tmux_pane_map,
+                    ProcMemo, proc_memo_stats, proc_memo_drift,
+                    proc_memo_clear, PROC_MEMO_CAP)
 from .transcripts import (claude_homes, _read_chunk, _clean, _real_prompt,
                           session_topic, last_assistant_text, find_last_user,
                           parse_session_tail, scan_sessions, _subagent_files,

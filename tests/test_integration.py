@@ -97,7 +97,7 @@ class _Fleet(unittest.TestCase):
         fb.CFG["pattern"] = ""
         fb.CFG["exclude_accounts"] = []
         fb.CFG["reserve_percent"] = {}
-        fb.procs.claude_processes = lambda: []                       # no live procs
+        fb.procs.claude_processes = lambda **_: []                       # no live procs
         fb.limits.cached_limits = lambda refresh=False: {"available": False}
         fb._cache["state"] = None                              # bust the 4s cache
         self._closeouts = dict(fb._closeouts)
@@ -224,7 +224,7 @@ class TestCollectPipeline(_Fleet):
             turn_end(pending_bg_agents=1)])
         old = time.time() - 3 * fb.CFG["working_s"]     # not "working" by age
         os.utime(fp, (old, old))
-        fb.procs.claude_processes = lambda: [{
+        fb.procs.claude_processes = lambda **_: [{
             "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
             "cwd": str(self.repo), "cmd": "claude", "account": None,
             "tmux_target": None, "shells": 0}]
@@ -242,7 +242,7 @@ class TestCollectPipeline(_Fleet):
         fb._closeouts.clear()
         fb._closeouts["myapp"] = ts = time.time() - 30
         # terminal alive → the card advertises step two (✕ close)
-        fb.procs.claude_processes = lambda: [{
+        fb.procs.claude_processes = lambda **_: [{
             "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
             "cwd": str(self.repo), "cmd": "claude --dangerously-skip-permissions",
             "account": None, "tmux_target": "s:0", "shells": 0}]
@@ -252,7 +252,7 @@ class TestCollectPipeline(_Fleet):
         # terminal gone → the card stops advertising it; no stale ✕ close on a
         # freed card. The ENTRY survives: reaping it is finish's job, and a
         # perpetual sweep must not perform a mutation nobody asked for.
-        fb.procs.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda **_: []
         fb._cache["state"] = None
         card = fb.collect_state()["worktrees"][0]
         self.assertNotIn("closeout_sent", card)
@@ -268,7 +268,7 @@ class TestCollectPipeline(_Fleet):
         fb._closeouts["gone-wt"] = time.time() - 30     # no card at all
         fb._closeouts["ancient"] = time.time() - 10 * fb.CLOSEOUT_TTL_S
         before = dict(fb._closeouts)
-        fb.procs.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda **_: []
         for _ in range(3):
             fb._cache["state"] = None
             fb.collect_state()

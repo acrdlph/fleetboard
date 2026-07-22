@@ -707,7 +707,7 @@ class FleetFixture:
         fb.config.DEMO = False
         fb.CFG.update({"roots": [str(root)], "homes": [str(home)],
                        "pattern": "", "exclude_accounts": []})
-        fb.procs.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda **_: []
         fb.limits.cached_limits = lambda refresh=False: {"available": False}
         fb._cache["state"], fb._cache["t"] = None, 0.0
         return self

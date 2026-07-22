@@ -649,7 +649,7 @@ class TestStartFinish(ConfigGuard):
         fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.gitrepo._base_ref = lambda root: "origin/main"
-        fb.procs.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda **_: []
         self.sent = []
         fb.terminal.send_to_process = lambda pid, text: (
             self.sent.append(text) or {"ok": True})
@@ -672,7 +672,7 @@ class TestStartFinish(ConfigGuard):
     def live(self):
         # a realistic proc: real claude_processes() always carries "cmd", which
         # scan_sessions reads when start_finish classifies the live session
-        fb.procs.claude_processes = lambda: [
+        fb.procs.claude_processes = lambda **_: [
             {"pid": 1, "cwd": "/w/wt", "tmux_target": "s:0",
              "cmd": "claude --dangerously-skip-permissions"}]
 
@@ -813,7 +813,7 @@ class TestStartFinish(ConfigGuard):
         # finish drops to the normal no-terminal tiers, not a stale "pending"
         self.live()
         self.finish(landed=False)
-        fb.procs.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda **_: []
         out = self.finish(landed=False)
         self.assertEqual(out["mode"], "dispatch")
         self.assertNotIn("wt", fb._closeouts)
@@ -1652,6 +1652,217 @@ class TestStatMemo(unittest.TestCase):
             m.put(("/t", 1, 2), (size, size), size, float(size))
         self.assertEqual(len(m), 1)
         self.assertEqual(m.evictions, 0)
+
+
+# ------------------------------------------------- the per-generation memo
+
+class TestProcMemo(unittest.TestCase):
+    """The cache underneath the pid->cwd and pid->account lookups.
+
+    Its whole safety argument is the key. A memo on bare pid would put a dead
+    agent's cwd on a stranger's card and hand the act layer the wrong process
+    to type at — ADR 0008's bug in a new place."""
+
+    def test_a_recycled_pid_is_a_miss(self):
+        m = fb.ProcMemo()
+        m.put(4242, "Mon Jul 20 07:08:52 2026", "/work/alpha")
+        self.assertEqual(m.get(4242, "Mon Jul 20 07:08:52 2026"), "/work/alpha")
+        # same pid, a process that started later — a different agent entirely
+        self.assertIs(m.get(4242, "Tue Jul 21 11:00:00 2026"), fb.procs._MISS)
+
+    def test_a_process_with_no_generation_is_never_memoised(self):
+        """A `ps` that cannot report lstart leaves the sweep exactly as slow as
+        it was — never as fast and wrong."""
+        m = fb.ProcMemo()
+        m.put(4242, None, "/work/alpha")
+        self.assertEqual(len(m), 0)
+        self.assertIs(m.get(4242, None), fb.procs._MISS)
+
+    def test_none_is_a_held_value_not_an_absence(self):
+        """`ps eww` proving a process has no CLAUDE_CONFIG_DIR is an answer,
+        and re-asking every sweep would keep the subprocess in the loop."""
+        m = fb.ProcMemo()
+        m.put(7, "g", None)
+        self.assertIsNone(m.get(7, "g"))
+        self.assertIs(m.get(8, "g"), fb.procs._MISS)
+
+    def test_retain_is_the_bound_and_it_is_exact(self):
+        m = fb.ProcMemo()
+        for pid in range(10):
+            m.put(pid, "g", f"/w/{pid}")
+        m.retain({3, 4})
+        self.assertEqual(len(m), 2)
+        self.assertEqual(m.evictions, 0)      # turnover is not overflow
+        self.assertIs(m.get(9, "g"), fb.procs._MISS)
+
+    def test_the_cap_is_a_hard_bound(self):
+        m = fb.ProcMemo(cap=3)
+        for pid in range(5):
+            m.put(pid, "g", pid)
+        self.assertEqual(len(m), 3)
+        self.assertEqual(m.evictions, 2)
+
+
+class TestProcResolve(unittest.TestCase):
+    """`_resolve`: what actually gets probed, and what a cold sweep catches."""
+
+    def setUp(self):
+        self.memo = fb.ProcMemo()
+        self.asked = []
+
+    def probe(self, answers):
+        def _p(pids):
+            self.asked.append(list(pids))
+            return {p: answers[p] for p in pids if p in answers}
+        return _p
+
+    def _resolve(self, pids, gens, answers, cold=False, keep_absent=False):
+        return fb.procs._resolve(self.memo, pids, gens, self.probe(answers),
+                                 cold, keep_absent)
+
+    def test_a_second_sweep_probes_nothing(self):
+        gens = {1: "a", 2: "b"}
+        ans = {1: "/w/one", 2: "/w/two"}
+        self.assertEqual(self._resolve([1, 2], gens, ans), ans)
+        self.assertEqual(self._resolve([1, 2], gens, ans), ans)
+        self.assertEqual(self.asked, [[1, 2]])          # once, not twice
+
+    def test_only_the_new_pid_costs_anything(self):
+        gens = {1: "a", 2: "b"}
+        self._resolve([1], gens, {1: "/w/one"})
+        self._resolve([1, 2], gens, {1: "/w/one", 2: "/w/two"})
+        self.assertEqual(self.asked, [[1], [2]])
+
+    def test_a_recycled_pid_re_probes_rather_than_serving_the_dead_agent(self):
+        """The bug this memo must not become: pid 1 dies, the number is reused,
+        and the board files the new agent under the old one's worktree."""
+        self._resolve([1], {1: "a"}, {1: "/w/old"})
+        got = self._resolve([1], {1: "b"}, {1: "/w/new"})
+        self.assertEqual(got, {1: "/w/new"})
+        self.assertEqual(self.asked, [[1], [1]])
+
+    def test_the_cold_reconcile_counts_a_memo_that_lies(self):
+        """LAW: a memo nobody audits is worse than a slow sweep (§4.3 #1/#4).
+        A stale cwd looks exactly like a correct one on the board."""
+        self._resolve([1], {1: "a"}, {1: "/w/old"})
+        self.memo.put(1, "a", "/w/poisoned")
+        got = self._resolve([1], {1: "a"}, {1: "/w/old"}, cold=True)
+        self.assertEqual(got, {1: "/w/old"})            # the truth is served
+        self.assertEqual(self.memo.drift, 1)            # …and it is counted
+
+    def test_a_cold_sweep_that_agrees_is_not_drift(self):
+        self._resolve([1], {1: "a"}, {1: "/w/one"})
+        self._resolve([1], {1: "a"}, {1: "/w/one"}, cold=True)
+        self.assertEqual(self.memo.drift, 0)
+
+    def test_a_failed_lookup_is_never_remembered(self):
+        """Every live process has a cwd, so an unanswered pid is a broken
+        `lsof`, not a fact. Caching it would strand that agent for its life."""
+        self.assertEqual(self._resolve([1], {1: "a"}, {}), {})
+        self.assertEqual(self._resolve([1], {1: "a"}, {1: "/w/one"}), {1: "/w/one"})
+        self.assertEqual(self.asked, [[1], [1]])
+
+    def test_an_absent_environment_is_a_fact_when_the_probe_answered(self):
+        """A bare `claude` has no CLAUDE_CONFIG_DIR. `ps eww` answering for its
+        neighbour proves the mechanism works, so the absence is real."""
+        got = self._resolve([1, 2], {1: "a", 2: "b"}, {2: "/home/.claude-x"},
+                            keep_absent=True)
+        self.assertEqual(got, {2: "/home/.claude-x"})
+        self._resolve([1, 2], {1: "a", 2: "b"}, {2: "/home/.claude-x"},
+                      keep_absent=True)
+        self.assertEqual(self.asked, [[1, 2]])          # neither re-probed
+
+    def test_an_environment_probe_that_failed_outright_is_not_a_fact(self):
+        self._resolve([1], {1: "a"}, {}, keep_absent=True)
+        self._resolve([1], {1: "a"}, {}, keep_absent=True)
+        self.assertEqual(self.asked, [[1], [1]])
+
+    def test_a_cold_probe_that_answers_nothing_keeps_the_board_up(self):
+        """One denied `lsof` used to blank every cwd and report the whole
+        fleet FREE. An unanswered probe proves nothing — and is not a lie."""
+        self._resolve([1], {1: "a"}, {1: "/w/one"})
+        got = self._resolve([1], {1: "a"}, {}, cold=True)
+        self.assertEqual(got, {1: "/w/one"})
+        self.assertEqual(self.memo.drift, 0)
+
+
+class TestClaudeProcessesMemo(unittest.TestCase):
+    """`claude_processes` end to end against a fabricated process table."""
+
+    LSTART = "Mon Jul 20 07:08:52 2026"
+
+    def _ps(self, lstart=None):
+        lstart = lstart or self.LSTART
+        return ("  100     1 ??       0.0 01:00:00 Tue Jul 14 03:47:57 2026 /sbin/launchd\n"
+                f"  200   100 s001     1.5 00:10 {lstart} claude --resume abc\n")
+
+    def setUp(self):
+        self.saved = (fb.shell.run, fb.procs._pid_cwds, fb.procs._pid_config_dirs)
+        fb.proc_memo_clear()
+        self.ps_out, self.cwd_calls, self.env_calls = self._ps(), [], []
+
+        self.plain = False           # stand in for a ps that refuses `lstart`
+
+        def run(cmd, cwd=None, timeout=6):
+            if cmd[:2] == ["ps", "-axo"]:
+                if self.plain and "lstart=" in cmd[2]:
+                    return 1, ""
+                return 0, self.ps_out
+            return 1, ""
+        fb.shell.run = run
+        fb.procs._pid_cwds = lambda pids: (self.cwd_calls.append(list(pids))
+                                           or {p: "/w/alpha" for p in pids})
+        fb.procs._pid_config_dirs = lambda pids: (
+            self.env_calls.append(list(pids)) or {p: "/home/.claude-a2" for p in pids})
+
+    def tearDown(self):
+        fb.shell.run, fb.procs._pid_cwds, fb.procs._pid_config_dirs = self.saved
+        fb.proc_memo_clear()
+
+    def test_the_ps_row_parses_with_a_start_time_and_the_command_survives(self):
+        p, = fb.claude_processes()
+        self.assertEqual((p["pid"], p["cmd"], p["tty"]), (200, "claude --resume abc", "s001"))
+        self.assertEqual(p["cwd"], "/w/alpha")
+        self.assertEqual(p["account"], "a2")
+
+    def test_a_stable_fleet_stops_shelling_out(self):
+        fb.claude_processes()
+        for _ in range(4):
+            fb.claude_processes()
+        self.assertEqual(self.cwd_calls, [[200]])
+        self.assertEqual(self.env_calls, [[200]])
+
+    def test_a_cold_sweep_re_probes_everything(self):
+        fb.claude_processes()
+        fb.claude_processes(cold=True)
+        self.assertEqual(self.cwd_calls, [[200], [200]])
+        self.assertEqual(fb.proc_memo_drift(), 0)
+
+    def test_a_recycled_pid_does_not_inherit_the_dead_agents_worktree(self):
+        fb.claude_processes()
+        self.ps_out = self._ps("Tue Jul 21 11:00:00 2026")
+        fb.procs._pid_cwds = lambda pids: {p: "/w/beta" for p in pids}
+        p, = fb.claude_processes()
+        self.assertEqual(p["cwd"], "/w/beta")
+
+    def test_a_ps_without_lstart_still_builds_the_board(self):
+        """The fallback: no generation, so nothing is memoised and the sweep
+        costs what it always did — never fast and wrong."""
+        self.plain = True
+        self.ps_out = ("  100     1 ??       0.0 01:00:00 /sbin/launchd\n"
+                       "  200   100 s001     1.5 00:10 claude --resume abc\n")
+        p, = fb.claude_processes()
+        self.assertEqual((p["pid"], p["cmd"], p["cwd"]), (200, "claude --resume abc", "/w/alpha"))
+        fb.claude_processes()
+        self.assertEqual(self.cwd_calls, [[200], [200]])
+        self.assertEqual(fb.proc_memo_stats()["cwd_entries"], 0)
+
+    def test_a_process_that_exits_leaves_nothing_behind(self):
+        fb.claude_processes()
+        self.assertEqual(fb.proc_memo_stats()["cwd_entries"], 1)
+        self.ps_out = "  100     1 ??       0.0 01:00:00 Tue Jul 14 03:47:57 2026 /sbin/launchd\n"
+        fb.claude_processes()
+        self.assertEqual(fb.proc_memo_stats()["cwd_entries"], 0)
 
 
 if __name__ == "__main__":
