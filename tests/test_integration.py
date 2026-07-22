@@ -203,6 +203,97 @@ class TestCollectPipeline(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestGitInfoPorcelainV2(unittest.TestCase):
+    """The three ways `status --porcelain=v2 --branch` bites silently.
+
+    git_info reads branch, upstream, ahead/behind and the dirty count out of one
+    v2 call. Every failure mode below renders a confidently WRONG value rather
+    than raising, so each gets a repo built to trigger it.
+    """
+
+    def repo(self, name="app"):
+        d = Path(tempfile.mkdtemp(prefix="fb-gi-")) / name
+        d.mkdir(parents=True)
+        git(d, "init", "-q", "-b", "main")
+        git(d, "config", "user.email", "t@t.t")
+        git(d, "config", "user.name", "t")
+        (d / "a").write_text("1\n"); git(d, "add", "-A")
+        git(d, "commit", "-q", "-m", "c0")
+        return d
+
+    def test_detached_head_keeps_gits_own_abbreviation(self):
+        """v2 says only "(detached)" — no sha. And the label cannot be rebuilt
+        by slicing branch.oid, because git's abbrev length is per-repository
+        (measured 8 chars in one worktree of the dev fleet, 9 in the others).
+        The rendered label must match `rev-parse --short` exactly."""
+        d = self.repo()
+        (d / "b").write_text("2\n"); git(d, "add", "-A"); git(d, "commit", "-q", "-m", "c1")
+        git(d, "checkout", "-q", "HEAD~1")
+        short = subprocess.run(["git", "-C", str(d), "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+        self.assertEqual(fb.git_info(d)["branch"], f"detached@{short}")
+        self.assertNotIn("(detached)", fb.git_info(d)["branch"])
+
+    def test_no_upstream_leaves_ahead_behind_unset(self):
+        """`# branch.ab` is ABSENT with no tracking ref — not "+0 -0". A parser
+        that assumes the line exists reports 0/0 for every untracked branch,
+        which reads as "in sync" when nothing is known at all."""
+        d = self.repo()
+        git(d, "checkout", "-q", "-b", "feat/no-upstream")
+        info = fb.git_info(d)
+        self.assertEqual(info["branch"], "feat/no-upstream")
+        self.assertIsNone(info["ahead"])
+        self.assertIsNone(info["behind"])
+
+    def test_ahead_behind_orientation_is_not_inverted(self):
+        """`# branch.ab +A -B` is ahead-then-behind; `rev-list --left-right`
+        puts the UPSTREAM first. Read positionally, every count on the board
+        flips. Built deliberately asymmetric — 2 ahead, 3 behind — so a swap
+        cannot pass."""
+        d = self.repo()
+        git(d, "checkout", "-q", "-b", "feat/x")
+        for i in range(3):     # 3 commits that will belong to the upstream only
+            (d / f"u{i}").write_text("u\n"); git(d, "add", "-A")
+            git(d, "commit", "-q", "-m", f"u{i}")
+        git(d, "update-ref", "refs/remotes/origin/feat/x", "HEAD")
+        git(d, "reset", "-q", "--hard", "HEAD~3")
+        for i in range(2):     # 2 commits only we have
+            (d / f"m{i}").write_text("m\n"); git(d, "add", "-A")
+            git(d, "commit", "-q", "-m", f"m{i}")
+        # No real remote, so wire tracking by hand. The fetch refspec is the
+        # part that is easy to miss: without it git cannot map refs/heads/feat/x
+        # on origin to refs/remotes/origin/feat/x, @{u} fails to resolve, and
+        # the test silently degrades into the no-upstream case above.
+        git(d, "config", "remote.origin.url", ".")
+        git(d, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+        git(d, "config", "branch.feat/x.remote", "origin")
+        git(d, "config", "branch.feat/x.merge", "refs/heads/feat/x")
+        # Sanity-check the fixture itself: the two forms disagree on ORDER, which
+        # is the entire point. v2 says "+2 -3" (ahead, behind); rev-list says
+        # "3\t2" (behind, ahead). If this ever stops holding, the fixture — not
+        # git_info — is what changed.
+        v2 = subprocess.run(["git", "-C", str(d), "status", "--porcelain=v2",
+                             "--branch"], capture_output=True, text=True).stdout
+        self.assertIn("# branch.ab +2 -3", v2, "fixture did not build 2-ahead/3-behind")
+        info = fb.git_info(d)
+        self.assertEqual(info["ahead"], 2, "ahead/behind look inverted")
+        self.assertEqual(info["behind"], 3, "ahead/behind look inverted")
+
+    def test_dirty_counts_one_line_per_path(self):
+        """v2 uses different record types (1/2/u/?) than v1's two-char codes.
+        The count must still be one per path, untracked included."""
+        d = self.repo()
+        (d / "a").write_text("changed\n")        # modified, unstaged
+        (d / "new1").write_text("x\n")           # untracked
+        (d / "new2").write_text("y\n")           # untracked
+        (d / "staged").write_text("z\n"); git(d, "add", "staged")
+        self.assertEqual(fb.git_info(d)["dirty"], 4)
+
+    def test_clean_repo_is_zero_dirty(self):
+        self.assertEqual(fb.git_info(self.repo())["dirty"], 0)
+
+
 class TestTopologyPipeline(unittest.TestCase):
     """branch_topology against a real repo with a real origin/main ref."""
 

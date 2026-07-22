@@ -41,7 +41,13 @@ FIELDS = ("branch", "commit", "dirty", "ahead", "behind")
 def load_current():
     sys.path.insert(0, str(ROOT))
     import orchestra
-    orchestra.load_config()
+    # load_config() parses sys.argv, so hide this tool's own flags from it —
+    # otherwise argparse rejects --rev/--bench as unknown server options
+    argv, sys.argv = sys.argv, sys.argv[:1]
+    try:
+        orchestra.load_config()
+    finally:
+        sys.argv = argv
     return orchestra
 
 
@@ -72,20 +78,36 @@ def compare(rev="HEAD"):
     if not wts:
         raise SystemExit("no worktrees discovered — check orchestra.config.json")
 
-    mismatches, checked = [], 0
+    mismatches, checked, volatile = [], 0, []
     print(f"comparing git_info: {rev} vs working tree, over {len(wts)} worktrees\n")
     for w in wts:
         root = w.get("git_root") or w["path"]
-        a = old.git_info(root)
-        b = orchestra.git_info(root)
-        checked += 1
+        # The fleet is LIVE — other agents commit and stage while this runs, so a
+        # naive one-shot A/B manufactures phantom diffs (observed: a worktree
+        # reporting branch='?' once and its real branch a moment later). Confirm
+        # any disagreement is reproducible, and interleave the order so a field
+        # that is genuinely drifting shows up as volatile rather than as a
+        # one-sided regression.
+        a, b = old.git_info(root), orchestra.git_info(root)
         diff = [f for f in FIELDS if a.get(f) != b.get(f)]
+        if diff:
+            b2, a2 = orchestra.git_info(root), old.git_info(root)
+            stable = [f for f in diff if a2.get(f) != b2.get(f)]
+            churned = [f for f in diff if f not in stable]
+            if churned:
+                volatile.append((w["name"], churned))
+            diff = stable
+            a, b = a2, b2
+        checked += 1
         flag = "  " if not diff else "!!"
         print(f"{flag} {w['name']:<26} branch={b.get('branch')!r:<34} "
               f"dirty={b.get('dirty')} ahead={b.get('ahead')} behind={b.get('behind')}")
         for f in diff:
             print(f"     {f}: old={a.get(f)!r}  new={b.get(f)!r}")
             mismatches.append((w["name"], f, a.get(f), b.get(f)))
+    for name, fields in volatile:
+        print(f"   ~ {name}: {', '.join(fields)} changed under us mid-run "
+              f"(live worktree) — not counted as a mismatch")
 
     print()
     detached = sum(1 for w in wts

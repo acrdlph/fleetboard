@@ -67,9 +67,46 @@ def discover_worktrees():
 
 
 def git_info(git_root):
+    """Branch, last commit, dirty count and ahead/behind for one worktree.
+
+    Two `git` spawns, not five: `status --porcelain=v2 --branch` carries the
+    branch, the upstream, ahead/behind and the dirty list in a single pass,
+    replacing `branch --show-current`, `status --porcelain` and
+    `rev-list --left-right --count`. `log -1` stays separate — v2 reports the
+    commit oid but not its timestamp or subject.
+
+    Three things about that format bite silently, all reproduced before this
+    was written:
+
+    * A detached HEAD reports the bare string `(detached)` with no sha. The
+      label CANNOT be rebuilt by slicing `branch.oid`, because git's abbrev
+      length is per-repository — measured 8 characters in one worktree of this
+      fleet and 9 in the other eight. So detached heads spend one extra spawn
+      on `rev-parse --short`, which is both exact and rare.
+    * `# branch.ab` is ABSENT when there is no upstream — not `+0 -0`. Left
+      unset, ahead/behind stay None, which is what the caller expects.
+    * `# branch.ab +A -B` is ahead-then-behind, the OPPOSITE order to
+      `rev-list --left-right --count @{u}...HEAD`, which puts the upstream
+      first. Reading them positionally inverts every count on the board.
+    """
     info = {"branch": None, "commit": None, "dirty": 0, "ahead": None, "behind": None}
-    rc, branch = shell.run(["git", "branch", "--show-current"], cwd=git_root)
-    if rc == 0 and branch:
+    branch = None
+    rc, out = shell.run(["git", "status", "--porcelain=v2", "--branch"], cwd=git_root)
+    if rc == 0:
+        dirty = 0
+        for line in out.splitlines():
+            if line.startswith("# branch.head "):
+                branch = line[len("# branch.head "):].strip()
+            elif line.startswith("# branch.ab "):
+                ab = line[len("# branch.ab "):].split()
+                if len(ab) == 2:
+                    # +ahead -behind — note the order, it is not rev-list's
+                    info["ahead"] = int(ab[0].lstrip("+"))
+                    info["behind"] = int(ab[1].lstrip("-"))
+            elif line and not line.startswith("#"):
+                dirty += 1          # 1/2/u/? entries; one line per path, as v1
+        info["dirty"] = dirty
+    if branch and branch != "(detached)":
         info["branch"] = branch
     else:
         rc, head = shell.run(["git", "rev-parse", "--short", "HEAD"], cwd=git_root)
@@ -78,14 +115,6 @@ def git_info(git_root):
     if rc == 0 and log:
         h, ct, s = (log.split("\x00") + ["", "", ""])[:3]
         info["commit"] = {"hash": h, "ts": int(ct or 0), "subject": s}
-    rc, status = shell.run(["git", "status", "--porcelain"], cwd=git_root)
-    if rc == 0:
-        info["dirty"] = len([l for l in status.splitlines() if l.strip()])
-    rc, lr = shell.run(["git", "rev-list", "--left-right", "--count", "@{u}...HEAD"], cwd=git_root)
-    if rc == 0 and lr:
-        parts = lr.split()
-        if len(parts) == 2:
-            info["behind"], info["ahead"] = int(parts[0]), int(parts[1])
     return info
 
 

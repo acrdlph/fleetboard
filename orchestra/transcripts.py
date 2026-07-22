@@ -217,6 +217,42 @@ def parse_session_tail(fp):
     return out
 
 
+def _subagent_files(sub_dir):
+    """[(mtime, path)] for every *.jsonl under a session's subagent tree.
+
+    A session running a Workflow writes only under <session-id>/ while its main
+    transcript sits untouched, so this tree decides whether such a session is
+    live — the ⚙ indicator, and the reason liveness cannot be judged from the
+    main transcript's mtime alone. That makes it tempting to skip the walk for
+    sessions whose main transcript is already out of window; don't. The
+    out-of-window case is exactly the one this rescues, and it is silent when
+    wrong: the session simply vanishes from the board.
+
+    So the walk stays complete and gets cheap instead. os.scandir reuses one
+    directory read per level and skips building a Path per entry; measured over
+    163 real subagent dirs holding ~16k files, 146ms -> 84ms for an identical
+    result.
+    """
+    out = []
+    stack = [str(sub_dir)]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue                      # gone, or not a directory at all
+        with it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.name.endswith(".jsonl"):
+                        out.append((e.stat(follow_symlinks=False).st_mtime,
+                                    Path(e.path)))
+                except OSError:
+                    continue              # raced with a subagent finishing
+    return out
+
+
 def scan_sessions(worktrees, all_procs, now):
     """All recent sessions across every Claude home, mapped to worktrees.
 
@@ -240,14 +276,8 @@ def scan_sessions(worktrees, all_procs, now):
                     continue
                 # Workflows/subagents write to <session-id>/**/*.jsonl while the
                 # main transcript sits untouched — count them toward activity.
-                sub_files = []
                 sub_dir = fp.with_suffix("")
-                if sub_dir.is_dir():
-                    for sf in sub_dir.rglob("*.jsonl"):
-                        try:
-                            sub_files.append((sf.stat().st_mtime, sf))
-                        except OSError:
-                            continue
+                sub_files = _subagent_files(sub_dir)
                 sub_mtime = max((m for m, _ in sub_files), default=0.0)
                 # The newest thing the session "said" may be a subagent's
                 # report (Claude Code shows those in the terminal too).
