@@ -11,6 +11,13 @@ the reversal (see §11).
 > mitigations for statefulness. It is **not** authoritative on numbers or platform behaviour,
 > which were reasoned rather than measured. ADR 0011 indexes where it is stale.
 
+> **§10's "kqueue watches — not building" is REVERSED and built.**
+> [ADR 0012](adr/0012-the-watcher-is-evidence-not-truth.md) — `orchestra/watcher.py`. Three of
+> §10's four arguments held and shaped the design; the fourth, "hard-capped at 256 fds", was a
+> number invented for a design nobody was building and would have started truncating on the
+> first machine it met (the deliberate watch set measures **228**). The rule §10 got exactly
+> right is the one the module is built on: **nudge-only, never a source of truth.**
+
 > **`orchestra.py:NNN` citations throughout are historical.**
 > [ADR 0010](adr/0010-split-into-a-package.md) split that file into the `orchestra/` package;
 > the line numbers were true at the 2,302-line commit this was written against. Grep for the

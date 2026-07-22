@@ -154,6 +154,37 @@ Two kqueue behaviours that shape this, both verified:
   *death* is observable — but there is **no** filter for process *birth*. Discovery of new
   processes stays a timer poll. Any "fully event-driven" claim that omits this is wrong.
 
+### ⚠️ Three more, measured when the watcher was actually built (2026-07-22)
+
+Everything above held. Three things it does not say, all of which decide code:
+
+**1. `kevent()` with `nevents=0` ABORTS the changelist at the first failure.**
+Registering `[dead_fd, live_dir]` with no room in the eventlist raises `OSError:
+[Errno 9]` and **the live directory is never armed** — verified by then creating
+a file in it and seeing nothing. With `nevents=len(changes)` the same batch
+keeps going and returns one `EV_ERROR` kevent per failure (`flags=0x4021`,
+`data=errno`). Every registration must leave room for its own errors; the
+failure mode of getting this wrong is a watch set that is silently half-armed.
+
+**2. `select.KQ_FILTER_USER` is NOT exposed by Python** (3.14.5 — `KQ_FILTER_PROC`,
+`KQ_FILTER_READ`, `KQ_NOTE_EXIT` all are). So a kqueue thread cannot be woken by
+`EVFILT_USER`; it needs a self-pipe registered with `KQ_FILTER_READ`. Verified
+both halves: the attribute is absent, the pipe wake works.
+
+**3. A create in a NESTED directory does not reach the grandparent.** A watch on
+`d/` fires `NOTE_WRITE` for `d/x` and emits **nothing at all** for `d/sub/y`.
+Directory watches are one level deep, full stop — so a session dir can be
+watched for a workflow starting, but the tree below it is not reachable by
+watching upward.
+
+**And the fd count, measured rather than estimated.** The deliberate watch set on
+the live nine-worktree fleet is **228 fds** — 1 root + 8 `projects` roots + 164
+matched project/session dirs + 55 in-window transcripts. `ENGINE.md` §10's
+"hard-capped at 256 fds, if ever built" would have begun truncating on this
+machine on day one. The shipped cap is 2,048 — above the ~1,708 worst case (every top-level
+transcript in window at once, with a session dir each), and 3.3 % of
+`kern.maxfilesperproc` / 1.7 % of the system-wide table.
+
 ### mtime is a lying clock
 
 Worst observed case in the live corpus: `mtime_age` 1,779 s against a true `evidence_age` of

@@ -28,8 +28,8 @@ import time                    # unused here, but tests reach time.sleep as
                                # `orchestra.time.sleep` — keep the name bound
 
 from . import (config, shell, status, gitrepo, procs, transcripts, limits,
-               observer, identity, terminal, chat, finish, dispatch, resume,
-               server)
+               watcher, observer, identity, terminal, chat, finish, dispatch,
+               resume, server)
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO,
@@ -57,6 +57,10 @@ from .limits import (cached_limits, account_reserve, _model_remaining,
                      model_candidates, set_reserve, limits_by_account,
                      demo_limits, _limit_active_until, _cclimits_bin,
                      LIMITS_TTL_S, _limits)
+# `available` is deliberately NOT re-exported — at the top level the name reads
+# as anything at all. Reach it as `orchestra.watcher.available()`.
+from .watcher import (Watcher, WatchSet, build_watch_set, WATCH_MAX_FDS,
+                      DEBOUNCE_S, MIN_INTERVAL_S, MAX_WINDOW_S, REBUILD_S)
 from .observer import (collect_state, cached_state, demo_state, _cache,
                        Observer, Snapshot, GitCadence, start_observer,
                        stop_observer, STATE_TTL_S)

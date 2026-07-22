@@ -102,6 +102,7 @@ objections have already been considered and answered there.
 | [0008](adr/0008-identity-addressed-mutations.md) | Mutations addressed by durable identity, never by pid | accepted, **implemented** (`orchestra/identity.py`) |
 | [0009](adr/0009-api-v1.md) | The versioned API starts at `/api/v1` | accepted |
 | [0011](adr/0011-measurement-supersedes-the-design-doc.md) | Where ENGINE.md and measurement disagree, measurement wins | accepted |
+| [0012](adr/0012-the-watcher-is-evidence-not-truth.md) | The kqueue watcher, built — and it is evidence, not truth | accepted, **implemented** (`orchestra/watcher.py`); supersedes ENGINE.md §10 |
 
 ---
 

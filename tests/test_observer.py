@@ -60,13 +60,24 @@ def fake_state(at, *, cards=(("alpha", 0),), cpu=1.0, etime="01:00", age_s=5,
 
 
 class CacheGuard(unittest.TestCase):
-    """The Observer writes through `_cache`; never leak that into another test."""
+    """The Observer writes through `_cache`; never leak that into another test.
+
+    `watch` off, for every test in this file: an Observer that starts now also
+    starts a kqueue thread, and with no config loaded that thread watches the
+    DEVELOPER'S OWN fleet and nudges this loop whenever a real agent writes a
+    line. Every timing assertion here would become a function of what the
+    machine happened to be doing. The watcher has its own file and its own
+    fixtures; here it is an input to be held still.
+    """
 
     def setUp(self):
         self._cache = dict(fb._cache)
         self._glob = fb.observer._observer
+        self._watch = fb.CFG.get("watch")
+        fb.CFG["watch"] = False
 
     def tearDown(self):
+        fb.CFG["watch"] = self._watch
         fb.observer._observer = self._glob
         fb._cache.update(self._cache)
 
@@ -641,6 +652,7 @@ class TestGitCadence(CacheGuard):
 # five hand-written asserts do not.
 CADENCES = [
     ("idle_s", "IDLE_S", lambda o: o.idle_s),
+    ("idle_blind_s", "IDLE_BLIND_S", lambda o: o.idle_blind_s),
     ("hot_s", "HOT_S", lambda o: o.hot_s),
     ("git_s", "GIT_S", lambda o: o._git.every_s),
     ("reconcile_s", "RECONCILE_S", lambda o: o.reconcile_s),
@@ -714,20 +726,21 @@ class TestCadencesAreConfig(CacheGuard):
         start the board, get that cadence."""
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "orchestra.config.json"
-            p.write_text(json.dumps({"idle_s": 1.5, "hot_s": 0.05,
+            p.write_text(json.dumps({"idle_s": 1.5, "idle_blind_s": 0.4,
+                                     "hot_s": 0.05,
                                      "git_s": 30.0, "reconcile_s": 20.0,
                                      "max_stale_s": 2.0}))
             fb.load_config(["--config", str(p)])
             self.assertEqual(fb.config.CONFIG_PATH, p)
             o = fb.Observer()
             self.assertEqual([read(o) for _k, _c, read in CADENCES],
-                             [1.5, 0.05, 30.0, 20.0, 2.0])
+                             [1.5, 0.4, 0.05, 30.0, 20.0, 2.0])
             # …and the running loop can be asked what it picked up, so "did my
             # edit take?" is answerable without reading the file back
             st = o.stats()
-            self.assertEqual([st["idle_s"], st["hot_s"], st["git_s"],
-                              st["reconcile_s"], st["max_stale_s"]],
-                             [1.5, 0.05, 30.0, 20.0, 2.0])
+            self.assertEqual([st["idle_s"], st["idle_blind_s"], st["hot_s"],
+                              st["git_s"], st["reconcile_s"], st["max_stale_s"]],
+                             [1.5, 0.4, 0.05, 30.0, 20.0, 2.0])
 
     def test_idle_s_has_a_flag_because_it_is_the_battery_knob(self):
         """`--idle-s` beats the file, like every other flag. The other four are

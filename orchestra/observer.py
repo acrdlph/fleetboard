@@ -53,7 +53,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 
-from . import config, gitrepo, procs, transcripts, status, limits
+from . import config, gitrepo, procs, transcripts, status, limits, watcher
 
 STATE_TTL_S = 4.0              # cache collector output between requests
 _cache = {"t": 0.0, "state": None}
@@ -359,8 +359,70 @@ def collect_state(fresh=None, git=None, cold=False):
 # unaffordable when it is merely dearer. Re-measured because ADR 0011 says a
 # performance claim without a measurement is not a claim — including, and
 # especially, a claim inherited from this file's own earlier tables.
-IDLE_S = 3.0        # cadence with no evidence of change; config key "idle_s"
-HOT_S = 0.15        # floor between sweeps after a nudge; config key "hot_s"
+#
+# THEN THE SWEEP STOPPED BEING THE MECHANISM. `watcher.py` holds a bounded set
+# of kqueue fds over the project dirs and the in-window transcripts and calls
+# `nudge()` when one of them moves, so the timer is a SAFETY NET rather than
+# how anything is noticed (ADR 0012). That changes what `idle_s` buys. It no
+# longer sets notification latency — measured, ten writes to a real transcript
+# on the real fleet, median write -> nudge 53 ms and write -> published version
+# 212 ms (max 468). It sets the worst case for the three things kqueue CANNOT
+# see: a process being BORN (there is a filter for process death, none for
+# birth), an append to a transcript already outside the 48 h window, and a
+# subagent file more than one directory deep.
+#
+# NOTHING HAPPENING ANYWHERE. Same instrument, same fleet, 120 s per row, and
+# A/B INTERLEAVED three times — this machine's load average wanders between 8
+# and 50 and a straight sequence of rows measures the load, not the loop:
+#
+#   watch  idle_s   CPU of one core   sweeps  git_probes
+#   off      3.0     13.3 / 13.9 / 15.2 %      40     8    <- the old default
+#   on      30.0      5.8 /  5.3 /  5.8 %       4     4    <- shipped
+#   on      60.0      3.1 %                     2     2
+#
+# 14 % -> 6 %, and the three timer-only rows are worth reading as a group: 13.3
+# was taken at load 47, where the loop could only manage 13 sweeps instead of
+# 40. That row FLATTERS the thing being replaced — under load the old cadence
+# cannot even reach itself. 15.2 % at load 17, with the full 40 sweeps, is the
+# honest one, and it matches the 17 % this file measured before the watcher.
+#
+# WITH ONE AGENT ACTUALLY WORKING, which is the regime that picks the number,
+# because idle it barely matters:
+#
+#   idle_s   CPU    sweeps   of which event-driven
+#     30.0    7.3 %     8            6              <- shipped
+#     15.0    9.6 %    15           11
+#      5.0   15.0 %    35           17
+#
+# Read the last column downward. Going 30 -> 5 buys 27 extra sweeps and 8
+# points, and every one of those sweeps found something the events had already
+# reported. That is the whole argument for 30.0 over anything tighter: below it
+# the timer is re-discovering what it was just told. Above it, 60.0 saves 3
+# points for twice the blind spot on the un-watchable three, and a `claude`
+# started in a quiet worktree being invisible for a minute is the wrong side of
+# "did the board notice me".
+#
+# `hot_s` is NOT the floor the watcher uses. It exists so a burst of MUTATIONS
+# cannot spin the loop and is sized for a handful of them; a transcript being
+# appended to continuously would nudge every 0.15 s forever, which at ~0.15
+# CPU-s per git-free sweep is ~100 % of one core — worse than the timer it
+# replaced. Event-driven nudges get their own rate limit, `watch_min_interval_s`
+# (1.0 s), and the reasoning lives in watcher.py beside it.
+IDLE_S = 30.0       # cadence with no evidence of change; config key "idle_s"
+
+# What `idle_s` was before events, and what it goes back to the moment there
+# are none: Linux (no stdlib inotify binding), a kqueue that failed to start, a
+# watch thread that died. Read from the watcher's `running` on every wait, not
+# latched at startup, so a watcher that dies at hour nine costs three seconds of
+# latency rather than thirty. Degradation is automatic and logged once.
+#
+# A CEILING, not a substitute — `min(idle_s, idle_blind_s)`. Replacing `idle_s`
+# outright would mean `Observer(idle_s=0.01)` silently ran at 3.0, i.e. an
+# explicit argument losing to a default, which is the one rule every other
+# cadence in this file keeps (`_cadence`, and the test named for it). Blind, the
+# loop may never wait LONGER than this; it may certainly wait less.
+IDLE_BLIND_S = 3.0  # ceiling on the wait with no watcher; key "idle_blind_s"
+HOT_S = 0.15        # floor between sweeps after a MUTATION nudge; key "hot_s"
 
 # git's own clock, §2.5's `git_s`. The document says 5.0 and calls it a
 # "re-probe cadence WITHIN a sweep", implying a memo; there cannot be one.
@@ -405,7 +467,16 @@ GIT_S = 15.0        # minimum interval between git fan-outs; config key "git_s"
 # process probe 116 against a warm 73, once a minute: well under 1 % duty for
 # the only thing that can catch a memo lying.
 RECONCILE_S = 60.0  # config key "reconcile_s"
-MAX_STALE_S = 8.0   # never wait longer than this between sweeps; key "max_stale_s"
+
+# The ceiling on one wait, and READ THE SIGN OF THE INEQUALITY: the loop waits
+# `min(idle_s, max_stale_s)` and sweeps when that expires, so a `max_stale_s`
+# BELOW `idle_s` silently becomes the cadence and `idle_s` stops meaning
+# anything. It was 8.0 against an `idle_s` of 3.0, where it never bound. Raising
+# `idle_s` to 30.0 for the watcher would have left it as the real cadence — the
+# whole idle-CPU win, quietly cancelled by a constant three screens away, with
+# every sweep counter still looking plausible. 45.0 is 1.5x `idle_s`; `stats()`
+# publishes both so the pair can be checked against each other on a running loop.
+MAX_STALE_S = 45.0  # never wait longer than this between sweeps; key "max_stale_s"
 HIST = 512          # version/changed-keys ring, §3.5
 
 
@@ -560,7 +631,8 @@ class Observer:
     """
 
     def __init__(self, *, idle_s=None, hot_s=None, git_s=None,
-                 reconcile_s=None, max_stale_s=None):
+                 reconcile_s=None, max_stale_s=None, idle_blind_s=None,
+                 watch=None, watcher_factory=None):
         # §2.5 also lists limits_s. It is not implemented and not accepted: it
         # would start polling cclimits from the sweep, which is step 7. A
         # parameter that silently does nothing is worse than an absent one.
@@ -574,6 +646,7 @@ class Observer:
         # running `_loop` would make `sweeps`-per-second unattributable to any
         # setting, and this module's whole argument is made of measurements.
         self.idle_s = _cadence("idle_s", IDLE_S, idle_s)
+        self.idle_blind_s = _cadence("idle_blind_s", IDLE_BLIND_S, idle_blind_s)
         self.hot_s = _cadence("hot_s", HOT_S, hot_s)
         self.reconcile_s = _cadence("reconcile_s", RECONCILE_S, reconcile_s)
         self.max_stale_s = _cadence("max_stale_s", MAX_STALE_S, max_stale_s)
@@ -598,6 +671,15 @@ class Observer:
         self._nudges = 0
         self._nudge_reason = None
         self._logged_error_at = 0.0
+        # The watcher is built here and started in `start()`, so an Observer
+        # that is only ever `publish()`ed into — which is most of the suite —
+        # opens no file descriptors at all.
+        self.watch = bool(config.CFG.get("watch", True) if watch is None else watch)
+        self._watcher = None
+        if self.watch:
+            make = watcher_factory or watcher.Watcher
+            self._watcher = make(lambda reason: self.nudge(reason, git=False),
+                                 pids=self._live_pids)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -605,6 +687,35 @@ class Observer:
     def running(self):
         t = self._thread
         return bool(t is not None and t.is_alive())
+
+    @property
+    def watching(self):
+        """Whether events are currently driving the loop. Read on every wait,
+        never latched: a watcher that dies mid-uptime must cost three seconds of
+        latency, not thirty."""
+        return bool(self._watcher is not None and self._watcher.running)
+
+    @property
+    def effective_idle_s(self):
+        """What the loop actually waits, which is none of the three settings on
+        its own: `idle_s` while events drive it, capped by `idle_blind_s` when
+        they do not, and capped again by `max_stale_s` in the wait itself."""
+        return self.idle_s if self.watching else min(self.idle_s, self.idle_blind_s)
+
+    def _live_pids(self):
+        """The claude pids of the last snapshot, for `EVFILT_PROC`/`NOTE_EXIT`.
+
+        Costs no fd (the ident is the pid), so watching every one of them is
+        free. There is no kqueue filter for process BIRTH, which is why this
+        reads the snapshot rather than being a source of it — a pid that has
+        appeared since the last sweep is found by the next sweep, not here.
+        """
+        snap = self._snap
+        if snap is None:
+            return ()
+        pids = {p["pid"] for c in snap.cards.values() for p in c.get("live_procs", [])}
+        pids |= {p["pid"] for p in snap.other_procs}
+        return tuple(sorted(pids))
 
     def start(self):
         with self._cv:
@@ -615,9 +726,16 @@ class Observer:
             self._thread = threading.Thread(target=self._loop,
                                             name="observer-sweep", daemon=True)
             self._thread.start()
+        if self._watcher is not None:
+            # after the sweep thread: a watcher whose first nudge lands before
+            # there is a loop to wake is a wasted nudge, not a crash, but there
+            # is no reason to arrange one
+            self._watcher.start()
         return self
 
     def stop(self, timeout=5.0):
+        if self._watcher is not None:
+            self._watcher.stop(timeout)
         self._stop.set()
         self._wake.set()
         t = self._thread
@@ -640,7 +758,7 @@ class Observer:
                           file=sys.stderr)
             if self._stop.is_set():
                 break
-            nxt = started + self.idle_s
+            nxt = started + self.effective_idle_s
             if self._nudge_at > started:        # nudged while we were sweeping
                 nxt = min(nxt, self._nudge_at + self.hot_s)
             self._wake.clear()
@@ -680,7 +798,15 @@ class Observer:
         # to collect synchronously — exactly what happens today.
         if _cache["t"] == t_before and _cache["state"] is s_before:
             _cache["state"], _cache["t"] = state, started
-        return self.publish(state, fresh=fresh, sweep_ms=ms)
+        snap = self.publish(state, fresh=fresh, sweep_ms=ms)
+        if self._watcher is not None:
+            # AFTER the publish, never before: `_live_pids` reads the snapshot,
+            # so a rearm here arms the exit watches for the fleet this sweep
+            # just found rather than the previous one's. It is also the only
+            # thing that keeps the watch set current at `idle_s` 30 — the
+            # watcher's own rebuild clock is the fallback, not the mechanism.
+            self._watcher.rearm("sweep")
+        return snap
 
     def publish(self, state, fresh=None, sweep_ms=None):
         """Turn one `collect_state()` result into a snapshot.
@@ -781,31 +907,49 @@ class Observer:
                 # from the running loop and not only from the file on disk
                 "idle_s": self.idle_s, "hot_s": self.hot_s,
                 "reconcile_s": self.reconcile_s, "max_stale_s": self.max_stale_s,
+                "idle_blind_s": self.idle_blind_s,
+                # what the loop is ACTUALLY waiting, which is neither of the two
+                # above on its own: the blind cadence when there is no watcher,
+                # and `max_stale_s` if somebody set that below `idle_s`
+                "idle_effective_s": min(self.effective_idle_s, self.max_stale_s),
                 **self._git.stats(), **transcripts.memo_stats(),
-                **procs.proc_memo_stats()}
+                **procs.proc_memo_stats(),
+                **(self._watcher.stats() if self._watcher is not None
+                   else {"watching": False})}
 
     # ----------------------------------------------------------- write API
 
-    def nudge(self, reason=""):
+    def nudge(self, reason="", git=True):
         """Evidence, never a command: something changed, sweep sooner.
 
         Never blocks, never fails, never a source of truth — a dropped nudge
         costs latency and nothing else.
 
-        Sooner AND fuller: the nudge also pulls git off its cadence. Every
-        caller is a completed mutation (finish/exit parks a worktree back on
-        the trunk, finish/brief and finish/nudge type at an agent that is about
-        to commit, a dispatch cuts a branch), and a board that re-sweeps in
-        150 ms only to serve 15 s-old branch data has answered the wrong half
-        of the question. git is nudged unconditionally rather than per-reason:
-        guessing which mutations move the working tree is a second source of
-        truth that goes stale the first time somebody adds a route.
+        Sooner AND fuller, for a MUTATION: the nudge also pulls git off its
+        cadence. Every such caller is a completed mutation (finish/exit parks a
+        worktree back on the trunk, finish/brief and finish/nudge type at an
+        agent that is about to commit, a dispatch cuts a branch), and a board
+        that re-sweeps in 150 ms only to serve 15 s-old branch data has answered
+        the wrong half of the question. git is forced unconditionally across
+        mutations rather than per-reason: guessing which of them move the working
+        tree is a second source of truth that goes stale the first time somebody
+        adds a route.
+
+        `git=False` is the WATCHER's nudge, and the distinction is not cosmetic.
+        A transcript write is not a mutation, it is an agent working, and it
+        arrives as often as an agent types. Forcing a fan-out on each one would
+        run git at the event rate — the exact cost `GIT_S` exists to bound, and
+        by the measured table beside it the most expensive thing this loop can
+        do. Watched evidence therefore buys a sooner sweep and nothing more;
+        git keeps its own 15 s clock, which is what it was designed for and
+        which `freshness["git"]` still dates on the card.
         """
         try:
             self._nudge_at = time.time()
             self._nudge_reason = reason
             self._nudges += 1
-            self._git.force(reason)
+            if git:
+                self._git.force(reason)
             self._wake.set()
         except Exception:                          # noqa: BLE001
             pass
@@ -832,11 +976,13 @@ def stop_observer(timeout=5.0):
         _observer.stop(timeout)
 
 
-def nudge(reason=""):
+def nudge(reason="", git=True):
     """Module-level convenience: a no-op when no sweep thread is running, so
-    every mutation path can call it unconditionally."""
+    every mutation path can call it unconditionally. Every caller of THIS is a
+    mutation, hence `git=True` — the watcher holds its Observer directly and
+    passes `git=False`."""
     if _observer is not None:
-        _observer.nudge(reason)
+        _observer.nudge(reason, git=git)
 
 
 # --------------------------------------------------------------- demo state

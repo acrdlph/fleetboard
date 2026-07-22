@@ -37,21 +37,40 @@ CFG = {
     "max_sessions": 6,         # per worktree card
     "exclude_accounts": [],    # account labels never AUTO-picked for dispatch
     "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)
-    # The sweep's five cadences (ENGINE.md §2.5). They are keys and not
-    # constants because they trade notification latency against battery, and
-    # the right trade belongs to whoever owns the laptop: measured on a
-    # nine-worktree fleet, `idle_s` 3.0 costs 17 % of one core continuously
-    # and 1.0 costs 28 %. Every default here is the measured value shipped in
-    # observer.py, which is where the measurements and the reasoning live —
-    # read the tables beside IDLE_S/GIT_S before changing one, and note that
-    # `git_s` moves the bill more than `idle_s` does. Observer(idle_s=…) still
-    # wins over the file: the tests drive the loop at cadences no user would
-    # choose.
-    "idle_s": 3.0,             # seconds between sweeps with no evidence of change
-    "hot_s": 0.15,             # floor between sweeps after a nudge, so a burst can't spin
+    # The sweep's cadences (ENGINE.md §2.5). They are keys and not constants
+    # because they trade notification latency against battery, and the right
+    # trade belongs to whoever owns the laptop. Every default here is the
+    # measured value shipped in observer.py, which is where the measurements
+    # and the reasoning live — read the tables beside IDLE_S/GIT_S before
+    # changing one, and note that `git_s` moves the bill more than `idle_s`
+    # does. Observer(idle_s=…) still wins over the file: the tests drive the
+    # loop at cadences no user would choose.
+    #
+    # `idle_s` no longer sets notification latency — the watcher below does,
+    # at ~53 ms measured. It sets how long the things kqueue CANNOT see wait:
+    # a `claude` being born (there is no filter for process birth), an append
+    # to a transcript already outside the 48 h window, a subagent file more
+    # than one directory deep. Measured on a nine-worktree fleet with nothing
+    # happening: the old timer-only 3.0 cost 13.9 % of one core; the watcher
+    # with 30.0 costs 5.8 %.
+    "idle_s": 30.0,            # seconds between sweeps with no evidence of change
+    "idle_blind_s": 3.0,       # …and with no watcher: Linux, or a kqueue that died
+    "hot_s": 0.15,             # floor between sweeps after a MUTATION nudge
     "git_s": 15.0,             # min seconds between git fan-outs on the sweep
     "reconcile_s": 60.0,       # cold sweep: bypass every memo, count the disagreements
-    "max_stale_s": 8.0,        # never wait longer than this between sweeps
+    "max_stale_s": 45.0,       # never wait longer than this between sweeps (>= idle_s,
+                               # or it silently BECOMES the cadence — see observer.py)
+    # The watcher (ENGINE.md §10's deferred kqueue, built: watcher.py). Events
+    # are what let `idle_s` go from 3.0 to 30.0, so turning this off without
+    # also lowering `idle_s` leaves a board that notices things half a minute
+    # late — which is why the loop reads `idle_blind_s` whenever the watcher is
+    # not actually running, rather than trusting the setting.
+    "watch": True,             # react to transcript writes instead of polling for them
+    "watch_max_fds": 2048,     # hard cap; over it the excess degrades to the timer
+    "watch_debounce_s": 0.05,  # quiet period that ends a burst — 50 lines, one nudge
+    "watch_min_interval_s": 1.0,   # min seconds between event nudges (the rate limit)
+    "watch_max_window_s": 2.0,     # never defer a nudge longer than this
+    "watch_rebuild_s": 30.0,   # re-enumerate the watch set on this clock too
     "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
     "resume_message": "continue",  # what auto-resume types at the stalled agent
 }
@@ -77,9 +96,11 @@ def load_config(argv=None):
     # tuning for someone who has already read observer.py, and a flag each
     # would be five ways to misconfigure the loop for one that is used.
     ap.add_argument("--idle-s", type=float, metavar="S",
-                    help="seconds between sweeps when nothing is changing "
-                         "(default 3.0, ~17%% of one core; 1.0 notices ~2s "
-                         "sooner and costs ~28%%)")
+                    help="seconds between SAFETY-NET sweeps (default 30.0, "
+                         "~6%% of one core idle). Transcript writes arrive as "
+                         "events in ~50ms; this is the worst case for what "
+                         "kqueue cannot see, and 3.0 on a platform with no "
+                         "watcher")
     ap.add_argument("--config", metavar="FILE", help="path to a orchestra.config.json")
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)

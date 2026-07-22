@@ -36,7 +36,9 @@ A left rail navigates between them; all share one visual language:
 
 ![the orchestra dashboard](docs/screenshot.png)
 
-One card per worktree, attention-sorted, refreshed every 5 s. Each card:
+One card per worktree, attention-sorted, refreshed every 5 s — and the
+engine behind it re-reads the world within ~50 ms of an agent writing a line,
+rather than on a timer. Each card:
 branch, dirty count, ahead/behind, last commit, live processes, and every
 recent session tagged with its **account**, model, age, and three lines of
 context — `→` the last thing you told it, `⏎` the last thing it said, `⚙` the
@@ -231,7 +233,7 @@ python3 -m orchestra [--root DIR]... [--pattern REGEX] [--home DIR]...
 | `--home DIR` | auto | Claude home dirs; default finds `~/.claude*` |
 | `--port N` | 4242 | also `ORCHESTRA_PORT` env |
 | `--window-h H` | 48 | ignore transcripts idle longer than this many hours |
-| `--idle-s S` | 3.0 | seconds between sweeps when nothing is changing (see below) |
+| `--idle-s S` | 30.0 | seconds between **safety-net** sweeps; changes arrive as events (see below) |
 | `--demo` | — | fictional data (screenshots, kicking the tires) |
 
 Persistent settings go in `orchestra.config.json` next to the script
@@ -240,7 +242,7 @@ Persistent settings go in `orchestra.config.json` next to the script
 ```json
 { "roots": ["/Users/you/code"], "pattern": "myproject", "cclimits_cmd": null,
   "exclude_accounts": [], "router_home": null, "reserve_percent": {"main": 20},
-  "idle_s": 3.0, "git_s": 15.0 }
+  "idle_s": 30.0, "git_s": 15.0 }
 ```
 
 | key | default | meaning |
@@ -257,51 +259,100 @@ Persistent settings go in `orchestra.config.json` next to the script
 | `cclimits_cmd` / `router_home` | `null` | override the limits binary / pin the router to one Claude home |
 | `resume_delay_s` | `60` | auto-resume fires this long after a limit reset |
 | `resume_message` | `"continue"` | what auto-resume types at the stalled agent |
-| **the sweep's cadences** | | *costs measured below; all five are seconds* |
-| `idle_s` | `3.0` | between sweeps when nothing is changing — **the battery knob** |
-| `hot_s` | `0.15` | floor between sweeps after a mutation, so a burst can't spin the loop |
+| **the sweep's cadences** | | *costs measured below; all are seconds* |
+| `idle_s` | `30.0` | between **safety-net** sweeps — see "how the board notices" below |
+| `idle_blind_s` | `3.0` | ceiling on that wait when there is no watcher (Linux, or one that died) |
+| `hot_s` | `0.15` | floor between sweeps after a **mutation**, so a burst can't spin the loop |
 | `git_s` | `15.0` | minimum between `git` fan-outs |
 | `reconcile_s` | `60.0` | how often a sweep goes cold: bypass every cache, count the disagreements |
-| `max_stale_s` | `8.0` | hard ceiling between sweeps |
+| `max_stale_s` | `45.0` | hard ceiling between sweeps — **keep this ≥ `idle_s`**, or it silently becomes the cadence |
+| **the watcher** (macOS) | | *what makes `idle_s` a safety net rather than the mechanism* |
+| `watch` | `true` | react to transcript writes instead of polling for them |
+| `watch_max_fds` | `2048` | hard cap on watched descriptors; over it the excess falls back to the timer |
+| `watch_debounce_s` | `0.05` | quiet period that ends a burst — an agent writing 50 lines is **one** sweep |
+| `watch_min_interval_s` | `1.0` | floor between event-driven sweeps (the rate limit; see below) |
+| `watch_max_window_s` | `2.0` | never defer a nudge longer than this, however busy the writer |
+| `watch_rebuild_s` | `30.0` | re-enumerate the watch set on this clock, as well as on every change |
 
-**What the cadences cost.** orchestra watches continuously — one thread sweeps
-forever, so the board hears that an agent needs you without anybody refreshing
-anything. That is a real, permanent CPU cost, which is why it is a setting and
-why here is the bill. Measured on a nine-worktree fleet (709 transcripts on
-disk, ~47 inside the 48 h window), 120 s per row, with
-`getrusage(RUSAGE_SELF) + RUSAGE_CHILDREN` — wall time and `ps -o time` on the
-server process both understate this by ~2×, because the sweep is a parallel
-fan-out and most of its cost is billed to the `git` and `ps` children it
-spawns. One knob varies per row; the rest are at their defaults:
+**How the board notices (macOS).** It does not go looking. A kqueue watcher
+holds a deliberately bounded set of file descriptors — the project directories
+that map to one of your worktrees, and the transcripts inside your session
+window — and the moment one of them is written to, the sweep runs. Measured on
+a nine-worktree fleet that is **228 descriptors**: 1 root, 8 `projects` roots,
+164 project and session directories, 55 in-window transcripts. Never the
+18,773 subagent files; over `watch_max_fds` the excess quietly falls back to
+the timer and says so once in the log.
+
+A burst is one sweep, not fifty: writes are debounced (`watch_debounce_s`) and
+then rate-limited (`watch_min_interval_s`), because events remove the sweep's
+floor *and* its ceiling, and the ceiling is the dangerous half — an agent
+writing continuously would otherwise sweep several times a second.
+
+Three things the watcher **cannot** see, which is what `idle_s` is now for:
+a `claude` process being **born** (kqueue has a filter for process death, none
+for birth), an append to a transcript that had already fallen out of the 48 h
+window, and a subagent file more than one directory deep. Those wait for a
+safety-net sweep. And on Linux — no stdlib inotify binding — the watcher never
+starts, one line is logged, and the loop falls back to `idle_blind_s` (3.0),
+which is exactly how this program behaved before.
+
+**What the cadences cost.** orchestra watches continuously, so the board hears
+that an agent needs you without anybody refreshing anything. That is a real,
+permanent CPU cost, which is why it is a setting and why here is the bill.
+Measured on a nine-worktree fleet (709 transcripts on disk, ~47 inside the
+48 h window), 120 s per row, with `getrusage(RUSAGE_SELF) + RUSAGE_CHILDREN` —
+wall time and `ps -o time` on the server process both understate this by ~2×,
+because the sweep is a parallel fan-out and most of its cost is billed to the
+`git` and `ps` children it spawns. One knob varies per row; the rest are at
+their defaults:
+
+**Nothing happening at all** — no agent writing anywhere, three interleaved
+repetitions per row so machine load cancels rather than favouring one:
 
 | | | CPU (1 core = 100 %) | sweeps / git runs | what you trade |
 |---|---|---|---|---|
-| `idle_s` | `5.0` | 16 % | 24 / 8 | |
-| | **`3.0`** | **17 %** | 40 / 8 | the default |
-| | `2.0` | 19 % | 60 / 8 | |
-| | `1.0` | 28 % | 119 / 8 | notice ~2 s sooner, for ~1.6× the CPU |
+| `watch` + `idle_s` | **`true` + `30.0`** | **6 %** | 4 / 4 | the default |
+| | `true` + `60.0` | 3 % | 2 / 2 | 3 points, for twice the blind spot below |
+| | `false` + `3.0` | 14 % | 40 / 8 | the timer-only loop this replaces |
 | `git_s` | `5.0` | 29 % | 40 / 20 | branch/ahead/behind/dirty ≤5 s old |
-| | **`15.0`** | **17 %** | 40 / 8 | the default |
+| | **`15.0`** | **17 %** | 40 / 8 | *(measured at the old `idle_s` 3.0)* |
 | | `60.0` | 9 % | 40 / 2 | a dirty count can be a minute stale |
-| `reconcile_s` | **`60.0`** | **17 %** | 40 / 8 | the default |
+| `reconcile_s` | **`60.0`** | **17 %** | 40 / 8 | *(same)* |
 | | off | 16 % | 40 / 8 | saves ~1 point; nothing audits the caches |
 
-Read that table before tuning `idle_s`, because it is not the knob it looks
-like. **`git_s` is.** The `git` fan-out is 79 % of a sweep's cost, so what
-dominates the bill is how often git runs, not how often the sweep does —
-tripling the sweep rate (3.0 → 1.0) costs 11 points, while tripling the git
-rate (15 → 5) costs 12 on its own. A sweep that skips git is cheap: that is
-what the transcript and process caches bought, and it is why 5.0 and 3.0 are
-one point apart. And `reconcile_s` — the cold pass that bypasses every cache
-and counts what they got wrong — is close to free, so turning it off buys a
-rounding error and gives up the only thing that can catch a cache lying.
+**And with one agent actually working**, which is the regime that decides
+`idle_s`, because idle it barely matters:
 
-Both budgets are for changes **nobody told the board about** — an agent going
-quiet, a file saved in an editor. Every mutation you make on the board
-(finish, dispatch, chat) nudges the sweep, which pulls the next one forward
-*and* forces git off its cadence, so you never wait out `git_s` for your own
-actions. And nothing is ever silently stale: each card publishes how old its
-git data is.
+| `idle_s` (watcher on) | CPU | sweeps | of which event-driven |
+|---|---|---|---|
+| **`30.0`** | **7 %** | 8 | 6 |
+| `15.0` | 10 % | 15 | 11 |
+| `5.0` | 15 % | 35 | 17 |
+
+Read the last column downward. Tightening `idle_s` from 30 to 5 buys 27 extra
+sweeps and 8 points of CPU, and **every one of those sweeps found something the
+events had already reported**. Before the watcher, that column did not exist
+and polling harder was the only dial there was.
+
+Two more things worth more than the numbers.
+
+**The watcher pays twice.** Idle cost falls **14 % → 6 %** *and* a transcript
+write reaches the board in **53 ms** instead of waiting out a cadence (median
+of ten writes; 212 ms through to a published version, since the sweep follows).
+Latency and battery usually trade against each other; this is the one change
+that moved both.
+
+**`git_s` is still the expensive knob, not `idle_s`.** The `git` fan-out is
+79 % of a sweep's cost, which is why tripling the git rate (15 → 5) costs 12
+points on its own. And note what a *watch* nudge deliberately does **not** do:
+it does not force git off its cadence. A mutation you performed does; an agent
+typing does not, or git would run at the speed of somebody's keyboard.
+
+Every budget above is for changes **nobody told the board about**. Every
+mutation you make (finish, dispatch, chat) nudges the sweep, which pulls the
+next one forward *and* forces git off its cadence, so you never wait out
+`git_s` for your own actions. And nothing is ever silently stale: each card
+publishes how old its git data is.
 
 `exclude_accounts` names accounts (by label) that dispatch/router will never
 **auto**-pick — useful for keeping a primary account (e.g. `main` = `~/.claude`)
