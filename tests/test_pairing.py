@@ -711,6 +711,72 @@ class TestTheFlowOnTheWire(WireCase):
             self.assertEqual(status, 403, f"{method} {path}")
             self.assertEqual(data["error"], fb.auth.ADMIN_ONLY)
 
+    def test_a_suffix_is_not_a_way_round_the_admin_rule(self):
+        """The guard and the router have to agree, and here they did not.
+
+        `auth._under_admin` matches on a SEGMENT boundary — deliberately, and
+        `test_the_prefix_does_not_spread_across_a_segment_boundary` pins it.
+        `do_GET` matched the same subtree with a bare `startswith`, which is one
+        character LESS strict, so `/api/v1/devicesX` was *not admin* to the
+        guard and *was the device list* to the router. A phone holding a valid
+        token read the inventory of every credential to this machine — and
+        silently, because `auth.audited` asks the same segment-aware question
+        the guard does and therefore did not log it either.
+
+        Both halves were tested alone and neither test could see the gap. The
+        rule is API.md §2.3 step 5, which already said it: `/api/v1` resolves by
+        EXACT match on the path without its query, and there is no prefix
+        routing. Found by driving it, not by reading it.
+        """
+        _, token = fb.auth.add_device("iPhone")
+        for path in ("/api/v1/devicesX", "/api/v1/devices-of-others",
+                     "/api/v1/deviceslist", "/api/v1/devices.json",
+                     "/api/v1/devicesX?x=1"):
+            status, data = self.request("GET", path, token=token)
+            self.assertNotEqual(status, 200, path)
+            self.assertNotIn("devices", data, path)
+
+    def test_v1_resolves_exactly_for_the_mac_as_well(self):
+        """A suffix on an admin route is refused for a token holder by the
+        guard — `/api/v1/devices/pair/openX` is still under the `/api/v1/devices/`
+        segment — so this one is not a hole. It is still wrong, and quietly:
+        `startswith` meant a typo on the board OPENED A REAL PAIRING WINDOW,
+        answered 200, and left a live 120-second credential nobody knew about,
+        because the page that would have displayed it had asked for a URL that
+        does not exist. Exact match, so a path that is not the route does
+        nothing at all.
+        """
+        board = fb.Server(("127.0.0.1", 0), LoopbackHandler)
+        threading.Thread(target=board.serve_forever, daemon=True).start()
+        try:
+            for path in ("/api/v1/devices/pair/openX",
+                         "/api/v1/devices/pair/closeX",
+                         "/api/v1/pairX"):
+                conn = http.client.HTTPConnection("127.0.0.1",
+                                                  board.server_address[1],
+                                                  timeout=10)
+                conn.request("POST", path, body="{}",
+                             headers={"Content-Type": "application/json"})
+                r = conn.getresponse()
+                blob = r.read()
+                conn.close()
+                self.assertEqual(r.status, 404, f"{path} -> {blob[:120]}")
+                self.assertNotIn(b'"svg"', blob, path)
+                self.assertFalse(fb.pairing.state()["open"], path)
+        finally:
+            board.shutdown()
+            board.server_close()
+
+    def test_the_real_device_route_still_answers_the_mac(self):
+        """The other half of the fix: tightening the router must not shut the
+        board out of the surface it is the only caller for."""
+        fb.auth.add_device("iPhone")
+        for path in ("/api/v1/devices", "/api/v1/devices?x=1"):
+            verdict = fb.auth.check("127.0.0.1", None, "GET", path, now=1000.0)
+            self.assertTrue(verdict.ok, path)
+            self.assertTrue(fb.server.Handler.__dict__ and
+                            fb.auth.admin("GET", path), path)
+
     def test_a_phone_cannot_revoke_the_device_that_would_revoke_it(self):
         device, token = fb.auth.add_device("stolen iPhone")
         status, _ = self.request("POST",

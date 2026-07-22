@@ -589,6 +589,53 @@ class TestAudit(AuthCase):
         self.check(TAILNET, f"Bearer {token}", "POST", "/api/finish", now=1.0)
         self.assertNotIn(token.split("_", 2)[2], fb.auth.AUDIT_LOG.read_text())
 
+    def test_the_log_never_carries_a_token_that_arrived_in_the_path(self):
+        """The header is not the only place a token can be.
+
+        API.md §2.1 says a token is presented `only` as `Authorization: Bearer`
+        — never a query parameter — and this server refuses one that arrives
+        any other way. But refusing it is not the end of the story: the refusal
+        is AUDITED, and the audit keeps the path whole, query included (ADR
+        0008: the query is the identity a mutation was addressed to). So a
+        client that got that wrong once wrote its own live 256-bit secret into
+        a file whose own docstring says people paste it into bug reports, and
+        the token stayed valid.
+
+        The path is still logged. The credential inside it is not.
+        """
+        _, token = self.mint()
+        self.check(TAILNET, None, "GET", f"/api/state?token={token}", now=1.0)
+        blob = fb.auth.AUDIT_LOG.read_text()
+        self.assertNotIn(token, blob)
+        self.assertNotIn(token.split("_", 2)[2], blob)
+        self.assertIn("/api/state", fb.auth.read_audit()[0]["path"])
+
+    def test_a_token_is_scrubbed_from_every_field_not_only_the_path(self):
+        """The scrub is on the LINE, not on one field, for the same reason the
+        auth check is in `parse_request`: a field added next month is covered
+        without anybody remembering it was."""
+        _, token = self.mint()
+        fb.auth.audit(at=1.0, peer=TAILNET, device=None,
+                      label=f"phone {token}", method="GET",
+                      path="/api/state", outcome="allow", note=token)
+        self.assertNotIn(token.split("_", 2)[2],
+                         fb.auth.AUDIT_LOG.read_text())
+
+    def test_the_scrub_follows_the_token_version(self):
+        """A hard-coded `orc1_` would keep every test green on the day the
+        token format bumps, and log the new one in full."""
+        self.assertIn(fb.auth.TOKEN_VERSION, fb.auth._TOKENISH.pattern)
+        self.assertTrue(fb.auth.REDACTED.startswith(fb.auth.TOKEN_VERSION))
+        self.assertEqual(fb.auth.scrub(f"{fb.auth.TOKEN_VERSION}_ab12cd34_sEcRe7"),
+                         fb.auth.REDACTED)
+
+    def test_the_scrub_keeps_the_device_id_it_exists_to_record(self):
+        """A redaction that ate the audit's own identifier would be a fix that
+        broke the file. The device id is not `orc1_`-prefixed and survives."""
+        device, token = self.mint()
+        self.check(TAILNET, f"Bearer {token}", "POST", "/api/send", now=1.0)
+        self.assertEqual(fb.auth.read_audit()[0]["device"], device["id"])
+
     def test_a_long_path_is_truncated(self):
         self.check("127.0.0.1", None, "POST", "/api/send?x=" + "y" * 5000,
                       now=1.0)
@@ -804,18 +851,34 @@ def routes_from_handler():
     tuple, and of whatever idiom somebody reaches for next — which is the
     property a hard-coded list does not have. The other literals in those
     methods are content types and error text, and none of them starts with `/`.
+
+    SECOND SOURCE, and it is not a convenience. The device subtree is routed by
+    asking the guard — `if auth.admin("GET", self.path)` — rather than by a
+    literal, because the router and the guard disagreeing by one character is
+    precisely how `/api/v1/devicesX` served the whole device inventory to a
+    phone. That fix is right and it costs the literal, so two real routes fell
+    out of this enumeration and the loss was invisible: the count merely went
+    down. A path the GUARD names is a route this server answers, so `auth.ADMIN`
+    is read too, under every method the handler implements. Both landmarks are
+    pinned in `test_the_enumeration_actually_enumerates`, so neither source can
+    quietly stop producing.
     """
     tree = ast.parse((ROOT / "orchestra" / "server.py").read_text())
     handler = next(n for n in ast.walk(tree)
                    if isinstance(n, ast.ClassDef) and n.name == "Handler")
     found = set()
+    methods = []
     for fn in handler.body:
         if not isinstance(fn, ast.FunctionDef) or not fn.name.startswith("do_"):
             continue
+        methods.append(fn.name[3:])
         for node in ast.walk(fn):
             if isinstance(node, ast.Constant) and isinstance(node.value, str) \
                     and node.value.startswith("/"):
                 found.add((fn.name[3:], node.value))
+    for path in fb.auth.ADMIN:
+        for method in methods:
+            found.add((method, path))
     return found
 
 
@@ -833,7 +896,13 @@ class TestEveryRouteIsGuarded(WireCase):
         self.assertGreaterEqual(len(routes), 15)
         for landmark in (("GET", "/api/state"), ("GET", "/api/events"),
                          ("GET", "/api/chat"), ("POST", "/api/send"),
-                         ("POST", "/api/dispatch"), ("GET", "/stream.js")):
+                         ("POST", "/api/dispatch"), ("GET", "/stream.js"),
+                         # the second source: routed by asking `auth.admin`, so
+                         # there is no literal in `do_GET` to find. Pinned here
+                         # because when it stopped producing, the only symptom
+                         # was a smaller number.
+                         ("GET", "/api/v1/devices"),
+                         ("POST", "/api/v1/devices")):
             self.assertIn(landmark, routes)
 
     def test_every_route_is_exempt_by_list_or_refuses_a_stranger(self):
@@ -864,6 +933,58 @@ class TestEveryRouteIsGuarded(WireCase):
                 self.assertNotIn(code, refusals, f"{method} {path}")
             else:
                 self.assertEqual(status, 401, f"{method} {path}")
+
+    def test_no_v1_route_can_be_reached_by_a_suffix(self):
+        """`/api/v1` resolves by EXACT match — API.md §2.3 step 5, "there is no
+        prefix routing".
+
+        This is the generic form of the `/api/v1/devicesX` hole, which existed
+        because the router said `startswith("/api/v1/devices")` and the guard
+        said "this segment or one below it": a valid token was refused at the
+        exact path and served the whole device inventory one character to the
+        right of it. Both halves had a test and neither could see the gap,
+        because neither asked the other one anything.
+
+        So the claim is made against the ROUTES THEMSELVES rather than against
+        the one that broke: for every v1 route the handler answers, the same
+        path with a character glued on must not reach it. A v1 route added next
+        month is in this test next month, and it is asked while holding a VALID
+        TOKEN — the credential the whole admin rule is about — because a
+        stranger is refused by the door and would prove nothing.
+        """
+        victim, _ = fb.auth.add_device("the device that gets revoked")
+        _, token = fb.auth.add_device("iPhone")
+        v1 = [(m, p) for m, p in routes_from_handler()
+              if p.startswith("/api/v1")]
+        self.assertGreaterEqual(len(v1), 3)     # the loop must not be vacuous
+        probes = 0
+        for method, path in sorted(v1):
+            # THE SUFFIX GOES IN THE FIRST SEGMENT AND THE TAIL IS KEPT, which
+            # a bare `path + "X"` does not do and which is the difference
+            # between a test and a green light. `/api/v1/devicesX` alone lands
+            # on a 404 from the id parser and looks refused; it is
+            # `/api/v1/devicesX/<id>/revoke` that parses into five parts, is not
+            # under the guard's segment, and REVOKES A DEVICE for anybody
+            # holding any token. Caught by mutation, not by reading.
+            for tail in ("", f"/{victim['id']}/revoke", "/pair/open"):
+                fb.auth._reset_buckets()
+                probe = path.rstrip("/") + "X" + tail
+                body = "{}" if method != "GET" else None
+                status, blob, _ = self.request(method, probe, token=token,
+                                               body=body)
+                probes += 1
+                self.assertIn(status, (401, 403, 404),
+                              f"{method} {probe} answered {status}: {blob[:120]}")
+                self.assertNotIn(b'"devices"', blob, f"{method} {probe}")
+                self.assertNotIn(b'"token"', blob, f"{method} {probe}")
+                self.assertNotIn(b'"svg"', blob, f"{method} {probe}")
+        self.assertGreaterEqual(probes, 9)
+        # …and nothing ACTED. A 404 that revoked a device on the way past is
+        # the failure this whole test exists for.
+        fb.auth._forget_registry()
+        by_id = {d["id"]: d for d in fb.auth.devices()}
+        self.assertIsNone(by_id[victim["id"]]["revoked"])
+        self.assertFalse(fb.pairing.state()["open"])
 
     def test_the_exempt_list_names_routes_that_exist(self):
         routes = routes_from_handler()

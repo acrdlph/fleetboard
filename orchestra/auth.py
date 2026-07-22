@@ -73,6 +73,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -509,6 +510,36 @@ def _forget_registry():
 
 _audit_lock = threading.Lock()
 
+# Anything shaped like a token, wherever it turns up in an audit line.
+#
+# The header is not the only place a token can be. API.md §2.1 says a token is
+# presented ONLY as `Authorization: Bearer` — never a query parameter, never a
+# cookie — and `parse_bearer` refuses one that arrives any other way. But the
+# refusal is AUDITED, and the audit keeps the path whole with its query,
+# because the query is the identity a mutation was addressed to (ADR 0008). So
+# a client that got that wrong once wrote its own live 256-bit secret into this
+# file, in the clear, and the token stayed valid: driven, not reasoned —
+# `GET /api/state?token=orc1_…` produced a 401 and a log line containing all 43
+# characters. The file is 0600, and it is also the file somebody pastes into a
+# bug report, which is exactly the argument `pairing._audit` already makes
+# about the code it refuses to write down.
+#
+# The substitution is on the SERIALISED LINE rather than on the `path` field,
+# for the same reason `auth.check` lives in `parse_request`: a field added next
+# month is covered without anybody remembering that it had to be. The device id
+# survives — it is eight hex characters with no `orc1_` in front of it, so the
+# identifier this log exists to carry is never what gets eaten.
+# Built FROM `TOKEN_VERSION` rather than spelling `orc1_` again: the day this
+# becomes `orc2` the scrub has to move with it, and a hard-coded prefix here
+# would keep passing every test while silently logging the new format in full.
+_TOKENISH = re.compile(re.escape(TOKEN_VERSION) + r"_[0-9A-Za-z][0-9A-Za-z_\-]*")
+REDACTED = TOKEN_VERSION + "_<redacted>"
+
+
+def scrub(text):
+    """Every token-shaped run in `text`, replaced. Idempotent."""
+    return _TOKENISH.sub(REDACTED, text)
+
 
 def audit(**fields):
     """One JSON object per line, appended, 0600, never rotated.
@@ -531,7 +562,7 @@ def audit(**fields):
     A failure to write is swallowed. An audit log that can take the server down
     is a denial of service wearing a security hat.
     """
-    line = json.dumps(fields, sort_keys=True) + "\n"
+    line = scrub(json.dumps(fields, sort_keys=True)) + "\n"
     try:
         with _audit_lock:
             fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)

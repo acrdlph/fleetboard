@@ -232,6 +232,12 @@ python3 -m orchestra [--root DIR]... [--pattern REGEX] [--home DIR]...
 | `--pattern REGEX` | all | only watch child dirs matching this (case-insensitive) |
 | `--home DIR` | auto | Claude home dirs; default finds `~/.claude*` |
 | `--port N` | 4242 | also `ORCHESTRA_PORT` env |
+| `--host ADDR` | 127.0.0.1 | bind address. Anything but loopback needs a registered device; `0.0.0.0` is refused outright |
+| `--tailnet` | — | detect the Tailscale address and bind it — the flag to reach the board from a phone |
+| `--bind-every-interface` | — | what `--host 0.0.0.0` was refused for, said deliberately. Still needs a registered device; a config file cannot set it |
+| `--add-device LABEL` | — | mint a device token, printed **once** — then exit |
+| `--list-devices` | — | every registered device, with `last_seen` — then exit |
+| `--revoke-device ID` | — | kill a token immediately, no restart needed — then exit |
 | `--window-h H` | 48 | ignore transcripts idle longer than this many hours |
 | `--idle-s S` | 30.0 | seconds between **safety-net** sweeps; changes arrive as events (see below) |
 | `--demo` | — | fictional data (screenshots, kicking the tires) |
@@ -418,14 +424,25 @@ headroom + reserve buffers, the reserve-persist round-trip, dispatch-log
 parsing, and an HTTP smoke test that boots the real server in `--demo` mode
 and hits every endpoint.
 
-**Auth tests** (`tests/test_auth.py`) come in three shapes because the claims
-do: the decision (`auth.check` with an explicit peer, header and clock — every
-refusal in the design is one row), the wire (a real server on a real port whose
-handler believes its peer is on the tailnet, which is what proves the check is
-in the request path rather than merely in a function), and the routes — read
-back out of `server.py`'s own AST and each required to be exempt-by-list or to
-refuse a stranger, so a route added later cannot start out unguarded and a
-hard-coded list cannot rot.
+**Auth tests** (`tests/test_auth.py`, `tests/test_pairing.py`) come in three
+shapes because the claims do: the decision (`auth.check` with an explicit peer,
+header and clock — every refusal in the design is one row), the wire (a real
+server on a real port whose handler believes its peer is on the tailnet, which
+is what proves the check is in the request path rather than merely in a
+function), and the routes — read back out of `server.py`'s own AST *and* out of
+the guard's own admin list, each required to be exempt-by-list or to refuse a
+stranger, so a route added later cannot start out unguarded and a hard-coded
+list cannot rot.
+
+The route tests also ask, **holding a valid token**, that no `/api/v1` route can
+be reached by gluing a character onto it. That one is not theoretical: the
+router matched the device subtree with `startswith("/api/v1/devices")` while the
+guard stopped at a segment boundary, so `GET /api/v1/devicesX` was refused at the
+exact path and served the whole device inventory one character to the right of
+it — and `POST /api/v1/devicesX/<id>/revoke` let any token holder revoke any
+device. Both halves had a test and neither could see the gap, because neither
+asked the other one anything. The router and the guard now call the same
+function.
 
 **Integration tests** (`tests/test_integration.py`) exercise the *real*
 pipeline against controlled fixtures — no dependency on your live fleet:
@@ -448,9 +465,10 @@ dispatch (kickoff → READY → instruction → DONE).
 ## Security & spending
 
 - **The board serves your prompts and your agents' replies.** It binds to
-  127.0.0.1. Loopback is trusted — a process that can open that socket is
-  already running as you and can read `~/.claude*` without asking this server
-  — so the browser needs no token. **Everything else must present one:**
+  127.0.0.1 by default. Loopback is trusted — a process that can open that
+  socket is already running as you and can read `~/.claude*` without asking
+  this server — so the browser needs no token. **Everything else must present
+  one:**
 
   ```bash
   python3 -m orchestra --add-device "iPhone"   # prints the token ONCE
@@ -458,11 +476,35 @@ dispatch (kickoff → READY → instruction → DONE).
   python3 -m orchestra --revoke-device 9f3ab21c
   ```
 
-  The token goes in `Authorization: Bearer orc1_…`. Only `GET /api/health` is
-  exempt. Devices live in `devices.json` as sha256 hashes, so a copy of that
-  file is not a way in, and every mutation and every refusal is appended to
-  `audit.log.jsonl`. Binding anything but loopback **refuses to start** until a
-  device exists — it used to warn and bind anyway.
+  The token goes in `Authorization: Bearer orc1_…` — never a query parameter,
+  never a cookie; both are refused. Exactly two routes need no token:
+  `GET /api/health`, which carries nothing that varies with your fleet, and
+  `POST /api/v1/pair`. Devices live in `devices.json` as sha256 hashes compared
+  with `hmac.compare_digest`, so a copy of that file is not a way in, and every
+  mutation and every refusal is appended to `audit.log.jsonl` — who, what, when,
+  never what was said, and never anything token-shaped, whichever field it
+  arrived in.
+
+- **To reach it from a phone, `--tailnet`.** The Tailscale address is detected
+  and then actually bound on port 0 to prove it, rather than pasted from a
+  stale document; if Tailscale is down you get one of three sentences saying
+  which failure it is, not `EADDRNOTAVAIL`. `--host 0.0.0.0` is refused and
+  names `--tailnet` in the refusal — the escape hatch is
+  `--bind-every-interface`, which cannot be typed by accident and which a
+  config file cannot set. **Nothing beyond loopback binds at all until a device
+  is registered**, including the wide one; it used to warn and bind anyway.
+  A tailnet bind also raises a second listener on 127.0.0.1, because device
+  management answers to this machine holding *no* token — and a request the Mac
+  sends to its own tailnet address does not arrive from loopback.
+
+- **Pairing a phone is a QR, and the QR is not the token.** `/pair` on the board
+  mints an 8-character Crockford code, valid 120 seconds, single use, which the
+  phone exchanges at `POST /api/v1/pair` for a fresh secret that was never on
+  screen — so a photograph of the code, or a screenshot in a bug report, is
+  worthless by the time it leaves the room. Device management (`/api/v1/devices`)
+  answers only to the Mac holding no token: **no token grants it, not even a
+  valid one**, because a device that could revoke devices could revoke the one
+  that would have revoked it.
 - **A website you visit cannot drive your fleet.** Mutations must be sent as
   `Content-Type: application/json` and a cross-site `Origin` is refused, which
   is what stops another page borrowing your browser's loopback trust to type

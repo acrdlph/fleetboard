@@ -262,7 +262,7 @@ class Handler(BaseHTTPRequestHandler):
             # Content-Length — the one header a stream must never send, and the
             # tail that makes all nine of the others work.
             return self._sse()
-        if self.path.startswith("/api/v1/devices"):
+        if auth.admin("GET", self.path):
             # The versioned surface starts here (ADR 0009). Everything else in
             # this handler is the legacy unversioned board API and stays where
             # it is; the routes born with pairing are born on `/api/v1`, which
@@ -273,6 +273,21 @@ class Handler(BaseHTTPRequestHandler):
             # the caller is the Mac itself. It reads a list of every credential
             # to this machine, which is why `auth.audited` logs it even though
             # it is a GET.
+            #
+            # THE CONDITION IS `auth.admin` AND NOT A `startswith`, and that is
+            # the whole of a real hole. It used to read
+            # `self.path.startswith("/api/v1/devices")`, which is one character
+            # less strict than the guard: `_under_admin` stops at a SEGMENT
+            # boundary, so `/api/v1/devicesX` was not admin to `auth.check` and
+            # WAS the device list to this line. A phone with a perfectly valid
+            # token read the inventory of every credential to this machine, and
+            # `auth.audited` — asking the same segment-aware question — did not
+            # log it. Each half had a test and neither could see the gap.
+            #
+            # So the router and the guard now consult the SAME function. They
+            # cannot drift, because there is only one answer to drift from.
+            # API.md §2.3 step 5 said this all along: `/api/v1` resolves by
+            # exact match on the path without its query, no prefix routing.
             return self._json(200, {"ok": True, "devices": auth.devices(),
                                     "pairing": pairing.state()})
         if self.path.startswith("/api/health"):
@@ -571,10 +586,20 @@ class Handler(BaseHTTPRequestHandler):
         # down" (429) before it has parsed anything. A 200 carrying a failure
         # is a contract that only works when the reader is a browser you also
         # wrote.
-        if self.path.startswith("/api/v1/pair"):
+        # `/api/v1` resolves by EXACT match on the path without its query
+        # (API.md §2.3 step 5, "there is no prefix routing"), and after
+        # `/api/v1/devicesX` that is a rule rather than a preference. `startswith`
+        # here made the router looser than the guard on GET; on POST it happened
+        # to fail safe — `/api/v1/pairX` is not in `auth.EXEMPT`, so it demanded
+        # a token it would then have handed to `pairing.claim` — but "safe by
+        # luck this time" is what the GET was too. One shape, no luck.
+        route = self.path.split("?", 1)[0]
+        if route == "/api/v1/pair":
             # The bootstrap. `auth.EXEMPT` lets it through with no token —
             # every other guard in `pairing.claim` still applies, starting with
             # the peer range and ending with a constant-time code comparison.
+            # `auth.EXEMPT` matches this path exactly, and now so does this
+            # line: the exempt list and the router say the same word.
             result, error = pairing.claim(
                 self.client_address[0] if self.client_address else "", payload)
             if error:
@@ -582,19 +607,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(status, {"ok": False, "error": code,
                                            "message": message})
             return self._json(200, {"ok": True, **result})
-        if self.path.startswith("/api/v1/devices/pair/open"):
+        if route == "/api/v1/devices/pair/open":
             w = pairing.open_window(host=self._advertised_host())
             return self._json(200, {"ok": True, **w})
-        if self.path.startswith("/api/v1/devices/pair/close"):
+        if route == "/api/v1/devices/pair/close":
             pairing.close()
             return self._json(200, {"ok": True, "pairing": pairing.state()})
-        if self.path.startswith("/api/v1/devices/"):
+        if auth.admin("POST", route):
             # `/api/v1/devices/<id>/revoke`. Parsed rather than matched so the
             # path shape is API.md §2.5's, which is what the Swift client and
-            # the docs both say — and `auth.ADMIN` covers the whole subtree by
-            # prefix, so an id this parse does not recognise is still refused
-            # for everyone but the Mac.
-            parts = self.path.split("?", 1)[0].strip("/").split("/")
+            # the docs both say — and `auth.admin` is the guard's own predicate,
+            # so an id this parse does not recognise is refused for everyone but
+            # the Mac by the same rule that let the Mac in.
+            parts = route.strip("/").split("/")
             if len(parts) == 5 and parts[4] == "revoke":
                 device = auth.revoke_device(parts[3])
                 if device is None:
