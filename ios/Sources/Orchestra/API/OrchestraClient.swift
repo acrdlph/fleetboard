@@ -146,6 +146,43 @@ public actor OrchestraClient {
                        to: profile, as: ResumeReply.self)
     }
 
+    // MARK: - Push
+
+    /// Register (or re-register) this device's APNs token. A refusal here is a
+    /// value like every other mutation's — a 422 `push_token_invalid` throws
+    /// `.http`, which the store reports rather than retrying.
+    public func registerPush(token: String, environment: String, tzOffsetMin: Int,
+                             appVersion: String?,
+                             settings: [String: Any]?) async throws -> RegisterPushReply {
+        try await send(Endpoint.registerPush(token: token, environment: environment,
+                                             tzOffsetMin: tzOffsetMin,
+                                             appVersion: appVersion, settings: settings),
+                       to: profile, as: RegisterPushReply.self)
+    }
+
+    public func pushStatus() async throws -> PushStatus {
+        try await send(.pushStatus, to: profile, as: PushStatus.self)
+    }
+
+    public func savePushSettings(body: [String: Any]) async throws -> ActionReply {
+        try await send(Endpoint.pushSettings(body: body), to: profile, as: ActionReply.self)
+    }
+
+    public func mutePush(minutes: Double) async throws -> ActionReply {
+        try await send(Endpoint.pushMute(minutes: minutes), to: profile, as: ActionReply.self)
+    }
+
+    public func testPush() async throws -> ActionReply {
+        try await send(.pushTest, to: profile, as: ActionReply.self)
+    }
+
+    /// Answer an agent from a notification. Addressed by `sid` alone — the reply
+    /// path has no account and does not need one.
+    public func reply(sid: String, worktree: String?, text: String) async throws -> SendReply {
+        try await send(Endpoint.reply(sid: sid, worktree: worktree, text: text),
+                       to: profile, as: SendReply.self)
+    }
+
     // MARK: - The one place a request is made
 
     private func send<T: Decodable & Sendable>(_ endpoint: Endpoint,

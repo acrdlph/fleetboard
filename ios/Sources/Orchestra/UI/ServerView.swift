@@ -1,5 +1,11 @@
 import SwiftUI
 
+/// Where the Server tab can navigate. One destination today — the notification
+/// preferences — as a value so a `#if DEBUG` seam can push it without a tap.
+enum ServerRoute: Hashable, Sendable {
+    case notifications
+}
+
 /// "Am I connected, and to what?"
 ///
 /// On the desktop you can see the server's log and the terminals; on a phone
@@ -8,25 +14,37 @@ import SwiftUI
 /// otherwise have to ask for in a bug report.
 public struct ServerView: View {
     @Bindable private var fleet: FleetStore
+    @Bindable private var push: PushStore
     private let profile: ServerProfile?
     private let onUnpair: () -> Void
+    /// Push the notifications screen on appear. The same `#if DEBUG` seam as the
+    /// Fleet tab's `initialRoute`: a simulator cannot tap the row, and a screen
+    /// that is only ever reached by a finger is a screen the phase gate cannot
+    /// look at.
+    private let initialShowSettings: Bool
 
+    @State private var path: [ServerRoute] = []
     @State private var now = Date()
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    public init(fleet: FleetStore, profile: ServerProfile?, onUnpair: @escaping () -> Void) {
+    public init(fleet: FleetStore, profile: ServerProfile?, push: PushStore,
+                initialShowSettings: Bool = false,
+                onUnpair: @escaping () -> Void) {
         self.fleet = fleet
+        self.push = push
         self.profile = profile
+        self.initialShowSettings = initialShowSettings
         self.onUnpair = onUnpair
     }
 
     public var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack {
                 Palette.canvas.ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: Space.lg) {
                         machine
+                        notifications
                         stream
                         freshness
                         Button("Unpair this device", role: .destructive, action: onUnpair)
@@ -44,8 +62,92 @@ public struct ServerView: View {
             }
             .navigationTitle("server")
             .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: ServerRoute.self) { route in
+                switch route {
+                case .notifications: NotificationSettingsView(push: push)
+                }
+            }
         }
         .onReceive(ticker) { now = $0 }
+        .task {
+            if initialShowSettings, path.isEmpty { path = [.notifications] }
+        }
+    }
+
+    /// A summary of the push pipeline, and the door to the preferences. Every
+    /// line is diagnostic: whether the OS let us notify, whether this device has
+    /// a token on file, and what the server's last send returned — the three
+    /// facts that turn "push just doesn't work" into a specific missing piece.
+    private var notifications: some View {
+        VStack(alignment: .leading, spacing: Space.xs) {
+            SectionLabel("NOTIFICATIONS")
+            VStack(spacing: Space.xs) {
+                Row("permission", authLabel, hue: authHue)
+                Row("this device", registrationLabel, hue: registrationHue)
+                if let status = push.status {
+                    Row("pipeline", status.ready ? "ready"
+                        : (status.problems.first ?? status.backend),
+                        hue: status.ready ? Palette.statusWorking : Palette.statusLimit)
+                    if let last = status.last, !last.isEmpty {
+                        Row("last send", last)
+                    }
+                }
+                NavigationLink(value: ServerRoute.notifications) {
+                    HStack(spacing: Space.sm) {
+                        Text("Preferences & quiet hours")
+                            .font(OrcFont.meta)
+                            .foregroundStyle(Palette.textSecondary)
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right")
+                            .font(OrcFont.meta)
+                            .foregroundStyle(Palette.textTertiary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
+                .stroke(Palette.hairline, lineWidth: 1))
+        }
+    }
+
+    private var authLabel: String {
+        switch push.authorizationGranted {
+        case .some(true): "granted"
+        case .some(false): "denied — enable in iOS Settings"
+        case .none: push.authorizationAsked ? "—" : "not asked yet"
+        }
+    }
+
+    private var authHue: Color? {
+        switch push.authorizationGranted {
+        case .some(true): Palette.statusWorking
+        case .some(false): Palette.statusNeeds
+        case .none: nil
+        }
+    }
+
+    private var registrationLabel: String {
+        switch push.registration {
+        case .idle: "not registered"
+        case .registering: "registering…"
+        case .registered(let env, let warnings):
+            warnings.isEmpty ? "registered (\(env))" : "registered (\(env)) — \(warnings.count) warning(s)"
+        case .failed(let why): why
+        }
+    }
+
+    private var registrationHue: Color? {
+        switch push.registration {
+        case .registered(_, let w): w.isEmpty ? Palette.statusWorking : Palette.statusLimit
+        case .failed: Palette.statusNeeds
+        default: nil
+        }
     }
 
     private var machine: some View {

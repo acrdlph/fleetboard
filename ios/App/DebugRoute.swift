@@ -29,6 +29,9 @@ enum DebugRoute: Equatable {
     case fleet
     case limits
     case server
+    /// The notification preferences, pushed on the Server stack. `ORC_SCREEN=
+    /// notifications` — the only way a script reaches a screen behind a tap.
+    case notifications
     /// The branch map, pushed on the Fleet stack. `ORC_SCREEN=map` — the only way
     /// `xcrun simctl` reaches a pushed destination that has no camera and no tap.
     case map
@@ -61,6 +64,7 @@ enum DebugRoute: Equatable {
             guard parts.count == 2, !parts[1].isEmpty else { return .limits }
             return .account(parts[1])
         case "server": return .server
+        case "notifications", "push": return .notifications
         case "map": return .map
         case "mission": return .mission
         case "finish":
@@ -92,9 +96,12 @@ enum DebugRoute: Equatable {
         switch self {
         case .fleet, .map, .worktree, .chat, .mission, .finish, .resume: 0
         case .limits, .account: 1
-        case .server: 2
+        case .server, .notifications: 2
         }
     }
+
+    /// Whether the Server tab should push its notifications screen on appear.
+    var showsNotificationSettings: Bool { self == .notifications }
 
     /// What the Limits tab should push, if anything.
     var accountSlug: String? {
@@ -119,7 +126,7 @@ enum DebugRoute: Equatable {
         case .chat(let w, let a, let s): .chat(worktree: w, account: a, sid: s)
         case .finish(let name): .worktree(name)
         case .resume(let w, _): .worktree(w)
-        case .fleet, .limits, .server, .account, .mission: nil
+        case .fleet, .limits, .server, .notifications, .account, .mission: nil
         }
     }
 }

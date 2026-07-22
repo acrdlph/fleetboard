@@ -35,6 +35,17 @@
 	</array>
 
 	<!--
+	  `remote-notification` so a `content-available: 1` push (every one
+	  `notify.compose` sends sets it) can wake the app to refresh its cached
+	  board while backgrounded. It is the only background mode this app claims;
+	  it does not run code on a timer and does not need `fetch`.
+	-->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
+
+	<!--
 	  App Transport Security — ADR 0013.
 
 	  The server speaks PLAIN HTTP over the tailnet, deliberately: WireGuard

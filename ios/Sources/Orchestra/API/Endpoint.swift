@@ -206,6 +206,81 @@ public struct Endpoint: Sendable {
                         timeout: 15, requiresToken: true)
     }
 
+    // MARK: - Push
+
+    /// `POST /api/v1/devices/self/push` — register (or re-register) this device's
+    /// APNs token.
+    ///
+    /// **`read`-scoped, not admin**, deliberately: a phone registers its OWN
+    /// token, which rotates on every reinstall and iCloud restore, and gating
+    /// that behind the Mac-only admin scope would make push structurally
+    /// impossible on a phone. The device is identified by the token it presents
+    /// (`Handler.device`), never by a path parameter, so this can only ever write
+    /// the caller's own endpoint.
+    ///
+    /// `tzOffsetMin` rides here rather than on the settings route because quiet
+    /// hours are evaluated in the device's zone and iOS gives no background
+    /// callback for a timezone change — so it is re-sent on every registration,
+    /// which is every foreground that finds the token changed or unconfirmed.
+    public static func registerPush(token: String, environment: String,
+                                    tzOffsetMin: Int, appVersion: String?,
+                                    settings: [String: Any]?) throws -> Endpoint {
+        var payload: [String: Any] = ["backend": "apns", "token": token,
+                                      "environment": environment,
+                                      "tz_offset_min": tzOffsetMin]
+        if let appVersion { payload["app_version"] = appVersion }
+        if let settings { payload["settings"] = settings }
+        return Endpoint(method: .post, path: "/api/v1/devices/self/push",
+                        body: try JSONSerialization.data(withJSONObject: payload),
+                        timeout: probeDeadline, requiresToken: true)
+    }
+
+    /// `GET /api/v1/push/status` — is push configured, what did the last send
+    /// return, is THIS device registered. The one read the settings screen makes.
+    public static let pushStatus = Endpoint(method: .get, path: "/api/v1/push/status",
+                                            timeout: probeDeadline, requiresToken: true)
+
+    /// `POST /api/v1/devices/self/settings` — the per-type rules, quiet hours,
+    /// privacy and nudge. Only these four keys are accepted; `set_push`'s
+    /// allow-list drops anything else.
+    public static func pushSettings(body: [String: Any]) throws -> Endpoint {
+        Endpoint(method: .post, path: "/api/v1/devices/self/settings",
+                 body: try JSONSerialization.data(withJSONObject: body),
+                 timeout: probeDeadline, requiresToken: true)
+    }
+
+    /// `POST /api/v1/push/mute` — a hard snooze, `minutes` from now, capped
+    /// server-side at a week.
+    public static func pushMute(minutes: Double) throws -> Endpoint {
+        Endpoint(method: .post, path: "/api/v1/push/mute",
+                 body: try JSONSerialization.data(withJSONObject: ["minutes": minutes]),
+                 timeout: probeDeadline, requiresToken: true)
+    }
+
+    /// `POST /api/v1/push/test` — the real thing end to end: composes a
+    /// notification, signs a real JWT, does the real HTTP/2 POST. Without a
+    /// `.p8` it cannot complete the 200, and it says precisely which piece is
+    /// missing — which is the whole point of a test button.
+    public static let pushTest = Endpoint(method: .post, path: "/api/v1/push/test",
+                                          body: Data("{}".utf8), timeout: 15,
+                                          requiresToken: true)
+
+    /// `POST /api/send`, addressed by `sid` ALONE — the inline-reply path.
+    ///
+    /// A notification carries no account (`notify.compose` never puts one on the
+    /// wire) and does not need to: `identity.resolve` resolves a bare sid to the
+    /// live process, and an account would only ever be a corroborator it does not
+    /// have. `worktree` rides along when the payload had one, as a second
+    /// assertion the server checks for free. This is the same route the chat
+    /// composer uses; it simply omits the field it cannot know.
+    public static func reply(sid: String, worktree: String?, text: String) throws -> Endpoint {
+        var payload: [String: Any] = ["sid": sid, "text": text]
+        if let worktree, !worktree.isEmpty { payload["worktree"] = worktree }
+        return Endpoint(method: .post, path: "/api/send",
+                        body: try JSONSerialization.data(withJSONObject: payload),
+                        timeout: 25, requiresToken: true)
+    }
+
     func urlRequest(base: URL, token: String?) throws -> URLRequest {
         guard var comps = URLComponents(url: base.appendingPathComponent(path),
                                         resolvingAgainstBaseURL: false) else {

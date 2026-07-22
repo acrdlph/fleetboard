@@ -6,6 +6,9 @@ import UIKit
 @main
 struct OrchestraApp: App {
     @State private var model = AppModel()
+    // Catches the two remote-registration callbacks the SwiftUI `App` lifecycle
+    // does not surface — the device token and the failure. See `PushController`.
+    @UIApplicationDelegateAdaptor(OrchestraAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -18,7 +21,13 @@ struct OrchestraApp: App {
                 // does not reach them.
                 .preferredColorScheme(.dark)
                 .accessibilityIgnoresInvertColors(true)
-                .task { await model.start() }
+                .task {
+                    // Wire the delegate to the model's controller before start:
+                    // a token buffered by the delegate replays the instant this
+                    // runs, and start() may itself register for one.
+                    appDelegate.controller = model.pushController
+                    await model.start()
+                }
                 .onChange(of: scenePhase) { _, phase in
                     Task { await model.scenePhaseChanged(to: phase) }
                 }
@@ -41,6 +50,19 @@ final class AppModel {
     /// Everything the app can make the fleet DO. App-level and not per-screen,
     /// because a dispatch outlives the sheet that started it — see `ActionsStore`.
     let actions: ActionsStore
+    /// Push: registration, the server-held preferences, the pipeline's health.
+    let push: PushStore
+    /// The one-way channel from a notification tap to the navigation stack.
+    let router: PushRouter
+    /// The adapter over `UNUserNotificationCenter` — authorization, the reply
+    /// category, the delegate. Held here so the app delegate can hand it the
+    /// device token and so `scenePhaseChanged` can re-assert registration.
+    let pushController: PushController
+
+    /// Requested once. Authorization prompts the user, and pairing can happen
+    /// after launch, so the push flow is armed both from `start()` and from the
+    /// paired view's appearance — and this makes the second call a no-op.
+    private var pushStarted = false
 
     init() {
         let client = OrchestraClient()
@@ -51,6 +73,11 @@ final class AppModel {
         self.limits = LimitsStore(client: client)
         self.topology = TopologyStore(client: client)
         self.actions = ActionsStore(client: client, fleet: fleet)
+        let push = PushStore(client: client)
+        self.push = push
+        let router = PushRouter()
+        self.router = router
+        self.pushController = PushController(store: push, router: router)
     }
 
     func start() async {
@@ -58,7 +85,27 @@ final class AppModel {
         #if DEBUG
         await pairFromLaunchEnvironment()
         #endif
-        if pairing.isPaired { fleet.start() }
+        if pairing.isPaired {
+            fleet.start()
+            ensurePushStarted()
+        }
+        #if DEBUG
+        await runPushDebugSeams()
+        #endif
+    }
+
+    /// Arm push exactly once: become the notification delegate, register the
+    /// reply category, ask for authorization, register for a remote token, and
+    /// read the pipeline's current health. Called from `start()` and, because
+    /// pairing can happen after launch, from the paired view too.
+    func ensurePushStarted() {
+        guard pairing.isPaired, !pushStarted else { return }
+        pushStarted = true
+        pushController.start()
+        Task {
+            await pushController.requestAuthorization()
+            await push.refreshStatus()
+        }
     }
 
     /// **Backgrounding drops the stream; foregrounding resyncs.** A phone is not
@@ -80,10 +127,47 @@ final class AppModel {
             // socket, and the resync costs one delta because the version we
             // still hold goes back as `Last-Event-ID`.
             await fleet.resume()
+            // Re-assert the token: the tz offset may have moved while backgrounded
+            // (a flight, a DST edge) and quiet hours are evaluated in the device's
+            // zone. Cheap — the store skips the POST when the token is unchanged
+            // and only the offset rides.
+            ensurePushStarted()
+            pushController.refreshRegistration()
         default:
             break
         }
     }
+
+    #if DEBUG
+    /// The push test seams, and they exist for the same reason `ORC_SEND` does:
+    /// a simulator cannot be typed into from a script, so the one flow that
+    /// proves this feature — a real token reaching the server, a tap deep-linking
+    /// to the right session, an inline reply reaching an agent — would be
+    /// verifiable only by hand, and a check only ever done by hand stops being
+    /// done. Each seam presses exactly the button the OS presses, through the
+    /// same `PushStore` and `PushController` the delegate uses.
+    ///
+    /// ```
+    /// SIMCTL_CHILD_ORC_PUSH_TOKEN=<64+ hex>            # drive registration
+    /// SIMCTL_CHILD_ORC_PUSH='{"ev":"session.needs_answer","wt":"X","sid":"…"}'
+    /// SIMCTL_CHILD_ORC_PUSH_ACTION=reply               # default | reply
+    /// SIMCTL_CHILD_ORC_PUSH_REPLY='yes, ship it'       # the typed answer
+    /// ```
+    private func runPushDebugSeams() async {
+        let env = ProcessInfo.processInfo.environment
+        if let hex = env["ORC_PUSH_TOKEN"], !hex.isEmpty {
+            await push.register(tokenHex: hex, environment: pushController.environment, force: true)
+        }
+        guard let raw = env["ORC_PUSH"], !raw.isEmpty,
+              let data = raw.data(using: .utf8),
+              let userInfo = (try? JSONSerialization.jsonObject(with: data)) as? [AnyHashable: Any],
+              let message = PushMessage(userInfo: userInfo) else { return }
+        let action = env["ORC_PUSH_ACTION"] == "reply"
+            ? PushCategory.replyAction : "default"
+        await pushController.handle(message: message, actionIdentifier: action,
+                                    replyText: env["ORC_PUSH_REPLY"])
+    }
+    #endif
 
     #if DEBUG
     /// A test seam, and it is here for a specific reason.

@@ -23,6 +23,14 @@ struct RootView: View {
         #endif
     }
 
+    private var initialShowSettings: Bool {
+        #if DEBUG
+        return DebugRoute.fromEnvironment()?.showsNotificationSettings ?? false
+        #else
+        return false
+        #endif
+    }
+
     /// `ORC_SCREEN=mission` opens the composer on launch — the only way a script
     /// on a simulator can reach a sheet, and therefore the only way phase 3's
     /// most dangerous screen can be looked at without a finger.
@@ -99,6 +107,7 @@ struct RootView: View {
                           actions: model.actions,
                           limits: model.limits,
                           topology: model.topology,
+                          router: model.router,
                           client: model.client,
                           serverLabel: model.pairing.profile?.display ?? "—",
                           initialRoute: initialFleetRoute,
@@ -114,7 +123,9 @@ struct RootView: View {
                     .connectionBar(model.fleet)
             }
             Tab("Server", systemImage: "bolt.horizontal", value: 2) {
-                ServerView(fleet: model.fleet, profile: model.pairing.profile) {
+                ServerView(fleet: model.fleet, profile: model.pairing.profile,
+                           push: model.push,
+                           initialShowSettings: initialShowSettings) {
                     Task { await model.unpair() }
                 }
                 .connectionBar(model.fleet)
@@ -126,9 +137,17 @@ struct RootView: View {
         // the moment the stream should open.
         .task {
             model.fleet.start()
+            model.ensurePushStarted()
             #if DEBUG
             if let route = DebugRoute.fromEnvironment() { tab = route.tab }
             #endif
+        }
+        // A notification tap deposits a deep link and bumps the router's
+        // generation. Selecting the Fleet tab here — and resolving the exact
+        // session in `FleetView` — is what makes a tap land on the agent it is
+        // about rather than on whatever tab was last open.
+        .onChange(of: model.router.generation) { _, _ in
+            if model.router.pendingDeepLink != nil { tab = 0 }
         }
     }
 }

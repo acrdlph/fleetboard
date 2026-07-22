@@ -1,4 +1,4 @@
-# orchestra for iOS — phases 1–3
+# orchestra for iOS — phases 1–4
 
 A native SwiftUI client for the orchestra board.
 
@@ -17,8 +17,18 @@ A native SwiftUI client for the orchestra board.
   simulator reached a real agent on the Mac, the agent replied, and the app's
   transcript carried `✓✓ sent from this phone` on that exact turn.
 
-Push is a later phase. Nothing here is load-bearing on it: it lands as a
-registration call and a delegate.
+* **Phase 4** turned push on: the app asks for authorization, registers its APNs
+  token against the paired device (and re-registers when it rotates or the
+  timezone moves), renders a preferences screen that writes the server's own
+  preference store, deep-links a tap to the exact session it is about, and — the
+  one that matters — answers an agent from the banner's inline reply, addressed by
+  `sid` alone. Proven on 2026-07-23 against a real server and a booted simulator:
+  registration reached the server (a token on file, `sandbox`, tz and app
+  version); a `session.needs_answer` payload deep-linked to that session's
+  conversation; and an inline reply reached `/api/send` and typed into the live
+  agent (`{"ok": true, "message": "typed into Terminal (ttys010)"}`). See
+  "Phase 4 — push" below for what only an APNs key, and only a physical device,
+  can add.
 
 ## Build and run it — the only way this is verified
 
@@ -531,3 +541,119 @@ in the UI is now `Text(verbatim:)`.
   a page on. Bundling Plex changes no call site.
 - **A device build.** Simulator only. A real device needs a team in a gitignored
   `Signing.xcconfig`; that is the one thing here that needs the paid account.
+
+## Phase 4 — push
+
+Registration, per-event preferences, deep links, and inline reply from the
+banner. The server pipeline (`push.py`, `notify.py`) shipped in phase 2; this is
+the phone half.
+
+### What it does
+
+* **Registration.** On first pair the app asks for authorization
+  (`.alert/.sound/.badge`), registers for a remote token, and POSTs it to
+  `/api/v1/devices/self/push` with the environment (read from the embedded
+  provisioning profile's `aps-environment`, `sandbox` on a simulator), the
+  device's tz offset, and the app version. It re-registers on foreground —
+  cheap, and it is how a rotated token and a moved timezone reach the server,
+  since iOS gives no background callback for either. `PushStore` is pure (no
+  UIKit); `PushController` is the `UNUserNotificationCenter` adapter.
+* **Inline reply — the point of the feature.** The `ORC_REPLY` category carries a
+  `UNTextInputNotificationAction`; answering it calls `/api/send` addressed by
+  **`sid` alone**. The payload never carried an account and does not need one:
+  `identity.resolve` resolves a bare sid to the live process. Not `.foreground` —
+  the whole value is answering without opening the app.
+* **Deep links.** A tap deposits a `PushDeepLink` in `PushRouter`; `RootView`
+  selects the Fleet tab and `FleetView` resolves the account (absent from the
+  payload) from the live board by sid and pushes the exact conversation. The
+  link is HELD while the board loads, so a cold-launch tap still lands on the
+  chat rather than settling for the board.
+* **Preferences.** `NotificationSettingsView` (reached from the Server tab) edits
+  per-event rules, quiet hours, privacy and the nudge interval, and writes
+  `/api/v1/devices/self/settings`. Defaults mirror `EVENT_TYPES[…]["default"]`
+  exactly — your-turn, auto-resume-armed and worktree-freed are OFF, pinned by a
+  test.
+
+### Drive it without a finger — the `#if DEBUG` seams
+
+A simulator cannot tap a permission dialog, a notification banner, or a reply
+field, so — exactly like `ORC_SEND`/`ORC_SCREEN` — each path has a seam that
+presses the same button the OS presses, through the same `PushStore` /
+`PushController` the delegate uses.
+
+```sh
+# 1. registration reaches the server (synthetic token, real POST)
+SIMCTL_CHILD_ORC_PUSH_TOKEN=$(python3 -c "print('facefeed'*8)") \
+  xcrun simctl launch booted sh.orchestra.app
+#   → devices.json gains push.{token,environment:sandbox,tz_offset_min,app_version}
+
+# 2. a tap deep-links to the exact session
+SIMCTL_CHILD_ORC_PUSH='{"ev":"session.needs_answer","wt":"ConfidAI2",
+  "sid":"<sid>","level":"P1","aps":{"alert":{"title":"…","subtitle":"…"}}}' \
+  xcrun simctl launch booted sh.orchestra.app
+#   → lands on that session's ChatView
+
+# 3. an inline reply reaches the agent, by sid alone
+SIMCTL_CHILD_ORC_PUSH='{…same…}' \
+SIMCTL_CHILD_ORC_PUSH_ACTION=reply \
+SIMCTL_CHILD_ORC_PUSH_REPLY='yes, ship it' \
+  xcrun simctl launch booted sh.orchestra.app
+#   → POST /api/send {sid,text}; server types into the live terminal
+
+# the preferences screen, and provisional auth so a launch does not stall on the prompt
+SIMCTL_CHILD_ORC_PUSH_PROVISIONAL=1 SIMCTL_CHILD_ORC_SCREEN=notifications \
+  xcrun simctl launch booted sh.orchestra.app
+```
+
+### Where the documents and the server disagree — reported, per METHOD §4
+
+Modelled from a live `notify.compose` and driven against `100.113.110.31:4269`
+on 2026-07-23.
+
+| # | claim | what the server does |
+|---|---|---|
+| P1 | the payload carries a `category`, or `API.md` §9.23's `expect_sid`/`intent_id`/`phase` | `notify.compose` emits **none of them**. The `aps` has `alert`, `interruption-level`, `thread-id`, `mutable-content:1`, `content-available:1`, `sound`; the body has `ev`, `event_id`, `dedupe_key`, `at`, `wt`, `sid`, `level`, `counts`. **No `category`** — and iOS decides the inline-reply field from `aps.category` at delivery. So the app DERIVES it (`PushMessage.categoryID` → `ORC_REPLY` for `needs_answer`/`blocked`, else `ORC_INFO`) and it must be STAMPED onto the notification before the banner shows: by the notification-service extension (`mutable-content:1` is set for exactly this) or by a one-line server addition (`aps["category"]`). Until one of those lands, a real push shows no reply button. The app half is complete and drives correctly for any payload carrying the category. |
+| P2 | the push payload carries an account for the reply | it carries `sid` and `wt`, **never an account**. Inline reply is `POST /api/send {sid, text}` (worktree as a free corroborator); `identity.resolve` resolves the bare sid. Driven live: `{"ok": true, "message": "typed into Terminal (ttys010)"}`. |
+| P3 | a device can read back its stored preferences | **no route returns them.** `GET /api/v1/push/status` answers the pipeline's health and a `registered` bool — nothing about rules or quiet hours. The settings screen opens on the app's **local mirror** of the last save and says so; every save POSTs the full set and adopts the server's echo. |
+| P4 | `/api/v1/devices/self/push` is device-self-service on every running server | a server that PREDATES the `SELF_SUBTREE` auth fix refuses it **403 `admin_local_only`** to any token (observed on a server started before the fix; a restart cleared it). The app maps 403 → a registration failure carrying the server's own sentence, so a stale server is diagnosable rather than a silent dead token. |
+| P5 | `/api/v1/push/test` answers `{ok, message}` | it answers `{ok, backend, status, apns_id, reason, environment, message, health}`. The app reads `message` — e.g. `"no answer · apns_key_path is not set — the .p8 auth key file…"`, a working transport naming the one missing credential. |
+| P6 | `/api/v1/push/status` names a missing key as `"no APNs key configured"` | the live sink is more specific: `"apns_key_path is not set — the .p8 auth key file downloaded from developer.apple.com"`. The app shows whatever `problems[]` says, verbatim. |
+
+### What only a device — or a key — can add, and what a simulator cannot show
+
+- **Apple's own delivery.** No `.p8` exists (only the account holder can make
+  one — `docs/mobile/APNS-SETUP.md`), so `/push/test` correctly stops at "no
+  key". Everything up to Apple accepting the token is proven.
+- **A real remote token.** The simulator's `registerForRemoteNotifications` does
+  not mint one here; registration was proven with a synthetic token through the
+  identical `PushStore.register` path, stored by the server. A device build needs
+  the `aps-environment` entitlement and the Push Notifications capability, which
+  ride the provisioning profile — the paid-account items, gated exactly like the
+  device-signing note above. They are deliberately NOT in the shared
+  `Orchestra.entitlements`, because an `aps-environment` entitlement breaks the
+  ad-hoc simulator signing this repo builds with.
+- **The banner presentation itself.** `xcrun simctl push` delivers the payload,
+  but iOS suppresses PRESENTATION until notification authorization is granted —
+  and on the iOS 26 simulator that cannot be scripted: the authorization prompt
+  appears even for `.provisional`, and the Simulator exposes no accessible window
+  to tap "Allow" (no `idb`/`cliclick`, System Events sees zero windows). This is
+  the same wall the `ORC_*` seams exist to climb, so the notification-handling
+  path — deep link and inline reply — is driven through the delegate's own code
+  by the seams above and verified against the real server, which proves
+  everything except the pixels of the banner. The authorization request itself is
+  screenshotted (the real system prompt fires on launch).
+
+### Not done, and honest about it
+
+- **The notification-service extension.** `IOS-APP.md` §1.2 lists
+  `OrchestraNotificationService`; it is the sanctioned home for stamping the
+  `ORC_REPLY` category onto a payload (finding P1) and for enriching a
+  `structural` body from `/api/v1/events/<id>` over the tailnet. It is a new
+  Xcode target — a hand-edited `.pbxproj`, the most fragile change in this
+  directory (`Package.swift`) — and it is additive, so it is left for its own
+  step rather than risked against a green build whose gate is "xcodebuild
+  succeeds". The app registers the category and handles the reply today; the
+  extension (or the one-line server `aps["category"]`) is what makes the reply
+  field appear on a production push.
+- **A settings read-back route, quiet-hours DST correctness beyond the offset,
+  and the widget / Live Activity surfaces of `IOS-APP.md` §1.2** — all additive.

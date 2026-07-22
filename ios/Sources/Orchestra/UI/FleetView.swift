@@ -14,6 +14,7 @@ public struct FleetView: View {
     @Bindable private var actions: ActionsStore
     @Bindable private var limits: LimitsStore
     @Bindable private var topology: TopologyStore
+    @Bindable private var router: PushRouter
     private let client: OrchestraClient
     private let serverLabel: String
     private let onUnpair: () -> Void
@@ -31,6 +32,9 @@ public struct FleetView: View {
     /// which is why the age slot has a fixed minimum width.
     @State private var now = Date()
     @State private var path: [FleetRoute] = []
+    /// A notification deep link waiting for the board to load enough to resolve
+    /// the session's account. Held rather than dropped — see `tryNavigate`.
+    @State private var pendingLink: PushDeepLink?
     @State private var collapsed: Set<BoardSection> = Set(
         BoardSection.allCases.filter(\.collapsedByDefault)
     )
@@ -41,7 +45,7 @@ public struct FleetView: View {
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     public init(store: FleetStore, actions: ActionsStore, limits: LimitsStore,
-                topology: TopologyStore,
+                topology: TopologyStore, router: PushRouter,
                 client: OrchestraClient, serverLabel: String,
                 initialRoute: FleetRoute? = nil, openComposer: Bool = false,
                 initialSheet: WorktreeSheet? = nil, initialSend: String? = nil,
@@ -50,6 +54,7 @@ public struct FleetView: View {
         self.actions = actions
         self.limits = limits
         self.topology = topology
+        self.router = router
         self.client = client
         self.serverLabel = serverLabel
         self.initialRoute = initialRoute
@@ -122,7 +127,63 @@ public struct FleetView: View {
         .task {
             if let initialRoute, path.isEmpty { path = [initialRoute] }
             if openComposer { composing = true }
+            // A tap that arrived before this tab was mounted is waiting in the
+            // router; take it now so a cold launch from a notification still
+            // lands on the session, not the board.
+            if let link = router.consume() { pendingLink = link }
+            tryNavigate()
         }
+        // A tap that arrives while the app is running. `generation` bumps even
+        // when two taps name the SAME session, which a plain `onChange(of: link)`
+        // would swallow.
+        .onChange(of: router.generation) { _, _ in
+            if let link = router.consume() { pendingLink = link }
+            tryNavigate()
+        }
+        // The board arriving is what completes a chat deep link: a tap on a cold
+        // launch reaches here before the first frame, so the account cannot be
+        // resolved yet. Retrying when the version moves is what makes the tap
+        // land on the CONVERSATION rather than settling for the worktree.
+        .onChange(of: store.version) { _, _ in tryNavigate() }
+    }
+
+    /// Resolve the pending notification deep link against the board, completing
+    /// the address the payload could not carry.
+    ///
+    /// The payload names a worktree and a session but **no account** — it never
+    /// had one — so the account the chat screen needs is looked up from the live
+    /// board by sid, HERE, where the board is in hand. While the board is still
+    /// loading the link is HELD (not discarded), and `onChange(of: store.version)`
+    /// retries — so a cold-launch tap lands on the conversation once the frame
+    /// arrives. Only once the board has loaded and the session is genuinely
+    /// absent does it settle for the worktree. An account-level event with no
+    /// worktree leaves the board up.
+    private func tryNavigate() {
+        guard let link = pendingLink else { return }
+        if link.isBoardOnly || (link.worktree ?? "").isEmpty {
+            path = []
+            pendingLink = nil
+            return
+        }
+        let name = link.worktree ?? ""
+        guard let sid = link.sid, !sid.isEmpty else {
+            path = [.worktree(name)]
+            pendingLink = nil
+            return
+        }
+        if let card = store.state?.worktrees.first(where: { $0.name == name }),
+           let session = card.sessions.first(where: { $0.sid == sid }) {
+            path = [.worktree(name), .chat(worktree: name, account: session.account, sid: sid)]
+            pendingLink = nil
+        } else if store.state != nil {
+            // The board is loaded and this session is not on it — land on the
+            // worktree, the best surviving context for what the notification was
+            // about, rather than waiting for a session that will not appear.
+            path = [.worktree(name)]
+            pendingLink = nil
+        }
+        // else: board not loaded yet — hold the link and let the version change
+        // retry.
     }
 
     @ViewBuilder
