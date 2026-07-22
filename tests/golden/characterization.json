@@ -40,6 +40,10 @@
    "cases": 42,
    "sha256": "89acdce99678bfdb"
   },
+  "limits_payload": {
+   "cases": 2,
+   "sha256": "0525f0fe19ac3565"
+  },
   "match_worktree": {
    "cases": 9,
    "sha256": "eaf7876605edefec"
@@ -25500,6 +25504,146 @@
      "sent": 1000
     },
     "out": "refuse"
+   }
+  ],
+  "limits_payload": [
+   {
+    "in": "cached_limits(demo)",
+    "out": {
+     "accounts": [
+      {
+       "config_dir": "~/.claude",
+       "email": null,
+       "error": null,
+       "headroom_percent": 62.0,
+       "limits": [
+        {
+         "exhausted_now": false,
+         "group": "session",
+         "label": "Session",
+         "model_scoped": false,
+         "percent": 21,
+         "remaining_percent": 79,
+         "resets_at": "<float>"
+        },
+        {
+         "exhausted_now": false,
+         "group": "weekly",
+         "label": "Weekly",
+         "model_scoped": false,
+         "percent": 38,
+         "remaining_percent": 62,
+         "resets_at": "<float>"
+        }
+       ],
+       "ok": true,
+       "plan": "max",
+       "slug": "default"
+      },
+      {
+       "config_dir": "~/.claude-work",
+       "email": null,
+       "error": null,
+       "headroom_percent": 0.0,
+       "limits": [
+        {
+         "exhausted_now": true,
+         "group": "session",
+         "label": "Session",
+         "model_scoped": false,
+         "percent": 100,
+         "remaining_percent": 0,
+         "resets_at": "<float>"
+        },
+        {
+         "exhausted_now": false,
+         "group": "weekly",
+         "label": "Weekly",
+         "model_scoped": false,
+         "percent": 91,
+         "remaining_percent": 9,
+         "resets_at": "<float>"
+        }
+       ],
+       "ok": true,
+       "plan": "max",
+       "slug": "work"
+      },
+      {
+       "config_dir": "~/.claude-spare",
+       "email": null,
+       "error": null,
+       "headroom_percent": 88.0,
+       "limits": [
+        {
+         "exhausted_now": false,
+         "group": "session",
+         "label": "Session",
+         "model_scoped": false,
+         "percent": 4,
+         "remaining_percent": 96,
+         "resets_at": "<float>"
+        },
+        {
+         "exhausted_now": false,
+         "group": "weekly",
+         "label": "Weekly",
+         "model_scoped": false,
+         "percent": 12,
+         "remaining_percent": 88,
+         "resets_at": "<float>"
+        }
+       ],
+       "ok": true,
+       "plan": "pro",
+       "slug": "spare"
+      }
+     ],
+     "available": true,
+     "fetched_at": "<float>",
+     "generated_at": "<NoneType>"
+    }
+   },
+   {
+    "in": "limits_by_account(demo)",
+    "out": {
+     "main": {
+      "available": true,
+      "exhausted": false,
+      "group": null,
+      "headroom": 62.0,
+      "reserve": 0,
+      "reserve_blocked": false,
+      "resets_at": "<NoneType>",
+      "scoped_exhausted": [],
+      "worst": null,
+      "worst_scoped": false
+     },
+     "spare": {
+      "available": true,
+      "exhausted": false,
+      "group": null,
+      "headroom": 88.0,
+      "reserve": 0,
+      "reserve_blocked": false,
+      "resets_at": "<NoneType>",
+      "scoped_exhausted": [],
+      "worst": null,
+      "worst_scoped": false
+     },
+     "work": {
+      "available": false,
+      "exhausted": true,
+      "group": "session",
+      "headroom": 0.0,
+      "reserve": 0,
+      "reserve_blocked": false,
+      "resets_at": "<float>",
+      "scoped_exhausted": [],
+      "worst": "Session",
+      "worst_scoped": false
+     }
+    }
    }
   ],
   "match_worktree": [

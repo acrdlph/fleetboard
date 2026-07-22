@@ -118,15 +118,18 @@ def collect_state(fresh=None, git=None, cold=False):
             lim = None
             if al and al["exhausted"]:
                 # account-wide cap (session / umbrella weekly) — bites every model here
+                # `resets_at` only — a countdown here would be frozen at the
+                # cclimits fetch (300 s cache) and would also make this card
+                # differ on every publish. ENGINE.md §3.4; the board subtracts.
                 lim = {"worst": al["worst"], "group": al["group"],
-                       "resets_in": al["resets_in"], "resets_at": al["resets_at"]}
+                       "resets_at": al["resets_at"]}
             elif al:
                 # a model-scoped cap only strands a session running THAT model
                 hit = next((sx for sx in al.get("scoped_exhausted", [])
                             if (sx["label"] or "").lower() in smodel), None)
                 if hit:
                     lim = {"worst": hit["label"], "group": hit["group"],
-                           "resets_in": hit["resets_in"], "resets_at": hit["resets_at"]}
+                           "resets_at": hit["resets_at"]}
             if lim:
                 s["status"] = "limit"
                 s["limit"] = lim
@@ -134,7 +137,7 @@ def collect_state(fresh=None, git=None, cold=False):
                 # the CLI wrote its limit notice into the transcript —
                 # trust it even when the cclimits cache is cold/stale
                 s["status"] = "limit"
-                s["limit"] = {"worst": None, "group": None, "resets_in": None, "resets_at": None}
+                s["limit"] = {"worst": None, "group": None, "resets_at": None}
 
     # Handoff awareness: a limit-hit session whose worktree has a FRESHER live
     # session (typically another account continuing from a handoff doc) is no
@@ -822,7 +825,7 @@ def demo_state():
                       "I'll continue once usage is available again.",
                       sid="demo-limit-1"),
                       limit={"worst": "Session", "group": "session",
-                             "resets_in": 7560, "resets_at": now + 7560}),
+                             "resets_at": now + 7560}),
                  sess("waiting", "personal", "fable-5", 2100,
                       "Audit the cart telemetry events for double-counting",
                       "Fixed and verified — the mutation is now idempotent and the test suite passes. Ready for review.")], [41567]),

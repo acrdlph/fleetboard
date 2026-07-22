@@ -239,11 +239,14 @@ def start_finish(wt_name):
                         "question or approval. Answer it in ✉ chat — a typed "
                         "nudge would collide with its open dialog. ✕ close works "
                         "once the landing verifies."}
-            mins = int((now - sent) // 60)
-            ago = f"{mins}m ago" if mins else "under a minute ago"
+            # The refusal names no elapsed time. It used to end "…went to the
+            # agent 4m ago", computed here and then read minutes later off a
+            # toast or a reloaded card — dead on arrival (ENGINE.md §3.4).
+            # `sent` is already in `extra` as an absolute epoch; the board
+            # counts up from it against its own clock.
             return {"ok": False, "mode": "pending", **extra, "message":
-                    f"can't close yet — {left}. The closeout brief went to "
-                    f"the agent {ago}; if it looks stuck, ✉ chat with it. "
+                    f"can't close yet — {left}. The closeout brief has already "
+                    f"gone to the agent; if it looks stuck, ✉ chat with it. "
                     "✕ close works once the landing verifies."}
         brief = (SLIM_CLOSEOUT_TEXT if landed else CLOSEOUT_TEXT)
         res = terminal.send_to_process(live["pid"], brief.format(trunk=trunk),

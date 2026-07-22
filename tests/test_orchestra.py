@@ -32,11 +32,32 @@ def acc(config_dir, ok=True, headroom=None, limits=None):
             "plan": "max", "headroom_percent": headroom, "limits": limits or []}
 
 
+FETCHED_AT = 1000    # default `fetched_at` for the hand-built _limits fixtures
+
+
 def lim(label, pct, model_scoped=False, exhausted=False, resets_in=None):
+    """A limit record as CCLIMITS emits it — countdown and all.
+
+    Raw on purpose: `limdata` below feeds it through the real fetch boundary,
+    so the fixtures carry whatever `cached_limits` would have left in the
+    cache rather than a hand-maintained second copy of that conversion."""
     return {"label": label, "group": "weekly" if label != "Session" else "session",
             "percent": pct, "remaining_percent": 100 - pct,
             "model_scoped": model_scoped, "exhausted_now": exhausted,
             "resets_in_seconds": resets_in}
+
+
+def limdata(accounts, fetched=FETCHED_AT):
+    """A `_limits["data"]` blob as `cached_limits` would have left it.
+
+    The countdown never survives the fetch boundary (ENGINE.md §3.4 — it goes
+    stale behind the 300s cache), so a fixture poked straight into
+    `_limits["data"]` must be post-conversion or it tests a shape production
+    never holds. Calling the real `_absolutise_resets` rather than restating
+    `fetched + resets_in` here means the two cannot drift apart."""
+    for a in accounts:
+        fb.limits._absolutise_resets(a, fetched)
+    return {"available": True, "fetched_at": fetched, "accounts": accounts}
 
 
 class ConfigGuard(unittest.TestCase):
@@ -388,11 +409,11 @@ class TestModelHeadroom(ConfigGuard):
         fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {"account3": 20}
-        fb._limits["data"] = {"available": True, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude", headroom=90, limits=[lim("Weekly", 10)]),          # main: excluded
             acc("/h/.claude-account3", headroom=15, limits=[lim("Weekly", 85)]),  # 15% < 20 reserve → not ok
             acc("/h/.claude-account4", headroom=50, limits=[lim("Weekly", 50)]),  # ok
-        ]}
+        ])
         cands = {c["label"]: c for c in fb.model_candidates("opus")}
         self.assertNotIn("main", cands)                 # excluded
         self.assertFalse(cands["account3"]["ok"])       # below reserve
@@ -404,8 +425,8 @@ class TestModelHeadroom(ConfigGuard):
         fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "accounts": [
-            acc("/h/.claude", headroom=90, limits=[lim("Weekly", 10)])]}
+        fb._limits["data"] = limdata([
+            acc("/h/.claude", headroom=90, limits=[lim("Weekly", 10)])])
         cands = fb.model_candidates("opus", only_account="main")
         self.assertEqual(len(cands), 1)                 # explicit choice honored
         self.assertTrue(cands[0]["ok"])
@@ -417,12 +438,12 @@ class TestLimitsByAccount(ConfigGuard):
     def test_reserve_blocked_and_available(self):
         fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {"main": 20}
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude", headroom=15, limits=[lim("Weekly", 85)]),           # 15 < 20 → blocked
             acc("/h/.claude-account2", headroom=50, limits=[lim("Weekly", 50)]),  # available
             acc("/h/.claude-account5", headroom=0,
                 limits=[lim("Weekly", 100, exhausted=True, resets_in=3600)]),     # exhausted
-        ]}
+        ])
         out = fb.limits_by_account()
         self.assertTrue(out["main"]["reserve_blocked"])
         self.assertFalse(out["main"]["available"])
@@ -434,7 +455,7 @@ class TestLimitsByAccount(ConfigGuard):
     def test_skips_not_ok_accounts(self):
         fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "accounts": [acc("/h/.claude", ok=False)]}
+        fb._limits["data"] = limdata([acc("/h/.claude", ok=False)])
         self.assertEqual(fb.limits_by_account(), {})
 
     def test_model_scoped_exhaustion_does_not_block_account(self):
@@ -445,12 +466,12 @@ class TestLimitsByAccount(ConfigGuard):
         off wholesale, so the router reported it exhausted."""
         fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude-account8", headroom=41, limits=[
                 lim("Session", 0),
                 lim("Weekly", 59),
                 lim("Fable", 100, model_scoped=True, exhausted=True, resets_in=144748)]),
-        ]}
+        ])
         out = fb.limits_by_account()["account8"]
         self.assertFalse(out["exhausted"])       # Fable-only exhaustion ≠ account-wide
         self.assertTrue(out["available"])        # still pickable
@@ -464,11 +485,11 @@ class TestLimitsByAccount(ConfigGuard):
         account out — every model shares that cap."""
         fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude-account5", headroom=0, limits=[
                 lim("Weekly", 100, exhausted=True, resets_in=3600),
                 lim("Fable", 84, model_scoped=True)]),
-        ]}
+        ])
         out = fb.limits_by_account()["account5"]
         self.assertTrue(out["exhausted"])
         self.assertFalse(out["available"])
@@ -495,12 +516,12 @@ class TestLimitsByAccount(ConfigGuard):
                 lim("Weekly", 100, exhausted=True, resets_in=1),
                 lim("Fable", 84, model_scoped=True)])
 
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             weekly_gone("/h/.claude"),                  # main — excluded + umbrella gone
             fable_gone("/h/.claude-account8", 41, 59),
             fable_gone("/h/.claude-account4", 15, 85),
             weekly_gone("/h/.claude-account5"),
-        ]}
+        ])
         lba = fb.limits_by_account()
         avail = sorted(a for a, d in lba.items()
                        if d["available"] and a not in fb.CFG["exclude_accounts"])
@@ -510,6 +531,103 @@ class TestLimitsByAccount(ConfigGuard):
         best = fb.model_candidates("opus")[0]
         self.assertEqual(best["label"], "account8")
         self.assertTrue(best["ok"])
+
+
+# ------------------------------------------------ §3.4: nothing counts down
+
+class TestResetsAreAbsoluteAtTheBoundary(ConfigGuard):
+    """cclimits answers in `resets_in_seconds`: a countdown measured the moment
+    it ran. `cached_limits` then serves that same answer for LIMITS_TTL_S =
+    300s, so anything counting down from it is up to five minutes wrong and
+    nothing on the payload says so. ENGINE.md §3.4 — convert once, on the way
+    in, and let the client subtract from its own clock."""
+
+    RAW = {"accounts": [{"slug": "default", "config_dir": "/h/.claude", "ok": True,
+                         "headroom_percent": 40.0, "limits": [
+                             {"label": "Session", "exhausted_now": True,
+                              "resets_at": None, "resets_in_seconds": 3600},
+                             {"label": "Weekly", "exhausted_now": False,
+                              "resets_in_seconds": None}]}]}
+
+    def setUp(self):
+        super().setUp()
+        fb.config.DEMO = False
+        fb.CFG["cclimits_cmd"] = "/usr/bin/true"
+        fb.CFG["reserve_percent"] = {}
+        fb._limits["data"], fb._limits["t"] = None, 0.0
+        self._run = fb.shell.run
+        fb.shell.run = lambda *a, **k: (0, json.dumps(self.RAW))
+
+    def tearDown(self):
+        fb.shell.run = self._run
+        super().tearDown()
+
+    def test_the_countdown_becomes_an_absolute_instant(self):
+        data = fb.cached_limits(refresh=True)
+        session = data["accounts"][0]["limits"][0]
+        self.assertAlmostEqual(session["resets_at"], data["fetched_at"] + 3600, places=3)
+
+    def test_the_countdown_never_reaches_the_wire(self):
+        data = fb.cached_limits(refresh=True)
+        for l in data["accounts"][0]["limits"]:
+            self.assertNotIn("resets_in_seconds", l)
+
+    def test_no_countdown_means_no_reset_time_rather_than_a_wrong_one(self):
+        data = fb.cached_limits(refresh=True)
+        self.assertIsNone(data["accounts"][0]["limits"][1]["resets_at"])
+
+    def test_an_unparseable_upstream_resets_at_is_dropped_not_forwarded(self):
+        # cclimits' own `resets_at` is passthrough from a tool whose schema is
+        # not pinned here — usually null, and not guaranteed to be an epoch. A
+        # client doing arithmetic on an ISO string gets NaN, silently.
+        self.RAW = {"accounts": [{"slug": "default", "config_dir": "/h/.claude",
+                                  "ok": True, "headroom_percent": 40.0, "limits": [
+                                      {"label": "Weekly", "exhausted_now": True,
+                                       "resets_at": "2026-07-22T09:00:00Z"}]}]}
+        l = fb.cached_limits(refresh=True)["accounts"][0]["limits"][0]
+        self.assertIsNone(l["resets_at"])
+
+
+class TestNoCountdownOnTheWire(ConfigGuard):
+    """ENGINE.md §3.4 is a schema rule, so it gets a schema test: walk every
+    payload this server composes and fail on any field that is a duration
+    counted from the server's own `now`. Named fields rather than a heuristic —
+    `age_s` still ships beside `last_write_at` on purpose until step 6."""
+
+    BANNED = {"resets_in", "resets_in_seconds", "resets_in_s"}
+
+    def _walk(self, obj, path="$"):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                self.assertNotIn(k, self.BANNED, f"{path}.{k} is a countdown")
+                self._walk(v, f"{path}.{k}")
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                self._walk(v, f"{path}[{i}]")
+
+    def test_api_limits_under_demo(self):
+        fb.config.DEMO = True
+        self._walk(fb.demo_limits())
+
+    def test_api_state_under_demo(self):
+        # reaches the hand-written `session.limit` in demo_state, which no
+        # other test composes and which drifts from the real one if unwatched
+        fb.config.DEMO = True
+        self._walk(fb.demo_state())
+
+    def test_the_account_summary_that_feeds_session_limit(self):
+        # observer copies these three keys straight onto `session.limit`; the
+        # countdown cannot come back here without the copy raising KeyError
+        fb.config.DEMO = False
+        fb.CFG["reserve_percent"] = {}
+        fb._limits["data"] = limdata([
+            acc("/h/.claude", headroom=0, limits=[
+                lim("Weekly", 100, exhausted=True, resets_in=3600),
+                lim("Fable", 100, model_scoped=True, exhausted=True, resets_in=99)])])
+        out = fb.limits_by_account()
+        self._walk(out)
+        self.assertEqual(out["main"]["resets_at"], FETCHED_AT + 3600)
+        self.assertEqual(out["main"]["scoped_exhausted"][0]["resets_at"], FETCHED_AT + 99)
 
 
 # ---------------------------------------------------------- reserve persist
@@ -578,6 +696,52 @@ class TestDispatchLog(ConfigGuard):
 
     def test_limit(self):
         self.assertEqual(len(fb.read_dispatch_log(limit=2)["entries"]), 2)
+
+    def test_rows_written_before_the_epoch_existed_still_read(self):
+        # every line in this fixture predates `ts_epoch`; the reader must hand
+        # them over untouched so the board can fall back to the naive string
+        entries = fb.read_dispatch_log()["entries"]
+        self.assertNotIn("ts_epoch", entries[0])
+        self.assertEqual(entries[0]["ts"], "2026-07-19T02:00:00")
+
+
+class TestDispatchLogStamp(unittest.TestCase):
+    """`ts` is `%Y-%m-%dT%H:%M:%S` in the server's local zone with no offset
+    written on it. Readable when you `tail` the file on the box; silently hours
+    wrong on a phone reading it over the tailnet from another zone. The epoch
+    beside it is the one a client should format."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        self.tmp.close()
+        self._saved = fb.dispatch.DISPATCH_LOG
+        fb.dispatch.DISPATCH_LOG = Path(self.tmp.name)
+
+    def tearDown(self):
+        fb.dispatch.DISPATCH_LOG = self._saved
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_an_appended_row_carries_an_unambiguous_epoch(self):
+        import time as _t
+        before = _t.time()
+        fb.dispatch._append_log(session="s1", worktree="w")
+        after = _t.time()
+        row = json.loads(Path(self.tmp.name).read_text().splitlines()[-1])
+        self.assertTrue(before <= row["ts_epoch"] <= after)
+        self.assertEqual(row["session"], "s1")
+
+    def test_the_two_forms_describe_the_same_instant(self):
+        import time as _t
+        fb.dispatch._append_log(session="s1")
+        row = json.loads(Path(self.tmp.name).read_text().splitlines()[-1])
+        self.assertEqual(row["ts"], _t.strftime("%Y-%m-%dT%H:%M:%S",
+                                                _t.localtime(row["ts_epoch"])))
+
+    def test_the_log_has_exactly_one_writer(self):
+        # the stamp can only be forgotten at a call site that opens the file
+        # itself; there is meant to be no such call site left
+        src = (ROOT / "orchestra" / "dispatch.py").read_text()
+        self.assertEqual(src.count("open(DISPATCH_LOG"), 1)
 
 
 # ------------------------------------------------------ deterministic dispatch
@@ -794,6 +958,23 @@ class TestStartFinish(ConfigGuard):
         self.assertIn("chat", out["message"])
         self.assertEqual(out["left"], "branch not landed on origin/main")
         self.assertEqual(len(self.sent), 1)                   # no nudge typed
+
+    def test_the_refusal_states_no_elapsed_time_only_the_instant(self):
+        # it used to end "…went to the agent 4m ago", computed here and then
+        # read off a toast — or a card reloaded much later — long after it
+        # stopped being true. ENGINE.md §3.4: ship `sent`, an absolute epoch,
+        # and let the board subtract from its own clock.
+        import re as _re
+        import time as _t
+        self.live()
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
+            "/w/wt": [{"sid": "s1", "pid": 1, "status": "working"}]}
+        self.finish(landed=False)
+        fb._closeouts["wt"] = _t.time() - 600          # briefed 10 minutes ago
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "pending")
+        self.assertIsNone(_re.search(r"\d+m ago|under a minute ago", out["message"]))
+        self.assertAlmostEqual(out["sent"], fb._closeouts["wt"], places=3)
 
     def test_working_session_refuses_close_even_past_the_guard(self):
         # the agent may be mid-closeout — refuse regardless of the clock
@@ -1268,9 +1449,9 @@ class TestScheduleResume(ResumeGuard):
         # client sent no resets_at, but the limits cache knows the account
         import time as _t
         now = _t.time()
-        fb._limits["data"] = {"available": True, "fetched_at": now, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude-account2", headroom=0,
-                limits=[lim("Session", 100, exhausted=True, resets_in=3600)])]}
+                limits=[lim("Session", 100, exhausted=True, resets_in=3600)])], now)
         out = fb.schedule_resume("wt", "s1", "account2")
         self.assertTrue(out["ok"])
         self.assertAlmostEqual(out["due_at"], now + 3600 + 60, delta=2)
@@ -1310,9 +1491,8 @@ class TestLimitActiveUntil(ResumeGuard):
         super().tearDown()
 
     def _data(self, limits, fetched):
-        fb._limits["data"] = {"available": True, "fetched_at": fetched,
-                              "accounts": [acc("/h/.claude-account2",
-                                               headroom=0, limits=limits)]}
+        fb._limits["data"] = limdata([acc("/h/.claude-account2", headroom=0,
+                                      limits=limits)], fetched)
 
     def test_account_wide_block_returns_future_reset(self):
         import time as _t

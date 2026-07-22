@@ -44,6 +44,35 @@ FLEET_SOCK = "fleet"
 DISPATCH_LOG = config.HERE / "dispatch.log.jsonl"
 
 
+def _log_stamp():
+    """When a dispatch happened, in both forms the log needs.
+
+    `ts` is `%Y-%m-%dT%H:%M:%S` in the server's LOCAL zone with no offset on
+    it, so nothing reading the log can tell which zone that is: `tail`ing the
+    file on the box is fine, a phone on the tailnet in another zone renders it
+    hours wrong and silently. `ts_epoch` is the unambiguous one and is what a
+    client should format. `ts` stays because the file is an audit trail people
+    read by eye, and every entry written before this change has only that."""
+    now = time.time()
+    return {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+            "ts_epoch": now}
+
+
+def _append_log(**fields):
+    """Append one audit row, stamped. THE only writer of DISPATCH_LOG.
+
+    Both dispatch paths (mission, one-shot closeout) had their own copy of
+    open/dumps/except OSError, which is how one of them could quietly go on
+    shipping rows a client cannot place in time. Going through here means the
+    stamp cannot be forgotten at a call site — there is no call site that
+    supplies it."""
+    try:
+        with open(DISPATCH_LOG, "a") as lf:
+            lf.write(json.dumps({**_log_stamp(), **fields}) + "\n")
+    except OSError:
+        pass
+
+
 def read_dispatch_log(limit=25):
     """Recent dispatches, newest first, each annotated with whether its tmux
     session is still alive."""
@@ -256,15 +285,9 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
         if rc != 0:
             return finish({"ok": False,
                            "message": f"tmux failed: {out or 'is tmux installed?'}"})
-        try:
-            with open(DISPATCH_LOG, "a") as lf:
-                lf.write(json.dumps({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": name,
-                    "worktree": worktree, "account": account, "model": model,
-                    "closeout": True, "mission_original": mission,
-                    "kickoff": mission}) + "\n")
-        except OSError:
-            pass
+        _append_log(session=name, worktree=worktree, account=account,
+                    model=model, closeout=True, mission_original=mission,
+                    kickoff=mission)
         _log(job, "✓ launched")
         return finish({"ok": True, "message":
                        f"one-shot closeout running in {worktree} on [{account}] — "
@@ -314,15 +337,9 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
     _log(job, "  kickoff " + ("sent ✓" if kick_sent
                               else "UNCONFIRMED ⚠ — attach and press Enter"))
 
-    try:  # audit trail: every dispatch, with the author's original words
-        with open(DISPATCH_LOG, "a") as lf:
-            lf.write(json.dumps({
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": name,
-                "worktree": worktree, "account": account, "model": model,
-                "effort": effort,
-                "mission_original": mission, "kickoff": kickoff}) + "\n")
-    except OSError:
-        pass
+    # audit trail: every dispatch, with the author's original words
+    _append_log(session=name, worktree=worktree, account=account, model=model,
+                effort=effort, mission_original=mission, kickoff=kickoff)
     effort_note = ""
     if effort:
         effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")

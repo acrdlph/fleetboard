@@ -199,8 +199,15 @@ function render(d) {
         <span class="lab">${esc(l.label)}${l.model_scoped ? ` <span class="mo">MODEL</span>` : ""}</span>
         <div class="track"><div class="fill" style="width:${Math.min(100, l.percent)}%;background:${col}"></div></div>
         <span class="num"><b>${Math.round(l.percent)}%</b> used${l.exhausted_now ? " ⛔" : ""}</span></div>`;
-      if (l.resets_in_seconds != null && (l.exhausted_now || l.percent >= 50))
-        out += `<div class="lim"><span></span><span class="resets ${l.exhausted_now ? "hot" : ""}">${l.exhausted_now ? "⛔ exhausted — " : ""}resets in ${rel(l.resets_in_seconds)}</span></div>`;
+      // `resets_at` is absolute (ENGINE.md §3.4) — the countdown is this page's
+      // arithmetic against its own clock, same as the "fetched Xm ago" below.
+      // The server used to send `resets_in_seconds`, measured when cclimits ran
+      // and then served from a 300s cache, so this line could be five minutes
+      // stale with nothing in the payload admitting it.
+      if (l.resets_at != null && (l.exhausted_now || l.percent >= 50)) {
+        const left = l.resets_at - Date.now() / 1000;
+        out += `<div class="lim"><span></span><span class="resets ${l.exhausted_now ? "hot" : ""}">${l.exhausted_now ? "⛔ exhausted — " : ""}${left > 0 ? "resets in " + rel(left) : "reset due"}</span></div>`;
+      }
       return out;
     }).join("");
     const autoFull = exhausted || rBlocked;

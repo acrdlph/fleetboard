@@ -423,6 +423,24 @@ function setAgeState(el) {
 function stampAges() { document.querySelectorAll(".age").forEach(setAgeState); }
 setInterval(stampAges, 1000);
 
+// ---- countdowns animate locally too, off an absolute stamp ----------------
+// Same rule, same reason (ENGINE.md §3.4). Sessions carry `limit.resets_at` —
+// an absolute unix float — and no `resets_in`. The countdown the server used
+// to send was frozen at the cclimits fetch and then cached for 300s, so a card
+// could sit insisting "resets in 12m" for five minutes after the limit had
+// already cleared, and nothing on the payload said how old the number was.
+// As with the age, the text is NEVER in the card's html string: a value that
+// moved every second would make the keyed diff rewrite every limit card on
+// every tick. `data-until` is time-invariant, so the html is too.
+function setUntilState(el) {
+  const until = parseFloat(el.dataset.until);
+  if (!isFinite(until)) { el.textContent = ""; return; }
+  const left = until - Date.now() / 1000;
+  el.textContent = (el.dataset.prefix || "")
+    + (left > 0 ? "in " + rel(Math.ceil(left)) : "now");
+}
+function stampUntils() { document.querySelectorAll(".until").forEach(setUntilState); }
+
 let lastAttn = null;
 function maybeBell(attn) {
   if ($("bell").checked && lastAttn != null && attn > lastAttn) {
@@ -455,15 +473,15 @@ function render(st) {
   document.title = attn > 0 ? `(${attn}!) orchestra` : "orchestra";
 
   const resets = st.worktrees.flatMap(w => w.sessions)
-    .filter(s => s.status === "limit" && !s.handed_to && s.limit && s.limit.resets_in != null)
-    .map(s => s.limit.resets_in);
+    .filter(s => s.status === "limit" && !s.handed_to && s.limit && s.limit.resets_at != null)
+    .map(s => s.limit.resets_at);
   const freeNames = st.free_worktrees || [];
   $("tiles").innerHTML = `
     <div class="tile ok"><div class="k">● working</div><div class="v">${c.working}</div><div class="sub">agents mid-turn</div></div>
     <div class="tile ${attn ? "attn" : ""}"><div class="k">▲ need you</div><div class="v">${attn}</div>
       <div class="sub">${c.needs_input} question · ${c.blocked} blocked · ${c.waiting} idle</div></div>
     <div class="tile"><div class="k">⛔ waiting on limits</div><div class="v">${c.limit || 0}</div>
-      <div class="sub">${resets.length ? "next reset in " + rel(Math.min(...resets)) : "agents resume on reset"}${(n => n ? " · ⏱ " + n + " armed" : "")(Object.values(SCHED).filter(r => r.status === "pending").length)}</div></div>
+      <div class="sub">${resets.length ? `<span class="until" data-until="${Math.min(...resets)}" data-prefix="next reset "></span>` : "agents resume on reset"}${(n => n ? " · ⏱ " + n + " armed" : "")(Object.values(SCHED).filter(r => r.status === "pending").length)}</div></div>
     <div class="tile free"><div class="k">◇ free worktrees</div><div class="v">${freeNames.length}</div>
       <div class="sub" title="${esc(freeNames.join(", "))}">${esc(freeNames.join(", ") || "none — everything busy")}</div></div>
     <div class="tile"><div class="k">⌁ live agents</div><div class="v">${st.worktrees.reduce((n,w)=>n+w.live_procs.length,0) + st.other_procs.length}</div>
@@ -481,13 +499,17 @@ function render(st) {
     const claimed = new Set(w.sessions.map(s => s.pid).filter(Boolean));
     const rows = sess.map(s => {
       const stt = { ...STATUS[s.status] };
+      // the label is the time-invariant half; the countdown is its own node,
+      // stamped by the 1s ticker off the absolute `resets_at` (see setUntilState)
       if (s.status === "limit" && s.limit)
-        stt.label = `LIMIT HIT · ${s.limit.worst || "usage"}${s.limit.resets_in ? " · resets in " + rel(s.limit.resets_in) : ""}`;
+        stt.label = `LIMIT HIT · ${s.limit.worst || "usage"}`;
+      const resetTick = (s.status === "limit" && s.limit && s.limit.resets_at != null)
+        ? `<span class="until" data-until="${s.limit.resets_at}" data-prefix=" · resets "></span>` : "";
       const pend = (s.status !== "working" && s.pending_tools.length)
         ? `<div class="pending">⧗ waiting on: ${esc(s.pending_tools.join(", "))}</div>` : "";
       return `<div class="sess ${s.status}">
         <div class="row1">
-          <span class="st ${s.status}"><span class="g">${stt.glyph}</span> ${stt.label}</span>
+          <span class="st ${s.status}"><span class="g">${stt.glyph}</span> ${stt.label}${resetTick}</span>
           <span class="acct">[${esc(s.account)}]</span>
           <span class="meta">${esc(s.model || "?")}</span>
           <span class="meta age" data-since="${s.last_write_at != null ? s.last_write_at : ""}">${s.last_write_at != null ? "" : rel(s.age_s) + " ago"}</span>
@@ -557,9 +579,11 @@ function render(st) {
   // stamp countdown state on the fresh buttons NOW — waiting for the 1s
   // ticker flashed them clickable ("▶ resume") for up to a second per refresh
   document.querySelectorAll(".resume").forEach(setResumeState);
-  // same reason for the ages: a card rewritten by this render carries an empty
-  // age span until something fills it, so fill it in the same frame
+  // same reason for the ages and the reset countdowns: a card (or the tiles
+  // row) rewritten by this render carries an empty span until something fills
+  // it, so fill it in the same frame rather than a tick later
   stampAges();
+  stampUntils();
 
   $("other").innerHTML = st.other_procs.length
     ? `<h3>other live agents (outside watched worktrees)</h3>` +
@@ -813,7 +837,13 @@ document.addEventListener("click", async (ev) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ worktree: wt }) });
     const d = await r.json();
-    toast((d.ok ? "✓ " : "✗ ") + d.message);
+    // the server's refusal no longer says "…went to the agent 4m ago" — it sends
+    // `sent`, the absolute epoch it briefed, and the elapsed part is worked out
+    // here against this clock (ENGINE.md §3.4). The old string was computed
+    // before the response was even serialised and never moved again.
+    const briefed = d.sent
+      ? ` (briefed ${rel(Math.max(0, Math.floor(Date.now() / 1000 - d.sent)))} ago)` : "";
+    toast((d.ok ? "✓ " : "✗ ") + d.message + briefed);
     // a refused close (pending), an agent stuck on its own dialog (chat), or a
     // just-sent leftover list (nudge) all mean the blockage is real; remember
     // why so the card can say so until it clears
@@ -866,7 +896,12 @@ function setResumeState(b) {
   if (left <= 0) { b.disabled = false; b.classList.add("armed"); b.textContent = "▶ resume now"; }
   else { b.disabled = true; b.classList.remove("armed"); b.textContent = "▶ resume in " + rel(left); }
 }
-setInterval(() => document.querySelectorAll(".resume").forEach(setResumeState), 1000);
+// one ticker for both — the resume buttons and every `.until` countdown run
+// off the same second so they never disagree about when a limit clears
+setInterval(() => {
+  document.querySelectorAll(".resume").forEach(setResumeState);
+  stampUntils();
+}, 1000);
 
 // ---- auto-resume: schedule the continue instead of waiting up for it -------
 function clock(ts) {
@@ -1135,6 +1170,15 @@ function chatKeyForWorktree(wt) {
   if (!keys.length) return null;
   return keys.sort((a, b) => (REG[a].s.age_s ?? 1e9) - (REG[b].s.age_s ?? 1e9))[0];
 }
+// `ts` is the server's local time with no zone offset written on it, so a
+// client anywhere else renders it silently wrong. `ts_epoch` (added beside it,
+// never instead of it) is unambiguous — format it in the VIEWER's zone. Rows
+// written before the epoch existed still have only `ts`, hence the fallback.
+function logStamp(e) {
+  if (e.ts_epoch) return new Date(e.ts_epoch * 1000).toLocaleString([],
+    { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return (e.ts || "").replace("T", " ").slice(5, 16);
+}
 async function loadDispatchLog() {
   try {
     const r = await fetch("/api/dispatchlog");
@@ -1144,7 +1188,7 @@ async function loadDispatchLog() {
       d.entries.map(e => {
         const key = e.alive ? chatKeyForWorktree(e.worktree) : null;
         return `<div class="logrow">
-        <span class="lt">${esc((e.ts || "").replace("T", " ").slice(5, 16))}</span>
+        <span class="lt">${esc(logStamp(e))}</span>
         <span class="ls ${e.alive ? "on" : "off"}">${e.alive ? "● live" : "○ ended"}</span>
         <span class="lm">${esc(e.worktree || "?")} · [${esc(e.account || "?")}]${e.model ? " · " + esc(e.model) : ""}${e.effort ? " · " + esc(e.effort) : ""}${e.routed ? " · routed" : ""}</span>
         ${key ? `<button class="abtn lchat" onclick="event.stopPropagation();openChat('${esc(key)}')">✉ chat</button>`

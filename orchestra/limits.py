@@ -20,6 +20,13 @@ stranded this session actually reset?
 `_limits` is a mutable cache dict, mutated in place and never rebound, so the
 facade re-export and the tests that poke `_limits["data"]` see the same
 object. Patch `limits.cached_limits`, never the facade copy.
+
+Every reset time in here is ABSOLUTE. cclimits answers in `resets_in_seconds`,
+a countdown frozen the instant it was measured; `_absolutise_resets` converts
+it once, at the fetch boundary, and nothing downstream ever sees the countdown
+again (ENGINE.md §3.4). This matters because of the cache above it: the same
+answer is served for up to LIMITS_TTL_S = 300 s, so a countdown read from it
+can be five minutes wrong with nothing on the payload to say so.
 """
 
 import json
@@ -47,6 +54,31 @@ def _cclimits_bin():
     return str(fallback) if fallback.exists() else None
 
 
+def _absolutise_resets(acc, fetched):
+    """Rewrite one account's limits from a countdown to an absolute instant.
+
+    ENGINE.md §3.4: no field derived from `now()` goes on the wire.
+    `resets_in_seconds` is exactly that — measured when cclimits ran, then held
+    by the cache above for up to LIMITS_TTL_S, so a client counting down from
+    it drifts by the whole TTL and cannot tell. `fetched_at + resets_in_seconds`
+    is the same reading in a form that ages correctly.
+
+    The computed value WINS over any `resets_at` cclimits itself supplies. That
+    field is passthrough from a tool whose schema is not pinned here — usually
+    null, and when present it is not guaranteed to be an epoch float (an
+    ISO-8601 string would decode to garbage). `resets_in_seconds` has a known
+    unit, so it is the one we trust; a numeric `resets_at` is kept only when
+    there is no countdown to derive from.
+    """
+    for l in acc.get("limits") or []:
+        rs, ra = l.get("resets_in_seconds"), l.get("resets_at")
+        if isinstance(rs, (int, float)) and not isinstance(rs, bool):
+            l["resets_at"] = fetched + rs
+        elif not isinstance(ra, (int, float)) or isinstance(ra, bool):
+            l["resets_at"] = None
+        l.pop("resets_in_seconds", None)
+
+
 def cached_limits(refresh=False):
     """Per-account usage limits via cclimits (github.com/acrdlph/cclimits).
     Lazy + cached; a network refetch happens only on explicit refresh."""
@@ -69,6 +101,7 @@ def cached_limits(refresh=False):
     data["available"] = True
     data["fetched_at"] = now
     for acc in data.get("accounts", []):
+        _absolutise_resets(acc, now)   # countdowns never leave this function
         if acc.get("config_dir"):
             label = config.account_label(Path(acc["config_dir"]))
             r = account_reserve(label)
@@ -170,8 +203,14 @@ def set_reserve(label, percent):
 
 
 def limits_by_account():
-    """account label -> {exhausted, worst, resets_in, headroom, reserve, available,
+    """account label -> {exhausted, worst, resets_at, headroom, reserve, available,
     scoped_exhausted}.
+
+    `resets_at` is an absolute epoch, never a countdown — see
+    `_absolutise_resets`. The countdown this used to carry beside it was frozen
+    at fetch time behind a 300 s cache and went out on the wire as
+    `session.limit.resets_in`; the board now subtracts `resets_at` from its own
+    clock instead (ENGINE.md §3.4).
 
     `exhausted`/`available` reflect only ACCOUNT-WIDE caps (session + umbrella
     weekly). A maxed model-scoped cap (e.g. Fable) is a per-model constraint,
@@ -182,7 +221,6 @@ def limits_by_account():
     data = _limits["data"] if not config.DEMO else demo_limits()
     if not data or not data.get("available"):
         return {}
-    fetched = (data.get("fetched_at") or time.time())
     out = {}
     for acc in data.get("accounts", []):
         if not acc.get("ok"):
@@ -190,8 +228,9 @@ def limits_by_account():
         label = config.account_label(Path(acc["config_dir"]))
         ex = [l for l in acc.get("limits", []) if l.get("exhausted_now")]
         blocking = [l for l in ex if not l.get("model_scoped")]   # session / umbrella weekly
-        worst = min(blocking, key=lambda l: l.get("resets_in_seconds") or 0) if blocking else None
-        resets_in = worst.get("resets_in_seconds") if worst else None
+        # soonest to reset first; an unknown reset (None -> 0) still sorts first,
+        # as it did when this ranked on the countdown
+        worst = min(blocking, key=lambda l: l.get("resets_at") or 0) if blocking else None
         headroom = acc.get("headroom_percent")
         reserve = account_reserve(label)
         # reserve-blocked: less than the required buffer remains → treat as full
@@ -202,16 +241,14 @@ def limits_by_account():
             "worst": worst["label"] if worst else None,
             "worst_scoped": False,   # `worst` is always an account-wide cap now
             "group": worst.get("group") if worst else None,
-            "resets_in": resets_in,
-            "resets_at": fetched + resets_in if resets_in else None,
+            "resets_at": worst.get("resets_at") if worst else None,
             "reserve": reserve,
             "reserve_blocked": reserve_blocked,
             # model-scoped caps that are used up — only strand a session
             # actually running that model, not the whole account
             "scoped_exhausted": [
                 {"label": l.get("label"), "group": l.get("group"),
-                 "resets_in": l.get("resets_in_seconds"),
-                 "resets_at": (fetched + l["resets_in_seconds"]) if l.get("resets_in_seconds") else None}
+                 "resets_at": l.get("resets_at")}
                 for l in ex if l.get("model_scoped")],
             # usable for AUTO dispatch: real all-model headroom above its buffer
             "available": (not blocking) and not reserve_blocked,
@@ -221,11 +258,13 @@ def limits_by_account():
 
 def demo_limits():
     now = time.time()
+    # demo records go out on the same wire as real ones, so they carry the same
+    # absolute `resets_at` and no countdown — a demo that shipped the field the
+    # real path dropped would let a client bind to a field that isn't there.
     def lim(label, group, pct, ex, resets_h, scoped=False):
         return {"label": label, "group": group, "percent": pct,
                 "remaining_percent": 100 - pct, "model_scoped": scoped,
-                "exhausted_now": ex, "resets_at": None,
-                "resets_in_seconds": resets_h * 3600}
+                "exhausted_now": ex, "resets_at": now + resets_h * 3600}
     return {"available": True, "fetched_at": now, "generated_at": None, "accounts": [
         {"slug": "default", "email": None, "plan": "max", "config_dir": "~/.claude",
          "ok": True, "error": None, "headroom_percent": 62.0, "limits": [

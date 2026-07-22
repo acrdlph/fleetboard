@@ -189,6 +189,7 @@ def build(mod):
     ]
 
     snap["state_payload"] = _state_payload(mod)
+    snap["limits_payload"] = _limits_payload(mod)
 
     return snap
 
@@ -199,8 +200,9 @@ VOLATILE = {
     # wall-clock and machine readings that legitimately differ between runs.
     # Normalised rather than dropped, so a field VANISHING is still caught.
     "generated_at", "at", "cpu", "etime", "age_s", "last_write_at",
-    "resets_in", "resets_at", "due_at", "created_at", "fired_at",
-    "closeout_sent", "ts", "sweep_ms", "freshness", "pid", "uptime_s",
+    "resets_in", "resets_at", "resets_in_seconds", "due_at", "created_at",
+    "fired_at", "fetched_at", "closeout_sent", "ts", "ts_epoch", "sweep_ms",
+    "freshness", "pid", "uptime_s",
 }
 
 
@@ -326,6 +328,34 @@ def _state_payload(mod):
         for k, v in saved.items():
             mod.CFG[k] = v
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _limits_payload(mod):
+    """The `/api/limits` wire shape, and the account summary derived from it.
+
+    `state_payload` above cannot see either: its fixture has no cclimits, so
+    `limits._limits["data"]` stays None, no session ever reaches `status:
+    "limit"`, and the whole `session.limit` sub-object is absent from the
+    snapshot. That blind spot let the limit fields change shape unnoticed —
+    found when removing `resets_in` from the wire left the golden byte-identical.
+
+    Demo mode is the seam that opens it without patching anything: both
+    `cached_limits` and `limits_by_account` read `demo_limits()` directly under
+    `DEMO`, so a config flag — the same lever `_state_payload` uses — reaches
+    the real composition. `reserve_percent` is pinned empty so the recording
+    machine's own config cannot leak into the golden.
+    """
+    was_demo = getattr(mod.config, "DEMO", False)
+    saved = mod.CFG.get("reserve_percent")
+    try:
+        mod.config.DEMO = True
+        mod.CFG["reserve_percent"] = {}
+        return [{"in": "cached_limits(demo)", "out": _normalise(_safe(mod, "cached_limits"))},
+                {"in": "limits_by_account(demo)",
+                 "out": _normalise(_safe(mod, "limits_by_account"))}]
+    finally:
+        mod.config.DEMO = was_demo
+        mod.CFG["reserve_percent"] = saved
 
 
 def digest(snap):
