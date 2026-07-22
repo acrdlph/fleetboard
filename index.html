@@ -396,6 +396,23 @@ function rel(s) {
   return Math.floor(s/86400) + "d";
 }
 
+// ---- ages animate locally, off an absolute stamp ---------------------------
+// Sessions carry `last_write_at` (an absolute unix float — ENGINE.md §3.4), so
+// "wrote 12s ago" is the CLIENT's arithmetic against Date.now(), not a number
+// the server counted down for us. Rendering the server's `age_s` froze the age
+// for the whole 5s poll interval and then jumped; this ticks every second with
+// no round-trip. Same idiom as the resume countdown below.
+// The age is deliberately NOT in the card's html string: html that moved every
+// second made the keyed diff rewrite every live card on every tick. Card html
+// is now time-invariant, and only this one text node moves.
+function setAgeState(el) {
+  const since = parseFloat(el.dataset.since);
+  if (!isFinite(since)) return;   // pre-`last_write_at` server: keep its age_s
+  el.textContent = rel(Math.max(0, Math.floor(Date.now() / 1000 - since))) + " ago";
+}
+function stampAges() { document.querySelectorAll(".age").forEach(setAgeState); }
+setInterval(stampAges, 1000);
+
 let lastAttn = null;
 function maybeBell(attn) {
   if ($("bell").checked && lastAttn != null && attn > lastAttn) {
@@ -463,7 +480,7 @@ function render(st) {
           <span class="st ${s.status}"><span class="g">${stt.glyph}</span> ${stt.label}</span>
           <span class="acct">[${esc(s.account)}]</span>
           <span class="meta">${esc(s.model || "?")}</span>
-          <span class="meta">${rel(s.age_s)} ago</span>
+          <span class="meta age" data-since="${s.last_write_at != null ? s.last_write_at : ""}">${s.last_write_at != null ? "" : rel(s.age_s) + " ago"}</span>
           ${s.subdir ? `<span class="subdir">./${esc(s.subdir)}</span>` : ""}
           ${s.branch && s.branch !== g.branch ? `<span class="meta"> ${esc(s.branch)}</span>` : ""}
           ${s.subagents_active ? `<span class="subag">⚙ subagents running</span>`
@@ -530,6 +547,9 @@ function render(st) {
   // stamp countdown state on the fresh buttons NOW — waiting for the 1s
   // ticker flashed them clickable ("▶ resume") for up to a second per refresh
   document.querySelectorAll(".resume").forEach(setResumeState);
+  // same reason for the ages: a card rewritten by this render carries an empty
+  // age span until something fills it, so fill it in the same frame
+  stampAges();
 
   $("other").innerHTML = st.other_procs.length
     ? `<h3>other live agents (outside watched worktrees)</h3>` +
