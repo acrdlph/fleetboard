@@ -18,12 +18,22 @@ The AppleScript templates are `%`-formatted with values that came from a
 transcript, so `_osa_escape` guards the quoting. `send_to_process` also
 collapses every newline to a space before typing: a bare Enter mid-message
 would submit half a prompt.
+
+NEITHER VERB TAKES A PID AS ITS ADDRESS. Both take a durable identity — a sid,
+a worktree, a tmux pane, a cwd — and hand it to `identity.resolve`, which
+re-reads the process table and answers with the process that identity names
+*now*; the pid rides along as a hint and is checked against that answer. This
+module is the only place in the package that types at an agent, so routing both
+verbs through one resolver is what makes the rule unskippable rather than a
+convention. ADR 0008, and the reason it exists: the drawer captures a pid when
+it opens and the user sends minutes later, so a recycled pid delivers the
+message to a stranger running --dangerously-skip-permissions.
 """
 
 import re
 import shlex
 
-from . import config, shell, procs
+from . import config, shell, identity
 
 
 # --------------------------------------------------------------- focus jump
@@ -68,11 +78,20 @@ tell application "iTerm2"
 end tell'''
 
 
-def focus_process(pid):
-    """Best-effort: bring the terminal window hosting `pid` to the front."""
-    proc = next((p for p in procs.claude_processes() if p["pid"] == pid), None)
-    if not proc:
-        return {"ok": False, "message": f"pid {pid} is gone"}
+def focus_process(pid, **ident):
+    """Best-effort: bring the terminal window hosting an agent to the front.
+
+    Identity-addressed like `send_to_process`, and for a smaller reason: focus
+    types nothing, so a misdirected focus costs confusion rather than an
+    injected instruction. It is still refused rather than guessed, because the
+    tmux branch below does not merely raise a window — it OPENS one, attached
+    read-write to a session — and because a rule with an exception is a rule
+    somebody will copy the exception from.
+    """
+    proc, refusal = identity.resolve(pid, **ident)
+    if refusal:
+        return refusal
+    pid = proc["pid"]
     tty, host, kind = proc["tty"], proc["host"], proc["host_kind"]
     where = f"pid {pid}" + (f" · {tty}" if tty else "")
     if kind == "tmux":
@@ -151,16 +170,28 @@ def _osa_escape(text):
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def send_to_process(pid, text):
-    """Type `text` + Enter into the terminal hosting a claude process."""
+def send_to_process(pid, text, **ident):
+    """Type `text` + Enter into the terminal hosting a claude process.
+
+    `pid` is a hint; `ident` is the address (`sid`/`account`, `worktree`,
+    `cwd`, `tmux`, `tty` — see `identity.resolve`). The resolve happens HERE,
+    immediately before the keystroke, not in the caller and not off a snapshot:
+    everything between reading the board and typing is window for the pid to
+    become somebody else's.
+
+    The identity is checked after the message is normalised and found non-empty
+    — an empty send should cost nothing, least of all a `ps` — and before any
+    of the three delivery mechanisms, which is the only ordering that has all
+    of them covered.
+    """
     if config.DEMO:
         return {"ok": False, "message": "demo mode — no live agents to talk to"}
     text = re.sub(r"\s*\n\s*", " ", text).strip()
     if not text:
         return {"ok": False, "message": "empty message"}
-    proc = next((p for p in procs.claude_processes() if p["pid"] == pid), None)
-    if not proc:
-        return {"ok": False, "message": f"pid {pid} is gone"}
+    proc, refusal = identity.resolve(pid, **ident)
+    if refusal:
+        return refusal
     if proc.get("tmux_target"):
         sock = ["-L", proc["tmux_sock"]] if proc["tmux_sock"] else []
         rc1, _ = shell.run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "-l", text])

@@ -650,9 +650,12 @@ class TestStartFinish(ConfigGuard):
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.gitrepo._base_ref = lambda root: "origin/main"
         fb.procs.claude_processes = lambda **_: []
-        self.sent = []
-        fb.terminal.send_to_process = lambda pid, text: (
-            self.sent.append(text) or {"ok": True})
+        self.sent, self.addressed = [], []
+        # `**ident` because every actuator call is identity-addressed now
+        # (ADR 0008) — a stub with the old two-arg shape would make finish
+        # look broken rather than the send look unaddressed.
+        fb.terminal.send_to_process = lambda pid, text, **ident: (
+            self.sent.append(text) or self.addressed.append(ident) or {"ok": True})
         self.dispatched = []
         fb.dispatch.start_dispatch = lambda brief, **kw: (
             self.dispatched.append((brief, kw)) or {"ok": True, "job": "j1"})
@@ -699,6 +702,23 @@ class TestStartFinish(ConfigGuard):
         out = self.finish(landed=False)
         self.assertEqual(out["mode"], "brief")
         self.assertIn("merge-base --is-ancestor", self.sent[0])
+
+    def test_every_brief_is_addressed_by_worktree_not_by_pid(self):
+        # ADR 0008. Between the scan that found this pid and the keystroke sit
+        # a git fetch, a merge-base and a status — seconds in which the pid can
+        # become somebody else's. The worktree and the pane travel with it so
+        # the send re-resolves rather than trusting the number.
+        self.live()
+        for git in ({"landed": True},                        # /exit
+                    {"landed": True, "porcelain": "?? s\n"},  # slim brief
+                    {"landed": False}):                       # full brief
+            with self.subTest(**git):
+                fb._closeouts.clear()      # each run is a first press
+                self.addressed.clear()
+                self.finish(**git)
+                self.assertEqual(len(self.addressed), 1)
+                self.assertEqual(self.addressed[0]["worktree"], "wt")
+                self.assertEqual(self.addressed[0]["tmux"], "s:0")
 
     # -- two-step: brief sent, then ✕ close ---------------------------------
     def test_brief_send_marks_the_card_for_step_two(self):
@@ -938,6 +958,247 @@ class TestCloseoutShell(unittest.TestCase):
         self.assertNotIn("--model", resume[0])
 
 
+# ------------------------------------------------- identity-addressed mutations
+
+class IdentityGuard(ConfigGuard):
+    """A fake fleet for the actuator: two worktrees, two agents, one shell.
+
+    The bug under test cannot be reproduced honestly — a real pid recycle is not
+    something a test can make the kernel do. What CAN be reproduced exactly is
+    its observable signature: the process table hands the same pid number back,
+    and the session that number used to serve is now served by somebody else (or
+    by nobody). `recycle()` does precisely that and nothing more.
+
+    Everything is patched at the module the actuator imports (ADR 0010), so the
+    resolver runs for real end to end — `identity.resolve` -> `gitrepo`,
+    `procs`, `transcripts` — and only the world underneath is fake. `shell.run`
+    is the ground truth for "was a keystroke delivered": if a refusal ever
+    leaked past, `self.typed` would be non-empty.
+    """
+
+    WTS = [{"name": "alpha", "path": "/w/alpha", "git": "/w/alpha"},
+           {"name": "beta", "path": "/w/beta", "git": "/w/beta"}]
+
+    def setUp(self):
+        super().setUp()
+        fb.config.DEMO = False
+        self._saved = {"run": fb.shell.run,
+                       "procs": fb.procs.claude_processes,
+                       "wts": fb.gitrepo.discover_worktrees,
+                       "scan": fb.transcripts.scan_sessions}
+        self.typed = []
+        fb.shell.run = lambda cmd, **kw: (self.typed.append(cmd), (0, "true"))[1]
+        fb.gitrepo.discover_worktrees = lambda: list(self.WTS)
+        # the world before the recycle: pid 4242 is alpha's agent, serving
+        # session s-alpha; pid 7777 is beta's, serving s-beta.
+        self.procs = {4242: "/w/alpha", 7777: "/w/beta"}
+        self.owners = {"s-alpha": 4242, "s-beta": 7777}
+        fb.procs.claude_processes = lambda **kw: [
+            {"pid": pid, "cwd": cwd, "cpu": 0.0, "etime": "1:00", "cmd": "claude",
+             "tty": f"ttys{pid % 1000:03d}", "host": "Terminal",
+             "host_kind": "app", "shells": 0, "account": "main",
+             "tmux_sock": None, "tmux_target": f"sess:0.{pid % 10}"}
+            for pid, cwd in sorted(self.procs.items())]
+        fb.transcripts.scan_sessions = lambda wts, live, now, cold=False: {
+            w["path"]: [{"sid": sid, "account": "main",
+                         "pid": self.owners.get(sid), "cwd": w["path"]}
+                        for sid, wt in (("s-alpha", "alpha"), ("s-beta", "beta"))
+                        if wt == w["name"] and sid in self.owners]
+            for w in wts}
+
+    def tearDown(self):
+        fb.shell.run = self._saved["run"]
+        fb.procs.claude_processes = self._saved["procs"]
+        fb.gitrepo.discover_worktrees = self._saved["wts"]
+        fb.transcripts.scan_sessions = self._saved["scan"]
+        super().tearDown()
+
+    def recycle(self):
+        """alpha's agent exited; the kernel handed 4242 to a beta agent.
+
+        The pid number is unchanged — that is the whole point — but it now runs
+        in a different worktree and serves a different conversation, and the
+        session that used to own it owns nothing.
+        """
+        self.procs = {4242: "/w/beta", 7777: "/w/beta"}
+        self.owners = {"s-beta": 7777}
+
+
+class TestSendIsIdentityAddressed(IdentityGuard):
+    """ADR 0008: /api/send names a session, never a pid slot."""
+
+    def test_the_happy_path_still_types(self):
+        res = fb.send_to_process(4242, "hello", sid="s-alpha", account="main",
+                                 worktree="alpha")
+        self.assertTrue(res["ok"], res)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.2", "-l", "hello"],
+                      self.typed)
+
+    def test_a_recycled_pid_is_refused_not_delivered(self):
+        # THE BUG. The drawer captured 4242 for s-alpha; by the time the user
+        # hits send, 4242 is a different agent in a different worktree.
+        self.recycle()
+        res = fb.send_to_process(4242, "rm -rf the wrong thing",
+                                 sid="s-alpha", account="main", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertIn("gone", res["message"])
+        self.assertEqual(self.typed, [])       # nobody was typed at
+
+    def test_a_pid_reassigned_within_the_session_is_refused(self):
+        # the harder half: 4242 still runs in alpha, but s-alpha is served by a
+        # different process now. Worktree containment alone would pass this.
+        self.procs = {4242: "/w/alpha", 9999: "/w/alpha"}
+        self.owners = {"s-alpha": 9999}
+        res = fb.send_to_process(4242, "hi", sid="s-alpha", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertIn("9999", res["message"])   # says who it is now
+        self.assertEqual(self.typed, [])
+
+    def test_no_pid_hint_resolves_the_session_to_its_current_process(self):
+        # the sid is the address; with no hint to contradict, the send follows
+        # the session to whatever process serves it now
+        self.procs = {9999: "/w/alpha"}
+        self.owners = {"s-alpha": 9999}
+        res = fb.send_to_process(None, "hi", sid="s-alpha")
+        self.assertTrue(res["ok"], res)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.9", "-l", "hi"], self.typed)
+
+    def test_a_vanished_session_is_refused(self):
+        self.owners = {}
+        res = fb.send_to_process(4242, "hi", sid="s-alpha", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_session_with_no_terminal_says_so(self):
+        # ADR 0008 asks for an error the client can SURFACE, not merely one it
+        # can count: "this conversation has no terminal any more" and "it had
+        # one and lost it mid-request" are different things to tell a user, and
+        # asserting only on the code cannot tell them apart — verified by
+        # mutation, where deleting this branch left the test green.
+        self.owners = {"s-alpha": None, "s-beta": 7777}
+        res = fb.send_to_process(None, "hi", sid="s-alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertIn("no live terminal", res["message"])
+        self.assertEqual(self.typed, [])
+
+    def test_a_bare_pid_is_refused_rather_than_guessed(self):
+        # the legacy wire form is still callable and no longer guesses
+        res = fb.send_to_process(4242, "hi")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.UNADDRESSED)
+        self.assertEqual(self.typed, [])
+
+    def test_a_place_addressed_send_refuses_a_pid_that_left(self):
+        # the drawer's other-terminal picker: addressed by worktree, and the
+        # recycled pid is in beta now
+        self.recycle()
+        res = fb.send_to_process(4242, "hi", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_place_addressed_send_types_when_the_pid_stayed(self):
+        res = fb.send_to_process(7777, "hi", worktree="beta")
+        self.assertTrue(res["ok"], res)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.7", "-l", "hi"], self.typed)
+
+    def test_a_stale_tmux_pane_is_refused(self):
+        # the corroborator: same pid, same worktree, different pane
+        res = fb.send_to_process(7777, "hi", worktree="beta", tmux="sess:0.4")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_stale_tty_is_refused(self):
+        res = fb.send_to_process(7777, "hi", worktree="beta", tty="ttys001")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_dead_worktree_is_refused(self):
+        fb.gitrepo.discover_worktrees = lambda: []
+        res = fb.send_to_process(7777, "hi", worktree="beta")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_an_empty_message_never_costs_a_resolve(self):
+        # ordering: normalise, refuse empty, THEN resolve — an empty send must
+        # not shell out to ps, and must not report itself as a stale identity
+        called = []
+        saved = fb.procs.claude_processes
+        fb.procs.claude_processes = lambda **kw: called.append(1) or []
+        try:
+            res = fb.send_to_process(4242, "   \n  ", sid="s-alpha")
+        finally:
+            fb.procs.claude_processes = saved
+        self.assertEqual(res["message"], "empty message")
+        self.assertEqual(called, [])
+
+
+class TestFocusIsIdentityAddressed(IdentityGuard):
+    """Focus types nothing, but it is addressed the same way — an exception
+    is a rule somebody will copy."""
+
+    def test_focus_follows_the_worktree(self):
+        res = fb.focus_process(7777, worktree="beta")
+        self.assertTrue(res["ok"], res)
+
+    def test_focus_refuses_a_recycled_pid(self):
+        self.recycle()
+        res = fb.focus_process(4242, worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+
+    def test_focus_refuses_a_bare_pid(self):
+        res = fb.focus_process(4242)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.UNADDRESSED)
+
+    def test_a_loose_process_is_addressed_by_its_cwd(self):
+        # the "other processes" strip has no worktree to name — the cwd the
+        # board displayed is its durable address
+        self.assertTrue(fb.focus_process(7777, cwd="/w/beta")["ok"])
+        gone = fb.focus_process(7777, cwd="/w/alpha")
+        self.assertFalse(gone["ok"])
+        self.assertEqual(gone["error"], fb.GONE)
+
+
+class TestResolveContract(IdentityGuard):
+    """The resolver's own surface, for the callers that are not `terminal`."""
+
+    def test_an_account_that_moved_is_refused(self):
+        res = fb.identity.resolve(4242, sid="s-alpha", account="work")
+        self.assertIsNone(res[0])
+        self.assertEqual(res[1]["error"], fb.GONE)
+
+    def test_a_sid_in_another_worktree_is_refused(self):
+        res = fb.identity.resolve(4242, sid="s-alpha", worktree="beta")
+        self.assertIsNone(res[0])
+        self.assertEqual(res[1]["error"], fb.GONE)
+
+    def test_a_place_with_no_pid_is_unaddressed(self):
+        res = fb.identity.resolve(None, worktree="alpha")
+        self.assertIsNone(res[0])
+        self.assertEqual(res[1]["error"], fb.UNADDRESSED)
+
+    def test_resolving_by_sid_reads_the_process_table_now(self):
+        # never the observer snapshot: `Snapshot` is advisory and one sweep is
+        # long enough for a pid to die and come back as somebody else
+        reads = []
+        saved = fb.procs.claude_processes
+        fb.procs.claude_processes = lambda **kw: reads.append(1) or saved(**kw)
+        try:
+            fb.identity.resolve(4242, sid="s-alpha")
+        finally:
+            fb.procs.claude_processes = saved
+        self.assertEqual(len(reads), 1)
+
+
 # --------------------------------------------------------- scheduled resumes
 
 class ResumeGuard(ConfigGuard):
@@ -1110,9 +1371,10 @@ class TestFireResume(ResumeGuard):
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
         fb.transcripts.claude_homes = lambda: [Path("/h/.claude-account2")]
         fb.limits._limit_active_until = lambda account, model, now: None
-        self.sent, self.tmuxed = [], []
-        fb.terminal.send_to_process = lambda pid, text: (
-            self.sent.append((pid, text)) or {"ok": True, "message": "sent via tmux"})
+        self.sent, self.tmuxed, self.addressed = [], [], []
+        fb.terminal.send_to_process = lambda pid, text, **ident: (
+            self.sent.append((pid, text)) or self.addressed.append(ident)
+            or {"ok": True, "message": "sent via tmux"})
         fb.resume._tmux_resume = lambda wt, cwd, home, sid: (
             self.tmuxed.append((wt, cwd, str(home), sid))
             or {"ok": True, "message": "resumed in tmux"})
@@ -1221,6 +1483,28 @@ class TestFireResume(ResumeGuard):
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
         self.assertEqual(self.tmuxed, [])
 
+    def test_the_unattended_send_is_addressed_by_sid_not_by_snapshot_pid(self):
+        # `proc` here came out of observer.cached_state() — advisory, up to a
+        # sweep old, and older still once the limit check has run. ADR 0008
+        # says the pid is a hint: the sid, the account and the worktree the
+        # schedule was armed for are the address, and the pane/tty the
+        # snapshot saw ride along so a recycled pid has to reproduce them too.
+        self.board(pid=42)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.addressed, [{"sid": "s1", "account": "account2",
+                                           "worktree": "wt", "tmux": None,
+                                           "tty": None}])
+
+    def test_a_refused_send_falls_through_to_the_sid_exact_tmux_path(self):
+        # the identity no longer resolves — the resume must NOT be abandoned
+        # and must NOT be retargeted; it reopens the sid itself
+        fb.terminal.send_to_process = lambda pid, text, **ident: {
+            "ok": False, "error": fb.GONE, "message": "that agent is gone"}
+        self.board(pid=42)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.tmuxed[0][3], "s1")
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+
     def test_never_borrows_another_sessions_terminal(self):
         # unlike the manual button, the unattended path must not type
         # 'continue' at whatever other agent happens to live in the worktree
@@ -1245,7 +1529,7 @@ class TestFireResume(ResumeGuard):
         self.assertIn("stale view", fb._resumes["wt|s1"]["message"])
 
     def test_failed_send_falls_back_to_tmux_resume(self):
-        fb.terminal.send_to_process = lambda pid, text: {"ok": False, "message": "no automation"}
+        fb.terminal.send_to_process = lambda pid, text, **ident: {"ok": False, "message": "no automation"}
         self.board(pid=42)
         fb.fire_resume(self.arm())
         self.assertEqual(len(self.tmuxed), 1)
@@ -1595,6 +1879,55 @@ class TestHTTPSmoke(ConfigGuard):
             d = json.loads(r.read())
         self.assertFalse(d["ok"])
         self.assertIn("demo", d["message"])
+
+    def _post(self, path, payload):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+
+    def test_send_on_the_wire_refuses_a_bare_pid(self):
+        # {pid, text} was the whole request once, and a recycled pid delivered
+        # it to a stranger (ADR 0008). The legacy form stays callable and now
+        # refuses — distinguishably, so a client can say what went wrong.
+        fb.config.DEMO = False          # ConfigGuard restores it
+        d = self._post("/api/send", {"pid": 999999, "text": "hi"})
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["error"], fb.UNADDRESSED)
+
+    def test_focus_on_the_wire_refuses_a_bare_pid(self):
+        d = json.loads(self._get("/api/focus?pid=999999")[1])
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["error"], fb.UNADDRESSED)
+
+    def test_the_router_carries_the_whole_identity(self):
+        # worktree names and tmux targets contain slashes and colons; the
+        # focus route used to pluck one integer out of the raw path with a
+        # regex, which cannot carry any of this
+        seen = {}
+        saved = fb.terminal.focus_process, fb.terminal.send_to_process
+        fb.terminal.focus_process = lambda pid, **kw: seen.setdefault(
+            "focus", (pid, kw)) or {"ok": True, "message": ""}
+        fb.terminal.send_to_process = lambda pid, text, **kw: seen.setdefault(
+            "send", (pid, text, kw)) or {"ok": True, "message": ""}
+        try:
+            self._get("/api/focus?pid=7&wt=feat%2Fx&tmux=sess%3A0.1&tty=ttys003")
+            self._post("/api/send", {"pid": 8, "text": "hi", "sid": "s1",
+                                     "account": "work", "worktree": "feat/x",
+                                     "tmux": "sess:0.1", "tty": "ttys003"})
+        finally:
+            fb.terminal.focus_process, fb.terminal.send_to_process = saved
+        self.assertEqual(seen["focus"][0], 7)
+        self.assertEqual(seen["focus"][1]["worktree"], "feat/x")
+        self.assertEqual(seen["focus"][1]["tmux"], "sess:0.1")
+        self.assertEqual(seen["focus"][1]["tty"], "ttys003")
+        self.assertEqual(seen["send"][0], 8)
+        self.assertEqual(seen["send"][2]["sid"], "s1")
+        self.assertEqual(seen["send"][2]["account"], "work")
+        self.assertEqual(seen["send"][2]["worktree"], "feat/x")
+        self.assertEqual(seen["send"][2]["tmux"], "sess:0.1")
 
     def test_unknown_path_404(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:

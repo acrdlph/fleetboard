@@ -388,10 +388,17 @@ function unpinTip() {
 async function tipFocus(wtName) {
   const wt = byName[wtName];
   if (!wt || !wt.live_procs.length) { toast(`${wtName}: no live process to focus`); return; }
-  const pid = wt.live_procs[0].pid;
+  const p = wt.live_procs[0];
+  const pid = p.pid;
   toast(`⌖ locating pid ${pid}…`);
+  // the worktree — not the pid — is the address the server re-resolves; the map
+  // holds a node for as long as the tooltip is open, which is plenty of time
+  // for the kernel to hand that pid to somebody else (ADR 0008)
+  const ident = Object.entries({ wt: wtName, tmux: p.tmux, tty: p.tty })
+    .filter(([, v]) => v != null && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
   try {
-    const r = await fetch(`/api/focus?pid=${pid}`);
+    const r = await fetch(`/api/focus?pid=${pid}&${ident}`);
     const res = await r.json();
     toast((res.ok ? "" : "✗ ") + res.message);
   } catch (e) { toast("✗ focus request failed"); }

@@ -362,8 +362,17 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&
 // card head so a worktree running several agents says which window is which —
 // the pairing comes from the process's CLAUDE_CONFIG_DIR matching the session's
 // account. A fallback pairing (no account match) is marked as a guess.
-function procChip(p, { certain = true, title } = {}) {
-  return `<button class="pidbtn${certain ? "" : " guess"}" onclick="focusPid(${p.pid})"
+// Every actuator call carries a DURABLE address, never a bare pid: the button
+// is rendered once and clicked whenever, and by then the kernel may have handed
+// that pid to a different agent (ADR 0008). `addr` is the address the server
+// re-resolves — a worktree for anything on a card, a cwd for the loose
+// processes strip — with the pid riding along only as a hint.
+function addr(o) {
+  return Object.entries(o).filter(([, v]) => v != null && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+}
+function procChip(p, { certain = true, title, wt, cwd } = {}) {
+  return `<button class="pidbtn${certain ? "" : " guess"}" onclick="focusPid(${p.pid}, '${esc(addr({ wt, cwd, tmux: p.tmux, tty: p.tty }))}')"
     title="${esc(title || "jump to this terminal")}">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button>`;
 }
 function sessProc(w, s) {
@@ -371,6 +380,7 @@ function sessProc(w, s) {
   const p = w.live_procs.find(x => x.pid === s.pid);
   if (!p) return "";
   return procChip(p, {
+    wt: w.name,
     certain: s.pid_certain,
     title: s.pid_certain
       ? `jump to this session's terminal — [${s.account}] on ${p.tty || p.host || "tmux"}`
@@ -528,7 +538,7 @@ function render(st) {
           // terminals no session claims — an agent whose transcript hasn't been
           // written yet, or one running outside any tracked session
           const loose = w.live_procs.filter(p => !claimed.has(p.pid));
-          if (loose.length) return loose.map(p => procChip(p, { title: "live terminal in this worktree — not tied to a session yet" })).join("");
+          if (loose.length) return loose.map(p => procChip(p, { wt: w.name, title: "live terminal in this worktree — not tied to a session yet" })).join("");
           return w.live_procs.length ? "" : `<span class="noproc">no live proc</span>`;
         })()}
           <button class="abtn finish ${finArmed ? "armed" : ""}" data-wt="${esc(w.name)}" ${w.closeout_sent ? 'data-close="1"' : ""}
@@ -553,7 +563,7 @@ function render(st) {
 
   $("other").innerHTML = st.other_procs.length
     ? `<h3>other live agents (outside watched worktrees)</h3>` +
-      st.other_procs.map(p => `<div>⌁ <button class="pidbtn" onclick="focusPid(${p.pid})">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button> ${p.cpu.toFixed(1)}% cpu · up ${esc(p.etime)} · ${esc(p.cwd || "?")}</div>`).join("")
+      st.other_procs.map(p => `<div>⌁ <button class="pidbtn" onclick="focusPid(${p.pid}, '${esc(addr({ cwd: p.cwd }))}')">⌖ ${p.pid}${p.tty ? ` <span class="tt">${esc(p.tty)}</span>` : ""}${p.host ? ` ${esc(p.host)}` : ""}</button> ${p.cpu.toFixed(1)}% cpu · up ${esc(p.etime)} · ${esc(p.cwd || "?")}</div>`).join("")
     : "";
 }
 
@@ -659,10 +669,10 @@ function toast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { t.style.display = "none"; }, 6000);
 }
-async function focusPid(pid) {
+async function focusPid(pid, ident) {
   toast(`⌖ locating pid ${pid}…`);
   try {
-    const r = await fetch(`/api/focus?pid=${pid}`);
+    const r = await fetch(`/api/focus?pid=${pid}${ident ? "&" + ident : ""}`);
     const res = await r.json();
     toast((res.ok ? "" : "✗ ") + res.message);
   } catch (e) { toast("✗ focus request failed"); }
@@ -700,7 +710,11 @@ function openChat(key) {
   const r = REG[key];
   if (!r) return;
   missionOpen = false;   // the drawer is the chat's now; don't rebuild its footer
-  chatCtx = { key, account: r.s.account, sid: r.s.sid };
+  // the SAME identity the read path uses ({account, sid}) now also addresses
+  // the write path — that asymmetry was the bug (ADR 0008). `wt` and `own`
+  // ride along so a send at a terminal other than this session's own still
+  // names a durable place instead of a bare pid.
+  chatCtx = { key, account: r.s.account, sid: r.s.sid, wt: r.wt, own: r.s.pid };
   $("dtitle").textContent = `${r.wt} · [${r.s.account}]`;
   $("dsub").textContent = r.s.topic || r.s.sid;
   const procs = reachableProcs(r.procs);
@@ -739,11 +753,25 @@ async function loadChatMsgs() {
   } catch (e) {}
   chatTimer = setTimeout(loadChatMsgs, 5000);
 }
-async function sendToPid(pid, text) {
+// `pid` is a hint the server checks; `ident` is what it actually resolves.
+// Sending a pid on its own is refused ({error:"unaddressed"}) rather than
+// delivered to whoever holds that number now.
+async function sendTo(pid, ident, text) {
   const r = await fetch("/api/send", { method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pid, text }) });
+    body: JSON.stringify({ ...ident, pid, text }) });
   return r.json();
+}
+// The address for one target inside a card. The session's OWN terminal is
+// addressed by sid — the strongest handle there is, since the server re-pairs
+// the sid to whatever process serves it at send time. Any other terminal the
+// user picked out of the target list is addressed by the worktree it lives in,
+// with the pane/tty it was picked on as corroborators.
+function chatAddr(pid) {
+  const p = (REG[chatCtx.key] || { procs: [] }).procs.find(x => x.pid === pid) || {};
+  const own = pid === chatCtx.own;
+  return { ...(own ? { sid: chatCtx.sid, account: chatCtx.account } : {}),
+           worktree: chatCtx.wt, tmux: p.tmux || null, tty: p.tty || null };
 }
 async function sendChat() {
   const text = $("chatText").value.trim();
@@ -754,7 +782,7 @@ async function sendChat() {
   $("chatText").value = "";
   $("dbody").insertAdjacentHTML("beforeend", `<div class="msg you">${esc(text)}</div>`);
   $("dbody").scrollTop = $("dbody").scrollHeight;
-  const res = await sendToPid(pid, text);
+  const res = await sendTo(pid, chatAddr(pid), text);
   toast((res.ok ? "✓ " : "✗ ") + res.message);
 }
 
@@ -820,8 +848,14 @@ document.addEventListener("click", async (ev) => {
   if (!procs.length) { toast("✗ no scriptable terminal for this worktree"); return; }
   // resume the session's own terminal, not just the worktree's first one
   const own = r.procs.find(p => p.pid === r.s.pid && p.reachable);
+  const t = own || procs[0];
   toast("▶ sending continue…");
-  const res = await sendToPid((own || procs[0]).pid, "continue");
+  // 'continue' typed at the wrong agent is an injected instruction, so this
+  // button carries the strongest address it has: the sid when the target is
+  // this session's own terminal, the worktree otherwise.
+  const res = await sendTo(t.pid, {
+    ...(own ? { sid: r.s.sid, account: r.s.account } : {}),
+    worktree: r.wt, tmux: t.tmux || null, tty: t.tty || null }, "continue");
   toast((res.ok ? "✓ resumed — " : "✗ ") + res.message);
 });
 // Every render rebuilds the buttons in their neutral "▶ resume" state, so the

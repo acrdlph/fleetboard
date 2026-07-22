@@ -99,7 +99,7 @@ objections have already been considered and answered there.
 | [0005](adr/0005-sse-on-threadinghttpserver.md) | SSE on the existing ThreadingHTTPServer — no rewrite | accepted, **verified** |
 | [0006](adr/0006-observation-is-continuous.md) | Observation becomes continuous and client-independent | accepted |
 | [0007](adr/0007-hooks-as-first-class-signal.md) | Claude Code hooks as a first-class signal source | accepted in principle |
-| [0008](adr/0008-identity-addressed-mutations.md) | Mutations addressed by durable identity, never by pid | accepted, **fixes a live bug** |
+| [0008](adr/0008-identity-addressed-mutations.md) | Mutations addressed by durable identity, never by pid | accepted, **implemented** (`orchestra/identity.py`) |
 | [0009](adr/0009-api-v1.md) | The versioned API starts at `/api/v1` | accepted |
 | [0011](adr/0011-measurement-supersedes-the-design-doc.md) | Where ENGINE.md and measurement disagree, measurement wins | accepted |
 

@@ -326,7 +326,18 @@ def fire_resume(key):
 
     msg = config.CFG.get("resume_message", "continue")
     if proc and proc.get("reachable"):
-        res = terminal.send_to_process(proc["pid"], msg)
+        # `proc` came out of `observer.cached_state()` — an ADVISORY snapshot,
+        # up to a whole sweep old, and older still by the time the limit check
+        # above has run. Its pid is a hint and nothing more: the send is
+        # addressed by the sid this schedule was armed for, re-resolved against
+        # a live process table at the instant it types (ADR 0008). The tty and
+        # tmux pane the snapshot saw ride along as corroborators, so a pid that
+        # both recycled AND landed on this session's pairing still has to have
+        # reproduced the window it was in. A refusal is not fatal here — it
+        # falls through to the tmux path below, which targets the sid exactly.
+        res = terminal.send_to_process(
+            proc["pid"], msg, sid=sid, account=account, worktree=worktree,
+            tmux=proc.get("tmux"), tty=proc.get("tty"))
         if res.get("ok"):
             return _resume_set(key, status="done", fired_at=now,
                                message=f"sent '{msg}' — {res['message']}")

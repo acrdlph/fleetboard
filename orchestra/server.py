@@ -21,10 +21,23 @@ readable.
 
 import json
 import re
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
 from . import (config, gitrepo, limits, observer, terminal, chat, dispatch,
                resume, finish)
+
+
+def _query(path):
+    """Query string -> {key: first value}, percent-decoded.
+
+    The older routes here read one parameter each with a `re.search`, which is
+    fine for one. `/api/focus` now carries a whole identity (ADR 0008) — a
+    worktree name, a cwd, a tmux target — and those contain slashes, spaces and
+    non-ASCII, none of which survive being matched out of a raw path.
+    """
+    qs = urllib.parse.urlsplit(path).query
+    return {k: v[0] for k, v in urllib.parse.parse_qs(qs).items() if v}
 
 
 # ------------------------------------------------------------------- server
@@ -37,8 +50,14 @@ class Handler(BaseHTTPRequestHandler):
                                "resumes": resume.resume_public()}).encode()
             ctype = "application/json"
         elif self.path.startswith("/api/focus"):
+            q = _query(self.path)
             m = re.search(r"pid=(\d+)", self.path)
-            result = terminal.focus_process(int(m.group(1))) if m else {"ok": False, "message": "missing pid"}
+            # the pid is a hint; wt/sid/cwd/tmux/tty are the address (ADR 0008)
+            result = terminal.focus_process(
+                int(m.group(1)) if m else None,
+                sid=q.get("sid"), account=q.get("account"),
+                worktree=q.get("wt"), cwd=q.get("cwd"),
+                tmux=q.get("tmux"), tty=q.get("tty"))
             body = json.dumps(result).encode()
             ctype = "application/json"
         elif self.path.startswith("/api/topology"):
@@ -101,7 +120,16 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/resume/cancel"):
             result = resume.cancel_resume(payload.get("worktree"), payload.get("sid"))
         elif self.path.startswith("/api/send"):
-            result = terminal.send_to_process(int(payload.get("pid") or 0), payload.get("text") or "")
+            # {pid, text} was the whole request once, and that was the bug: the
+            # drawer captured a pid on open and posted it minutes later, so a
+            # recycled pid typed the reply into a different agent (ADR 0008).
+            # The identity the drawer already uses to READ the conversation now
+            # travels with the write, and the pid is only a hint.
+            result = terminal.send_to_process(
+                int(payload.get("pid") or 0), payload.get("text") or "",
+                sid=payload.get("sid"), account=payload.get("account"),
+                worktree=payload.get("worktree"), cwd=payload.get("cwd"),
+                tmux=payload.get("tmux"), tty=payload.get("tty"))
         elif self.path.startswith("/api/finish"):
             result = finish.start_finish(payload.get("worktree") or "")
         elif self.path.startswith("/api/dispatch"):

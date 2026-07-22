@@ -135,6 +135,21 @@ def _reachable(p):
         p.get("host") in ("Terminal", "iTerm2") and p.get("tty"))
 
 
+def _addr(wt_name, p):
+    """The durable address of this card's live agent, for `send_to_process`.
+
+    finish is already identity-addressed at the front door — `/api/finish`
+    names a worktree, never a pid — but it then picks a process out of its own
+    `claude_processes()` scan and types at it, and between that scan and the
+    keystroke sit a `git fetch`, a merge-base, a status and (on the nudge path)
+    a transcript scan. Seconds, unattended, with an exit or a closeout brief on
+    the other end. So the worktree travels down with the pid and the send
+    re-resolves it (ADR 0008): the process must still be a live claude, still
+    in this worktree, still in the pane and on the tty this scan saw.
+    """
+    return {"worktree": wt_name, "tmux": p.get("tmux_target"), "tty": p.get("tty")}
+
+
 def start_finish(wt_name):
     """One button, tiered by what's actually left to do:
     live agent -> type a brief at it — the slim one if the branch already
@@ -163,7 +178,7 @@ def start_finish(wt_name):
     live = next((p for p in mine if _reachable(p)), None)
     if live:
         if landed and not porcelain:
-            res = terminal.send_to_process(live["pid"], "/exit")
+            res = terminal.send_to_process(live["pid"], "/exit", **_addr(wt_name, live))
             if res["ok"]:
                 _closeouts.pop(wt_name, None)
                 observer._cache["t"] = 0.0    # button reverts on the next poll
@@ -197,7 +212,7 @@ def start_finish(wt_name):
                     block += f"\n… and {len(porcelain) - len(files)} more"
                 nudge = CLOSEOUT_NUDGE_TEXT.format(
                     left=left, trunk=trunk, files=(block + "\n") if block else "")
-                res = terminal.send_to_process(live["pid"], nudge)
+                res = terminal.send_to_process(live["pid"], nudge, **_addr(wt_name, live))
                 if not res["ok"]:
                     return {"ok": False, "mode": "nudge", "message": res["message"]}
                 _closeouts[wt_name] = time.time()   # restart the "sent Xm ago"
@@ -231,7 +246,8 @@ def start_finish(wt_name):
                     f"the agent {ago}; if it looks stuck, ✉ chat with it. "
                     "✕ close works once the landing verifies."}
         brief = (SLIM_CLOSEOUT_TEXT if landed else CLOSEOUT_TEXT)
-        res = terminal.send_to_process(live["pid"], brief.format(trunk=trunk))
+        res = terminal.send_to_process(live["pid"], brief.format(trunk=trunk),
+                                       **_addr(wt_name, live))
         if not res["ok"]:
             return {"ok": False, "mode": "slim" if landed else "brief",
                     "message": res["message"]}
