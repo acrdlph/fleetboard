@@ -52,7 +52,9 @@ from .limits import (cached_limits, account_reserve, _model_remaining,
                      model_candidates, set_reserve, limits_by_account,
                      demo_limits, _limit_active_until, _cclimits_bin,
                      LIMITS_TTL_S, _limits)
-from .observer import collect_state, cached_state, demo_state, _cache, STATE_TTL_S
+from .observer import (collect_state, cached_state, demo_state, _cache,
+                       Observer, Snapshot, start_observer, stop_observer,
+                       STATE_TTL_S)
 from .terminal import focus_process, send_to_process, _osa_escape
 from .chat import read_chat
 from .finish import (start_finish, _park_on_trunk, _reachable, _closeouts,

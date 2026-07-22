@@ -146,6 +146,7 @@ def start_finish(wt_name):
             if res["ok"]:
                 _closeouts.pop(wt_name, None)
                 observer._cache["t"] = 0.0    # button reverts on the next poll
+                observer.nudge("finish/exit")  # …and the sweep sees it now
             return {"ok": res["ok"], "mode": "exit", "message":
                     "already landed — sent /exit to close the terminal"
                     if res["ok"] else res["message"]}
@@ -180,6 +181,7 @@ def start_finish(wt_name):
                     return {"ok": False, "mode": "nudge", "message": res["message"]}
                 _closeouts[wt_name] = time.time()   # restart the "sent Xm ago"
                 observer._cache["t"] = 0.0           # clock + re-arm the 60s guard
+                observer.nudge("finish/nudge")
                 # `left`/`files` ride along so the card note can say what's
                 # blocked without parsing the human message
                 return {"ok": True, "mode": "nudge", "left": left,
@@ -214,6 +216,7 @@ def start_finish(wt_name):
                     "message": res["message"]}
         _closeouts[wt_name] = time.time()
         observer._cache["t"] = 0.0   # show ✕ close on the next poll, not in 4s
+        observer.nudge("finish/brief")
         return {"ok": True, "mode": "slim" if landed else "brief", "message":
                 ("already landed — slim brief sent (tidy scratch and park, "
                  "no re-merge)" if landed else

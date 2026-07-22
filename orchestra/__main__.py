@@ -10,7 +10,7 @@ import sys
 import threading
 from http.server import ThreadingHTTPServer
 
-from orchestra import config, resume, server
+from orchestra import config, observer, resume, server
 
 
 def main():
@@ -22,6 +22,12 @@ def main():
     if not config.DEMO:
         resume.load_resumes()
         threading.Thread(target=resume.resume_loop, daemon=True).start()
+        # The sweep starts HERE and nowhere else. Importing the package must
+        # never start a thread: the test suite imports it constantly, and a
+        # background thread shelling out to git and ps during a test run is its
+        # own kind of hell. Not calling this degrades to exactly the old lazy
+        # collect-on-request — that is the rollback story, one line long.
+        observer.start_observer()
     httpd = ThreadingHTTPServer((config.CFG["host"], config.CFG["port"]),
                                 server.Handler)
     mode = " (demo data)" if config.DEMO else ""

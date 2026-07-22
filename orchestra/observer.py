@@ -21,12 +21,26 @@ Patch `observer.cached_state`, never the facade copy.
 
 `demo_state` is fictional data with the exact shape of `collect_state`, for
 screenshots. `cached_state` is the one entry point the server calls.
+
+`Observer` is the publish point (ENGINE.md §2.5): one perpetual thread that
+sweeps on its own cadence and publishes an immutable, versioned `Snapshot`.
+It exists because observation today happens only when a client asks — with no
+browser attached nothing computes, nothing is detected, and no notification
+can ever fire. That is structural, not a tuning problem.
+
+Nothing starts it on import. `python3 -m orchestra` starts it; a test that
+imports the package gets exactly today's lazy behaviour, and so does a
+deployment that simply never calls `start_observer()` — that is the rollback.
 """
 
 import getpass
 import os
 import re
+import sys
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field, replace
 
 from . import config, gitrepo, procs, transcripts, status, limits
 
@@ -36,17 +50,38 @@ _cache = {"t": 0.0, "state": None}
 
 # ---------------------------------------------------------------- collectors
 
-def collect_state():
+def collect_state(fresh=None):
+    """Compose the board. `fresh` is an optional out-parameter.
+
+    Pass a dict and the collector stamps it `kind -> wall clock of that kind's
+    last SUCCESSFUL probe` (ENGINE.md §3.3): one `generated_at` cannot say that
+    git is 47s stale because a fetch wedged. Left None it costs nothing and this
+    function behaves exactly as it did before there was an Observer — which is
+    what keeps `python3 tests/characterize.py` byte-identical across this change.
+    """
+    def stamp(kind):
+        if fresh is not None:
+            fresh[kind] = time.time()
+
     now = time.time()
     worktrees = gitrepo.discover_worktrees()
+    stamp("worktrees")
     # `all_procs`, not `procs`: a local of that name would shadow the module.
     all_procs = procs.claude_processes()
+    stamp("procs")
     sessions = transcripts.scan_sessions(worktrees, all_procs, now)
+    stamp("transcripts")
 
     # An agent parked at the prompt on an exhausted account isn't "your turn" —
     # it's out of juice. Joined from the cclimits cache (populated lazily by
     # /api/limits; never fetched on the state path).
     acct_limits = limits.limits_by_account()
+    if fresh is not None and limits._limits.get("data"):
+        # the cclimits CACHE clock, not `now`. Nothing on the state path
+        # probes cclimits (by design — it shells out and costs seconds), so
+        # stamping `now` here would claim a freshness this data does not have.
+        # This is the one kind that is genuinely hours behind the others.
+        fresh["limits"] = limits._limits["t"]
     limit_re = re.compile(r"out of usage credits|(reached|hit) your .{0,30}limit", re.I)
     rank = {"needs_input": 0, "limit": 1, "blocked": 2, "working": 3, "waiting": 4, "ended": 5}
     for ss in sessions.values():
@@ -96,6 +131,7 @@ def collect_state():
     # one fan-out for every worktree's git state, rather than one blocking call
     # per card — this path is dominated by waiting on `git`, not by our own work
     git_by_root = gitrepo.git_info_many([w["git"] for w in worktrees])
+    stamp("git")
 
     cards = []
     for w in worktrees:
@@ -164,6 +200,340 @@ def collect_state():
     }
 
 
+
+# ------------------------------------------------------- the publish point
+
+# Cadences, §2.5. IDLE_S deviates from the document's 1.0 and the reason is
+# measured: §2.5's 1.0 assumes the within-sweep git memo it paces with git_s,
+# which does not exist yet, so every sweep is a full collect — 600 ms against
+# the live fleet here (14 worktrees, 41 sessions). At 1.0 s that is a ~38 %
+# duty cycle, forever, on battery, with nobody watching. At 3.0 s it is ~17 %,
+# barely more than the ~12 % an open tab already costs at today's 5 s poll,
+# and it keeps `_cache` warm inside STATE_TTL_S so /api/state never collects.
+# Tighten it when the memo lands and a sweep stops costing 600 ms.
+IDLE_S = 3.0        # cadence with no evidence of change
+HOT_S = 0.15        # floor between sweeps after a nudge
+# A cold sweep bypasses the parse memo (§4.3) and counts the disagreements as
+# drift. There is no memo yet, so a cold sweep is identical to a warm one and
+# `drift` is honestly always 0 — the clock and the counter are here so step 4
+# has somewhere to land, not because they do anything today.
+RECONCILE_S = 60.0
+MAX_STALE_S = 8.0   # never wait longer than this between sweeps
+HIST = 512          # version/changed-keys ring, §3.5
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """One completed sweep, immutable and versioned (ENGINE.md §3.1).
+
+    ADVISORY. Safe to render, to diff, to notify from. Never a mutation
+    precondition — a mutation validates against the world at the instant it acts.
+
+    `cards` is name -> card, in the board's severity order (dicts preserve
+    insertion order). It is the view the version is diffed against; the wire
+    payload still travels as `cached_state()`'s list, so a duplicate worktree
+    name — which the rest of the app already treats as impossible, `_closeouts`
+    and `/api/finish` both key on it — costs delta precision, never a card.
+    """
+    v: int
+    at: float
+    cards: dict
+    other_procs: list
+    counts: dict
+    freshness: dict = field(default_factory=dict)
+    drift: int = 0
+    sweep_ms: float = 0.0
+
+
+# The stopwatches. Three card fields move on their own with nothing in the
+# world having changed: `age_s` is `int(now - last_write_at)` and ticks once a
+# second, `etime` is the same shape off `ps`, and `cpu` is a resampled
+# percentage. All three ride the wire — the board draws them — but none may
+# decide a version. Left in the diff, `v` would tick once a second forever on
+# any box with a live agent, deltas would degenerate to full snapshots, and the
+# notifier would fire on nothing. §3.2 says diff the composed view; this says
+# the composed view is the card minus its stopwatches.
+#
+# Nothing is lost by removing them: every one has an ABSOLUTE twin already in
+# the same object — `last_write_at` beside `age_s` (transcripts.py:308) — and
+# `status`, which is what a threshold crossing actually means, keeps its vote.
+_UNDIFFED_PROC_KEYS = ("cpu", "etime")
+_UNDIFFED_SESSION_KEYS = ("age_s",)
+
+
+def _strip(items, keys):
+    return [{k: v for k, v in it.items() if k not in keys} for it in items]
+
+
+def _diffable(card):
+    """The card as the version sees it: identical but for the stopwatches."""
+    live, sess = card.get("live_procs"), card.get("sessions")
+    if not live and not sess:
+        return card
+    out = dict(card)
+    if live:
+        out["live_procs"] = _strip(live, _UNDIFFED_PROC_KEYS)
+    if sess:
+        out["sessions"] = _strip(sess, _UNDIFFED_SESSION_KEYS)
+    return out
+
+
+def _diffable_procs(plist):
+    return _strip(plist, _UNDIFFED_PROC_KEYS)
+
+
+class Observer:
+    """Owns the ONLY perpetual read loop. Never mutates the world.
+
+    Threading model (§2.5): exactly one thread, `observer-sweep`, reusing the
+    ThreadPoolExecutor fan-out already inside `collect_state`. One Condition
+    guards `_snap`/`_version`. Readers take no lock — `snapshot()` is a single
+    attribute read of a frozen object.
+    """
+
+    def __init__(self, *, idle_s=IDLE_S, hot_s=HOT_S,
+                 reconcile_s=RECONCILE_S, max_stale_s=MAX_STALE_S):
+        # §2.5 also lists git_s and limits_s. Neither is implemented here and
+        # neither is accepted: git_s paces a WITHIN-sweep memo that does not
+        # exist yet, and limits_s would start polling cclimits from the sweep —
+        # that is step 7. A parameter that silently does nothing is worse than
+        # an absent one.
+        self.idle_s, self.hot_s = idle_s, hot_s
+        self.reconcile_s, self.max_stale_s = reconcile_s, max_stale_s
+        self._cv = threading.Condition()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = None
+        self._snap = None
+        self._version = 0
+        self._hist = deque(maxlen=HIST)     # (version, changed card keys)
+        self._dcards, self._dother = {}, []  # the published view, stopwatches out
+        self._fresh = {}
+        self._drift = 0                     # §4.3; no memo to disagree with yet
+        self._sweep_ms = 0.0
+        self._sweeps = 0
+        self._publishes = 0
+        self._errors = 0
+        self._last_error = None
+        self._cold_at = 0.0
+        self._nudge_at = 0.0
+        self._nudges = 0
+        self._nudge_reason = None
+        self._logged_error_at = 0.0
+
+    # ------------------------------------------------------------ lifecycle
+
+    @property
+    def running(self):
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
+    def start(self):
+        with self._cv:
+            if self.running:
+                return self
+            self._stop.clear()
+            self._wake.clear()
+            self._thread = threading.Thread(target=self._loop,
+                                            name="observer-sweep", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self, timeout=5.0):
+        self._stop.set()
+        self._wake.set()
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout)
+        self._thread = None
+
+    def _loop(self):
+        while not self._stop.is_set():
+            started = time.time()
+            cold = (started - self._cold_at) >= self.reconcile_s
+            try:
+                self.sweep(cold=cold)
+            except Exception as exc:               # noqa: BLE001 — a wedged
+                self._errors += 1                  # probe must not kill the loop
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                if started - self._logged_error_at > 60:
+                    self._logged_error_at = started
+                    print(f"orchestra: sweep failed — {self._last_error}",
+                          file=sys.stderr)
+            if self._stop.is_set():
+                break
+            nxt = started + self.idle_s
+            if self._nudge_at > started:        # nudged while we were sweeping
+                nxt = min(nxt, self._nudge_at + self.hot_s)
+            self._wake.clear()
+            if self._wake.wait(min(max(0.0, nxt - time.time()), self.max_stale_s)):
+                # woken by a nudge: honour the hot floor so a burst of
+                # mutations cannot turn the loop into a spin
+                floor = started + self.hot_s - time.time()
+                if floor > 0:
+                    self._stop.wait(floor)
+
+    # ----------------------------------------------------------- the sweep
+
+    def sweep(self, cold=False):
+        """One full collect, published. Also refreshes the request-path cache."""
+        t_before, s_before = _cache["t"], _cache["state"]
+        started = time.time()
+        t0 = time.perf_counter()
+        fresh = {}
+        state = collect_state(fresh=fresh)
+        ms = (time.perf_counter() - t0) * 1000.0
+        self._sweeps += 1
+        if cold:
+            self._cold_at = started
+        # Compare-and-swap, never a blind write. A mutation that parked
+        # `_cache["t"] = 0.0` while this sweep was in flight means the state we
+        # just collected predates it; dropping our write leaves the next request
+        # to collect synchronously — exactly what happens today.
+        if _cache["t"] == t_before and _cache["state"] is s_before:
+            _cache["state"], _cache["t"] = state, started
+        return self.publish(state, fresh=fresh, sweep_ms=ms)
+
+    def publish(self, state, fresh=None, sweep_ms=None):
+        """Turn one `collect_state()` result into a snapshot.
+
+        `v` bumps ONLY when the composed view differs (§3.2). A sweep that finds
+        nothing new refreshes `at` and `freshness` and publishes no new version:
+        the data is still true, just not new. Diffing is by EQUALITY over the
+        composed cards, never a fact-key -> card-key dependency map — a map is a
+        second source of truth that drifts from the composition the first time
+        somebody edits the pairing heuristic.
+        """
+        now = state.get("generated_at") or time.time()
+        cards = {c["name"]: c for c in state.get("worktrees", [])}
+        other = list(state.get("other_procs", []))
+        counts = dict(state.get("counts", {}))
+        with self._cv:
+            prev = self._snap
+            if prev is not None and now < prev.at:
+                return prev      # an older collect landing late — never regress
+            if fresh:
+                self._fresh.update(fresh)
+            if sweep_ms is not None:
+                self._sweep_ms = sweep_ms
+            self._publishes += 1
+            new_d = {k: _diffable(c) for k, c in cards.items()}
+            new_o = _diffable_procs(other)
+            if (prev is not None and new_d == self._dcards
+                    and counts == prev.counts and new_o == self._dother):
+                # no version bump — but `at` and `freshness` are precisely the
+                # fields that say "still true as of now", so they do move, and
+                # the cards carry the current stopwatch readings.
+                self._snap = replace(prev, at=now, cards=cards, other_procs=other,
+                                     freshness=dict(self._fresh),
+                                     sweep_ms=self._sweep_ms)
+                return self._snap
+            old_d = self._dcards if prev is not None else {}
+            changed = [k for k, c in new_d.items() if old_d.get(k) != c]
+            changed += [k for k in old_d if k not in new_d]
+            self._version += 1
+            self._hist.append((self._version, tuple(changed)))
+            self._dcards, self._dother = new_d, new_o
+            self._snap = Snapshot(self._version, now, cards, other, counts,
+                                  dict(self._fresh), self._drift, self._sweep_ms)
+            self._cv.notify_all()
+            return self._snap
+
+    # ------------------------------------------------------------ read API
+
+    def snapshot(self):
+        """The most recent completed sweep, or None before the first one."""
+        return self._snap
+
+    def wait_for(self, after, timeout=30.0):
+        """Block until a version newer than `after` is published. None on timeout."""
+        deadline = time.time() + timeout
+        with self._cv:
+            while self._version <= after:
+                left = deadline - time.time()
+                if left <= 0:
+                    return None
+                self._cv.wait(left)
+            return self._snap
+
+    def delta_since(self, n):
+        """What changed for a client at version `n` (§3.5).
+
+        An unknown, too-old or ahead-of-us `n` gets a full snapshot; that is the
+        entire resync path. Nothing consumes this yet — SSE is step 3 — but the
+        envelope carries `type` from day one, so if deltas prove worthless
+        deleting them removes lines and no concept.
+        """
+        snap = self._snap
+        if snap is None:
+            return None
+        hist = tuple(self._hist)
+        if n <= 0 or n > snap.v or not hist or n < hist[0][0] - 1:
+            return {"type": "snapshot", "v": snap.v, "at": snap.at,
+                    "cards": snap.cards, "counts": snap.counts,
+                    "other_procs": snap.other_procs, "freshness": snap.freshness}
+        keys = set()
+        for ver, ks in hist:
+            if ver > n:
+                keys.update(ks)
+        return {"type": "delta", "v": snap.v, "base": n, "at": snap.at,
+                "cards": {k: snap.cards.get(k) for k in keys},   # None = removed
+                "counts": snap.counts, "freshness": snap.freshness}
+
+    def stats(self):
+        snap = self._snap
+        return {"running": self.running, "version": self._version,
+                "at": snap.at if snap else None, "sweeps": self._sweeps,
+                "publishes": self._publishes, "sweep_ms": round(self._sweep_ms, 1),
+                "drift": self._drift, "cold_at": self._cold_at,
+                "nudges": self._nudges, "errors": self._errors,
+                "last_error": self._last_error,
+                "freshness": dict(self._fresh),
+                "idle_s": self.idle_s, "hot_s": self.hot_s}
+
+    # ----------------------------------------------------------- write API
+
+    def nudge(self, reason=""):
+        """Evidence, never a command: something changed, sweep sooner.
+
+        Never blocks, never fails, never a source of truth — a dropped nudge
+        costs latency and nothing else.
+        """
+        try:
+            self._nudge_at = time.time()
+            self._nudge_reason = reason
+            self._nudges += 1
+            self._wake.set()
+        except Exception:                          # noqa: BLE001
+            pass
+
+
+# The process-wide sweep. Rebound by `start_observer`, so it is deliberately
+# NOT re-exported on the facade (ADR 0010: a facade copy of a rebound global is
+# a patch that lies). Reach it as `observer._observer`.
+_observer = None
+
+
+def start_observer(**kw):
+    """Start the perpetual sweep. Called from `python3 -m orchestra`, never on
+    import — a background thread doing real subprocess work during a test run is
+    its own kind of hell, and tests import this package constantly."""
+    global _observer
+    if _observer is None:
+        _observer = Observer(**kw)
+    return _observer.start()
+
+
+def stop_observer(timeout=5.0):
+    if _observer is not None:
+        _observer.stop(timeout)
+
+
+def nudge(reason=""):
+    """Module-level convenience: a no-op when no sweep thread is running, so
+    every mutation path can call it unconditionally."""
+    if _observer is not None:
+        _observer.nudge(reason)
 
 
 # --------------------------------------------------------------- demo state
@@ -237,10 +607,26 @@ def demo_state():
 
 
 def cached_state():
+    """The one entry point the server calls.
+
+    With the sweep thread running this is O(1): the sweep refreshes `_cache`
+    faster than STATE_TTL_S expires, so N tabs no longer trigger N concurrent
+    collections. With no sweep thread — the rollback, and every test run — the
+    branch below is the whole function, byte for byte what it was before.
+
+    The branch is also the freshness guarantee after a mutation: the act layer
+    parks `_cache["t"] = 0.0`, and that still forces one synchronous collect on
+    the very next request rather than making the user wait out a sweep.
+    """
     if config.DEMO:
         return demo_state()
     now = time.time()
     if _cache["state"] is None or now - _cache["t"] > STATE_TTL_S:
-        _cache["state"] = collect_state()
-        _cache["t"] = now
+        fresh = {}
+        state = collect_state(fresh=fresh)
+        _cache["state"], _cache["t"] = state, now
+        if _observer is not None:
+            # a collect is a collect: publish it, or the version and the
+            # freshness map would silently miss everything a mutation caused.
+            _observer.publish(state, fresh=fresh)
     return _cache["state"]
