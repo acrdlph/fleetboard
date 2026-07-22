@@ -753,7 +753,12 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                 s["age_s"], alive, s["pending_tools"],
                 s["pending_workflows"] + s["pending_bg_agents"],
                 skip_perms, config.CFG["working_s"], shell_n,
-                turn_ended=s.get("turn_ended", False))
+                turn_ended=s.get("turn_ended", False),
+                # the only clock left in the ladder, and the only one with a
+                # measured cost behind it (config.py). `working_s` still backs
+                # the approval grace and the orphan grace, which are different
+                # questions and are not this step's to move.
+                quiet_s=config.CFG["quiet_s"])
             s["status"] = sess_status
             if tool_running:
                 s["tool_running"] = True

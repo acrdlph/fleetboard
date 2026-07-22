@@ -87,7 +87,8 @@ class _Fleet(unittest.TestCase):
 
         # point orchestra at the fixtures; neutralize live-system inputs
         self._save = {k: fb.CFG.get(k) for k in
-                      ("roots", "homes", "pattern", "exclude_accounts", "reserve_percent")}
+                      ("roots", "homes", "pattern", "exclude_accounts",
+                       "reserve_percent", "quiet_s", "working_s")}
         self._demo, self._procs, self._cl = (fb.config.DEMO,
                                              fb.procs.claude_processes,
                                              fb.limits.cached_limits)
@@ -443,6 +444,87 @@ class TestTurnEndedIsPositional(_Fleet):
         self.assertTrue(s["turn_ended"])
         self.assertEqual(s["pending_bg_agents"], 1)
         self.assertEqual(s["status"], "working")
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestTheQuietTimerIsWired(_Fleet):
+    """`CFG["quiet_s"]` against real bytes on disk — the 16 % of sessions with
+    no end-of-turn marker, which are the only ones a timer still decides.
+
+    The unit tests pin the ladder; this pins that the number the ladder reads
+    is the CONFIGURED one. `classify_session` takes `working_s` and `quiet_s`
+    as separate arguments precisely so they can diverge, and a call site that
+    passed `working_s` for both would be invisible to every test above.
+    """
+
+    def _proc(self):
+        fb.procs.claude_processes = lambda **_: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": "claude", "account": None,
+            "tmux_target": None, "shells": 0}]
+
+    def _aged(self, fp, secs):
+        t = time.time() - secs
+        os.utime(fp, (t, t))
+        fb.memo_clear()
+        fb._cache["state"] = None
+        return fb.collect_state()["worktrees"][0]["sessions"][0]
+
+    def _unmarked(self):
+        # deliberately NO turn_end: this is the residual the timer covers
+        return write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("do a thing"), assistant_msg(text="thinking about it")])
+
+    def test_a_live_agent_gone_quiet_is_the_users_turn_at_quiet_s(self):
+        fp = self._unmarked()
+        self._proc()
+        q = fb.CFG["quiet_s"]
+        self.assertEqual(self._aged(fp, q - 5)["status"], "working")
+        self.assertEqual(self._aged(fp, q + 5)["status"], "waiting")
+        # and the number is the CONFIGURED one, not working_s wearing its name
+        self.assertLess(q, fb.CFG["working_s"])
+        self.assertEqual(self._aged(fp, fb.CFG["working_s"] - 5)["status"], "waiting")
+
+    def test_lowering_the_key_lowers_the_threshold(self):
+        fp = self._unmarked()
+        self._proc()
+        fb.CFG["quiet_s"] = 10
+        self.assertEqual(self._aged(fp, 9)["status"], "working")
+        self.assertEqual(self._aged(fp, 11)["status"], "waiting")
+
+    def test_a_subagent_write_resets_the_quiet_clock(self):
+        # EXISTING behaviour, and the reason the timer is safe to shorten:
+        # `last_write_at` is max(mtime, sub_mtime), so a session whose main
+        # transcript has been idle for ten quiet windows while a workflow
+        # writes under <session-id>/ is still working. Shortening quiet_s
+        # multiplies the cost of getting this wrong tenfold.
+        fp = self._unmarked()
+        self._proc()
+        old = time.time() - 10 * fb.CFG["quiet_s"]
+        os.utime(fp, (old, old))
+        sub = fp.with_suffix("")
+        sub.mkdir()
+        sf = sub / "agent-1.jsonl"
+        sf.write_text(json.dumps(assistant_msg(text="subagent still going")) + "\n")
+        fresh = time.time() - 1
+        os.utime(sf, (fresh, fresh))
+        fb.memo_clear()
+        fb._cache["state"] = None
+        s = fb.collect_state()["worktrees"][0]["sessions"][0]
+        self.assertAlmostEqual(s["last_write_at"], fresh, places=3)
+        self.assertEqual(s["status"], "working")
+
+    def test_the_orphan_grace_still_covers_the_whole_working_window(self):
+        # No live process — a just-exec'd agent, or a lagging proc read. ENDED
+        # feeds worktree-FREE feeds dispatch targeting, so this one keeps the
+        # LONGER window on purpose: quiet_s must not make a busy worktree look
+        # free. (`free_worktrees` is what /api/dispatch picks from.)
+        fp = self._unmarked()
+        fb.procs.claude_processes = lambda **_: []
+        s = self._aged(fp, fb.CFG["quiet_s"] + 5)
+        self.assertEqual(s["status"], "working")
+        fb._cache["state"] = None
+        self.assertEqual(fb.collect_state()["free_worktrees"], [])
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")

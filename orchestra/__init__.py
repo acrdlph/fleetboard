@@ -39,7 +39,8 @@ from . import (config, shell, status, gitrepo, procs, transcripts, limits,
 # `orchestra.config.DEMO`.
 from .config import CFG, HOME, HERE, load_config, account_label
 from .shell import run
-from .status import classify_session, closeout_step, card_availability
+from .status import (classify_session, closeout_step, card_availability,
+                     settle, LOUDER, FLICKER_DWELL_S)
 from .gitrepo import (munge, match_worktree, discover_worktrees, git_info,
                       _base_ref, branch_topology, demo_topology,
                       cached_topology, TOPO_TTL_S, _topo)
@@ -62,7 +63,7 @@ from .limits import (cached_limits, account_reserve, _model_remaining,
 from .watcher import (Watcher, WatchSet, build_watch_set, WATCH_MAX_FDS,
                       DEBOUNCE_S, MIN_INTERVAL_S, MAX_WINDOW_S, REBUILD_S)
 from .observer import (collect_state, cached_state, demo_state, _cache,
-                       Observer, Snapshot, GitCadence, start_observer,
+                       Observer, Snapshot, GitCadence, Settler, start_observer,
                        stop_observer, STATE_TTL_S)
 # `resolve` is deliberately NOT re-exported: it is a name generic enough to
 # read as anything at the top level, and the two codes are what callers branch

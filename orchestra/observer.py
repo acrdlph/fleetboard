@@ -63,7 +63,7 @@ _cache = {"t": 0.0, "state": None}
 
 # ---------------------------------------------------------------- collectors
 
-def collect_state(fresh=None, git=None, cold=False):
+def collect_state(fresh=None, git=None, cold=False, settle=None):
     """Compose the board. `fresh` is an optional out-parameter.
 
     Pass a dict and the collector stamps it `kind -> wall clock of that kind's
@@ -85,6 +85,15 @@ def collect_state(fresh=None, git=None, cold=False):
     re-probed, and each disagreement with what a memo would have served is
     counted into `drift`. It costs a full uncached collect once a minute and it
     is what makes the memos honest.
+
+    `settle` is the third seam of the same shape, and the only one that carries
+    memory: `sessions, now -> None`, damping a status that is on its way DOWN
+    (ENGINE.md §6.3(a)). Left None this function is stateless per call, exactly
+    as it has always been — which is what keeps `tests/characterize.py`
+    reproducible and lets every test that calls `collect_state()` bare see the
+    world as it is this instant. The `Observer` passes its own `Settler`, so
+    the hysteresis belongs to the thing that publishes rather than to a module
+    global two callers share.
     """
     def stamp(kind):
         if fresh is not None:
@@ -140,6 +149,14 @@ def collect_state(fresh=None, git=None, cold=False):
                 # trust it even when the cclimits cache is cold/stale
                 s["status"] = "limit"
                 s["limit"] = {"worst": None, "group": None, "resets_at": None}
+
+    # AFTER the limit join and BEFORE anything derived from a status —
+    # handoff, the session sort, availability, severity, counts — so the whole
+    # board is composed from the statuses actually published rather than half
+    # from them and half from the raw ones. `limit` takes part in the ranking
+    # here, which is the point of doing it after the join.
+    if settle is not None:
+        settle(sessions, now)
 
     # Handoff awareness: a limit-hit session whose worktree has a FRESHER live
     # session (typically another account continuing from a handoff doc) is no
@@ -623,6 +640,54 @@ class GitCadence:
                 "git_reuses": self.reuses, "git_drift": self.drift}
 
 
+class Settler:
+    """The anti-flicker memory: `sid -> (published status, adopted at)`.
+
+    `status.settle` is the rule and is pure; this is the state it needs, and it
+    belongs to the `Observer` because the `Observer` is what publishes. One
+    consequence worth being explicit about: with no sweep thread there is no
+    Settler, so a board served purely by `cached_state()` on a browser poll has
+    no hysteresis — the same rollback story as versions, deltas and SSE, and
+    the same reason (nothing is publishing between polls, so there is nothing
+    to flicker between).
+
+    A sid that has left the board is forgotten on the spot. Holding it would
+    make a session that returns 48 h later inherit a status from another day,
+    and the whole rule is about consecutive sweeps.
+
+    `apply` mutates the sessions in place under a lock: the sweep thread and a
+    request thread that fell past `republish_s` can both be inside
+    `collect_state` at once, and they share this dict.
+    """
+
+    def __init__(self, dwell_s=None):
+        self.dwell_s = _cadence("flicker_dwell_s", status.FLICKER_DWELL_S, dwell_s)
+        self._at = {}                  # sid -> (status, adopted at)
+        self._lock = threading.Lock()
+        self.held = 0                  # de-escalations delayed, ever
+
+    def apply(self, sessions, now):
+        with self._lock:
+            seen = set()
+            for ss in sessions.values():
+                for s in ss:
+                    sid = s["sid"]
+                    seen.add(sid)
+                    prev, since = self._at.get(sid, (None, now))
+                    st, since = status.settle(prev, s["status"], now, since,
+                                              self.dwell_s)
+                    self._at[sid] = (st, since)
+                    if st != s["status"]:
+                        self.held += 1
+                        s["status"] = st
+            for gone in [k for k in self._at if k not in seen]:
+                del self._at[gone]
+
+    def stats(self):
+        return {"flicker_dwell_s": self.dwell_s, "settle_held": self.held,
+                "settle_tracked": len(self._at)}
+
+
 class Observer:
     """Owns the ONLY perpetual read loop. Never mutates the world.
 
@@ -634,7 +699,7 @@ class Observer:
 
     def __init__(self, *, idle_s=None, hot_s=None, git_s=None,
                  reconcile_s=None, max_stale_s=None, idle_blind_s=None,
-                 watch=None, watcher_factory=None):
+                 watch=None, watcher_factory=None, dwell_s=None):
         # §2.5 also lists limits_s. It is not implemented and not accepted: it
         # would start polling cclimits from the sweep, which is step 7. A
         # parameter that silently does nothing is worse than an absent one.
@@ -653,6 +718,7 @@ class Observer:
         self.reconcile_s = _cadence("reconcile_s", RECONCILE_S, reconcile_s)
         self.max_stale_s = _cadence("max_stale_s", MAX_STALE_S, max_stale_s)
         self._git = GitCadence(git_s)
+        self._settler = Settler(dwell_s)
         self._cv = threading.Condition()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -793,7 +859,7 @@ class Observer:
         t0 = time.perf_counter()
         fresh = {}
         state = collect_state(
-            fresh=fresh, cold=cold,
+            fresh=fresh, cold=cold, settle=self._settler.apply,
             git=lambda roots: self._git.resolve(roots, cold=cold))
         ms = (time.perf_counter() - t0) * 1000.0
         self._sweeps += 1
@@ -927,7 +993,8 @@ class Observer:
                 # above on its own: the blind cadence when there is no watcher,
                 # and `max_stale_s` if somebody set that below `idle_s`
                 "idle_effective_s": min(self.effective_idle_s, self.max_stale_s),
-                **self._git.stats(), **transcripts.memo_stats(),
+                **self._git.stats(), **self._settler.stats(),
+                **transcripts.memo_stats(),
                 **procs.proc_memo_stats(),
                 **(self._watcher.stats() if self._watcher is not None
                    else {"watching": False})}
@@ -1111,7 +1178,14 @@ def cached_state():
     ttl = obs.republish_s if (obs is not None and obs.running) else STATE_TTL_S
     if _cache["state"] is None or now - _cache["t"] > ttl:
         fresh = {}
-        state = collect_state(fresh=fresh)
+        # …through the sweep's own Settler when there is one. A collect on the
+        # request thread that skipped it would publish an un-damped status and
+        # then leave the sweep's memory disagreeing with what the user was just
+        # shown — two clocks for one status. With no Observer there is no
+        # hysteresis at all, which is the documented rollback.
+        state = collect_state(
+            fresh=fresh,
+            settle=_observer._settler.apply if _observer is not None else None)
         _cache["state"], _cache["t"] = state, now
         if _observer is not None:
             # a collect is a collect: publish it, or the version and the

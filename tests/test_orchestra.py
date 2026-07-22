@@ -251,6 +251,121 @@ class TestTurnEndedBeatsTheClock(unittest.TestCase):
         self.assertEqual(st, "ended")
 
 
+class TestQuietTimerCoversOnlyTheUnexplained(unittest.TestCase):
+    """`quiet_s` — what is left of the 90 s lie once the CLI's own marker has
+    taken 84 % of sessions off the clock. The residual 16 % have no marker, so
+    a timer is the only answer for them, and it is the LAST branch: it may only
+    ever decide a silence NOTHING else explains.
+
+    Every test fixes `working_s` at 90 and `quiet_s` at 45, so a failure names
+    which of the three jobs the old single number was doing has moved.
+    """
+    W, Q = 90, 45
+
+    def _c(self, *a, **kw):
+        kw.setdefault("quiet_s", self.Q)
+        return fb.classify_session(*a, **kw)
+
+    def test_a_quiet_agent_is_the_users_turn_at_quiet_s_not_working_s(self):
+        self.assertEqual(self._c(44, True, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(45, True, [], 0, False, self.W)[0], "waiting")
+        # the control: without quiet_s the same silence is WORKING for 45 s more
+        self.assertEqual(fb.classify_session(45, True, [], 0, False, self.W)[0],
+                         "working")
+
+    def test_delegated_work_is_an_explanation_and_outlasts_any_quiet_timer(self):
+        self.assertEqual(self._c(3600, True, [], 1, False, self.W)[0], "working")
+
+    def test_a_live_shell_is_an_explanation(self):
+        st, tool = self._c(3600, True, [], 0, False, self.W, shells=1)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+
+    def test_a_running_tool_is_an_explanation(self):
+        st, tool = self._c(3600, True, ["Bash"], 0, True, self.W)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+
+    def test_a_pending_question_still_beats_it(self):
+        self.assertEqual(self._c(3600, True, ["AskUserQuestion"], 0, False, self.W)[0],
+                         "needs_input")
+
+    def test_it_does_not_shorten_the_approval_grace(self):
+        # `working_s` still backs block_grace_s: an unresolved tool_use without
+        # --dangerously-skip-permissions is a long tool for 90 s, not BLOCKED
+        # at 45. Tightening THAT is a different question with a different cost.
+        self.assertEqual(self._c(50, True, ["Bash"], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(90, True, ["Bash"], 0, False, self.W)[0], "blocked")
+
+    def test_it_does_not_shorten_the_orphan_grace(self):
+        # ENDED feeds worktree-FREE feeds dispatch targeting. A fresh write with
+        # no observed process must keep reading WORKING for the full
+        # orphan_grace_s (= working_s), or a live-but-unpaired agent would make
+        # its worktree look free and a dispatch could land on top of it.
+        self.assertEqual(self._c(50, False, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(90, False, [], 0, False, self.W)[0], "ended")
+
+    def test_a_wholesale_proc_failure_still_wins_over_the_clock(self):
+        self.assertEqual(self._c(3600, True, [], 0, False, self.W,
+                                 procs_known=False)[0], "unknown")
+
+
+class TestSettleIsAsymmetric(unittest.TestCase):
+    """Anti-flicker (ENGINE.md §6.3(a)). Escalation toward more attention is
+    published on the sweep that sees it; de-escalation must dwell. The rule can
+    only ever delay GOOD news, which is what makes it safe."""
+    D = 3.0
+
+    def test_first_sighting_publishes_at_once(self):
+        self.assertEqual(fb.settle(None, "waiting", 100.0, 0.0, self.D),
+                         ("waiting", 100.0))
+
+    def test_escalation_ignores_the_dwell_entirely(self):
+        # adopted a millisecond ago, and still the louder status goes out
+        for prev, nxt in (("waiting", "needs_input"), ("working", "blocked"),
+                          ("working", "limit"), ("ended", "working")):
+            self.assertEqual(fb.settle(prev, nxt, 100.001, 100.0, self.D),
+                             (nxt, 100.001), f"{prev} -> {nxt}")
+
+    def test_de_escalation_inside_the_dwell_holds_and_keeps_its_clock(self):
+        self.assertEqual(fb.settle("working", "waiting", 102.9, 100.0, self.D),
+                         ("working", 100.0))
+
+    def test_de_escalation_publishes_once_the_status_has_stood_long_enough(self):
+        self.assertEqual(fb.settle("working", "waiting", 103.0, 100.0, self.D),
+                         ("waiting", 103.0))
+
+    def test_an_unchanged_status_never_restamps_its_clock(self):
+        # ENGINE.md's sketch falls through to the final `return proposed, now`
+        # here, which re-stamps `since` on every sweep that agrees. Under the
+        # hot cadence (0.15 s) that turns the dwell into a 0-3 s sawtooth and
+        # the wait for a real de-escalation becomes a function of where in the
+        # cycle it lands. Nothing was adopted, so nothing moves.
+        self.assertEqual(fb.settle("working", "working", 1000.0, 100.0, self.D),
+                         ("working", 100.0))
+
+    def test_the_dwell_does_not_stack_on_top_of_the_quiet_timer(self):
+        # the number the user actually waits. A session WORKING since its last
+        # write crosses `quiet_s` with `now - since == quiet_s`, which is far
+        # past the dwell — so the board says YOUR TURN at 45 s, not 48.
+        st, _ = fb.settle("working", "waiting", 100.0 + 45, 100.0, self.D)
+        self.assertEqual(st, "waiting")
+
+    def test_a_status_the_table_does_not_rank_is_never_suppressed(self):
+        # a wholesale ps/lsof failure yields "unknown", which is not in LOUDER.
+        # Publish it at once; holding back a status we cannot reason about is
+        # the one thing worse than showing it.
+        self.assertEqual(fb.settle("working", "unknown", 100.001, 100.0, self.D),
+                         ("unknown", 100.001))
+        # …and leaving it is a de-escalation like any other
+        self.assertEqual(fb.settle("unknown", "waiting", 100.001, 100.0, self.D),
+                         ("unknown", 100.0))
+
+    def test_the_ranking_is_the_one_the_board_sorts_by(self):
+        self.assertEqual(fb.LOUDER, {"needs_input": 0, "limit": 1, "blocked": 2,
+                                     "working": 3, "waiting": 4, "ended": 5})
+
+
 class TestCloseoutStep(unittest.TestCase):
     """Step two (✕ close) when the landing won't verify — the pure decision
     that breaks the idle-agent / refusing-forever deadlock. One assertion per

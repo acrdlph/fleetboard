@@ -17,6 +17,7 @@ real and nothing depends on the developer's live fleet.
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -41,7 +42,7 @@ def _git(cwd, *args):
 # ------------------------------------------------------ synthetic collect_state
 
 def fake_state(at, *, cards=(("alpha", 0),), cpu=1.0, etime="01:00", age_s=5,
-               other_cpu=0.5, counts=None):
+               other_cpu=0.5, counts=None, status="working"):
     """A collect_state() result, hand-built. `publish` reads exactly four keys."""
     return {
         "generated_at": at,
@@ -49,7 +50,7 @@ def fake_state(at, *, cards=(("alpha", 0),), cpu=1.0, etime="01:00", age_s=5,
         "worktrees": [
             {"name": name, "availability": "busy",
              "git": {"branch": "main", "dirty": dirty},
-             "sessions": [{"sid": f"s-{name}", "status": "working",
+             "sessions": [{"sid": f"s-{name}", "status": status,
                            "last_write_at": 1000.0, "age_s": age_s}],
              "live_procs": [{"pid": 7, "cpu": cpu, "etime": etime,
                              "tty": "ttys001", "reachable": True}]}
@@ -259,7 +260,7 @@ class TestSweepThread(CacheGuard):
         super().tearDown()
 
     def _stub(self, at=None):
-        def collect(fresh=None, git=None, cold=False):
+        def collect(fresh=None, git=None, cold=False, settle=None):
             self.calls.append(time.time())
             if fresh is not None:
                 fresh["procs"] = time.time()
@@ -350,7 +351,7 @@ class TestSweepThread(CacheGuard):
         started = threading.Event()
         release = threading.Event()
 
-        def collect(fresh=None, git=None, cold=False):
+        def collect(fresh=None, git=None, cold=False, settle=None):
             started.set()
             release.wait(5)
             return fake_state(time.time())
@@ -392,7 +393,7 @@ class TestSweepThread(CacheGuard):
         carries pre-mutation data, so the nudge has to survive it."""
         inside, release = threading.Event(), threading.Event()
 
-        def collect(fresh=None, git=None, cold=False):
+        def collect(fresh=None, git=None, cold=False, settle=None):
             self.calls.append(time.time())
             if len(self.calls) == 1:
                 inside.set()
@@ -443,7 +444,7 @@ class TestSweepThread(CacheGuard):
     def test_a_wedged_probe_does_not_kill_the_loop(self):
         boom = [3]
 
-        def collect(fresh=None, git=None, cold=False):
+        def collect(fresh=None, git=None, cold=False, settle=None):
             self.calls.append(time.time())
             if boom[0] > 0:
                 boom[0] -= 1
@@ -807,6 +808,132 @@ class TestCadencesAreConfig(CacheGuard):
         """JSON says 2, `--idle-s` says '2'; the loop does arithmetic on it."""
         fb.CFG["idle_s"] = 2
         self.assertIsInstance(fb.Observer().idle_s, float)
+
+
+# ---------------------------------------------------------------- anti-flicker
+
+class TestSettlerDampsOnlyTheWayDown(CacheGuard):
+    """ENGINE.md §6.3(a) with the state it needs. `status.settle` is the rule
+    and is pinned in test_orchestra; this is about the memory — who owns it,
+    what it forgets, and that the board is composed from what it publishes."""
+
+    def _sessions(self, st, sid="s1"):
+        return {"/wt": [{"sid": sid, "status": st}]}
+
+    def test_a_de_escalation_waits_for_the_dwell_and_then_lands(self):
+        s = fb.Settler(dwell_s=3.0)
+        now = 1000.0
+        ss = self._sessions("working")
+        s.apply(ss, now)
+        self.assertEqual(ss["/wt"][0]["status"], "working")
+        ss = self._sessions("waiting")
+        s.apply(ss, now + 2.9)
+        self.assertEqual(ss["/wt"][0]["status"], "working")   # held
+        self.assertEqual(s.stats()["settle_held"], 1)
+        ss = self._sessions("waiting")
+        s.apply(ss, now + 3.0)
+        self.assertEqual(ss["/wt"][0]["status"], "waiting")
+
+    def test_an_escalation_is_never_delayed(self):
+        s = fb.Settler(dwell_s=600.0)
+        now = 1000.0
+        s.apply(self._sessions("working"), now)
+        ss = self._sessions("needs_input")
+        s.apply(ss, now + 0.001)
+        self.assertEqual(ss["/wt"][0]["status"], "needs_input")
+        self.assertEqual(s.stats()["settle_held"], 0)
+
+    def test_a_session_that_leaves_the_board_is_forgotten(self):
+        # …or a session returning after two days would inherit a status from
+        # another day, and the rule is about CONSECUTIVE sweeps.
+        s = fb.Settler(dwell_s=600.0)
+        now = 1000.0
+        s.apply(self._sessions("working"), now)
+        s.apply({"/wt": []}, now + 1)
+        self.assertEqual(s.stats()["settle_tracked"], 0)
+        ss = self._sessions("ended")
+        s.apply(ss, now + 2)
+        self.assertEqual(ss["/wt"][0]["status"], "ended")     # no stale dwell
+
+    def test_the_dwell_is_a_config_key(self):
+        saved = fb.CFG.get("flicker_dwell_s")
+        try:
+            fb.CFG["flicker_dwell_s"] = 12.5
+            self.assertEqual(fb.Settler().dwell_s, 12.5)
+            self.assertEqual(fb.Settler(dwell_s=0.5).dwell_s, 0.5)  # arg still wins
+        finally:
+            if saved is None:
+                fb.CFG.pop("flicker_dwell_s", None)
+            else:
+                fb.CFG["flicker_dwell_s"] = saved
+
+    def test_the_sweep_publishes_through_its_own_settler(self):
+        state = {"v": fake_state(time.time())}
+
+        def collect(fresh=None, git=None, cold=False, settle=None):
+            st = dict(state["v"])
+            if settle is not None:
+                settle({"/wt": st["worktrees"][0]["sessions"]}, time.time())
+            return st
+
+        saved = fb.observer.collect_state
+        fb.observer.collect_state = collect
+        try:
+            o = fb.Observer(dwell_s=600.0)
+            o.sweep()
+            self.assertEqual(o.snapshot().cards["alpha"]["sessions"][0]["status"],
+                             "working")
+            state["v"] = fake_state(time.time() + 1, status="waiting")
+            o.sweep()
+            self.assertEqual(o.snapshot().cards["alpha"]["sessions"][0]["status"],
+                             "working")      # damped, by the sweep's own memory
+            self.assertEqual(o.stats()["settle_held"], 1)
+        finally:
+            fb.observer.collect_state = saved
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestSettlingHappensBeforeTheBoardIsComposed(CacheGuard):
+    """A held status has to be held everywhere. Settle after the cards are
+    built and the session says ● WORKING while the counts strip says ○ ENDED
+    and the card says FREE — which is the one that feeds dispatch targeting."""
+
+    def _age_out(self, tmp):
+        old = time.time() - 10000
+        for fp in (tmp / "home" / "projects").rglob("*.jsonl"):
+            os.utime(fp, (old, old))
+
+    def test_the_counts_and_the_availability_agree_with_the_held_status(self):
+        with FleetFixture() as fx:
+            s = fb.Settler(dwell_s=600.0)
+            st = fb.collect_state(settle=s.apply)
+            self.assertEqual(st["counts"]["working"], 2)
+            self._age_out(fx.tmp)
+            fb.memo_clear()
+            st = fb.collect_state(settle=s.apply)
+            card = st["worktrees"][0]
+            self.assertEqual(card["sessions"][0]["status"], "working")   # held
+            self.assertEqual(st["counts"], {"working": 2, "needs_input": 0,
+                                            "limit": 0, "blocked": 0,
+                                            "waiting": 0, "ended": 0})
+            self.assertEqual(card["availability"], "busy")
+            self.assertEqual(st["free_worktrees"], [])
+
+    def test_the_request_path_shares_the_sweeps_memory(self):
+        # Two clocks for one status is the bug: a collect on the request thread
+        # that skipped the settler would show the user an un-damped status and
+        # leave the sweep's memory disagreeing with what was just rendered.
+        with FleetFixture() as fx:
+            o = fb.Observer(dwell_s=600.0)
+            fb.observer._observer = o
+            self.assertEqual(
+                fb.cached_state()["worktrees"][0]["sessions"][0]["status"], "working")
+            self._age_out(fx.tmp)
+            fb.memo_clear()
+            fb._cache["state"], fb._cache["t"] = None, 0.0
+            self.assertEqual(
+                fb.cached_state()["worktrees"][0]["sessions"][0]["status"], "working")
+            self.assertEqual(o._settler.stats()["settle_held"], 2)
 
 
 # ------------------------------------------------------- the read-only rule

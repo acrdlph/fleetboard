@@ -252,7 +252,9 @@ Persistent settings go in `orchestra.config.json` next to the script
 | `homes` | `[]` | Claude home dirs; `[]` auto-discovers `~/.claude*` |
 | `host` / `port` | `127.0.0.1` / `4242` | keep the host on loopback: the board serves your transcript text |
 | `session_window_h` | `48` | ignore transcripts idle longer than this |
-| `working_s` | `90` | a transcript written within this reads as WORKING |
+| `quiet_s` | `45` | unexplained silence before a live agent stops reading WORKING |
+| `flicker_dwell_s` | `3.0` | a status must stand this long before it may quieten; escalation never waits |
+| `working_s` | `90` | the two graces `quiet_s` did **not** take over: how long an unresolved tool is "running" rather than BLOCKED, and how long a fresh write with no visible process is WORKING rather than ENDED |
 | `max_sessions` | `6` | sessions shown per worktree card |
 | `exclude_accounts` | `[]` | account labels dispatch/router never **auto**-picks |
 | `reserve_percent` | `{}` | `{label: pct}` headroom kept free before AUTO-pick treats an account as full |

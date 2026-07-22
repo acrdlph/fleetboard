@@ -14,7 +14,7 @@ the contract — see `classify_session`.
 
 def classify_session(age_s, alive, pending_tools, delegated,
                      skip_perms, working_s, shells=0, *, turn_ended=False,
-                     evidence_age=None, procs_known=True, thinking_s=None,
+                     evidence_age=None, procs_known=True, quiet_s=None,
                      block_grace_s=None, orphan_grace_s=None):
     """Base session status from observable signals (before limit/handoff
     overrides). `delegated` counts pending workflows + background agents.
@@ -33,10 +33,21 @@ def classify_session(age_s, alive, pending_tools, delegated,
     to admit the agent stopped — median lateness removed, the full 90 s. It is
     deliberately weaker than every positive sign of work above it — see the
     branch itself.
+
+    `quiet_s` is the LAST branch and the only clock this function still owes
+    the user: unexplained silence before a live agent stops being WORKING. It
+    is reached only when every explanation above it has been ruled out — no
+    pending tool, no delegated workflow or background agent, no live shell, no
+    observed turn end — so it covers exactly "it has gone quiet and nothing
+    says why". Left None it is `working_s`, which is what every caller but
+    `scan_sessions` wants; the measured value and its misfire cost live beside
+    `quiet_s` in config.py. (It was called `thinking_s` while it was still a
+    placeholder defaulting to 90; the branch is unchanged, the name now says
+    what the number means.)
     """
     pend = pending_tools or []
     age = age_s if evidence_age is None else evidence_age
-    thinking_s = working_s if thinking_s is None else thinking_s
+    quiet_s = working_s if quiet_s is None else quiet_s
     block_grace_s = working_s if block_grace_s is None else block_grace_s
     # Defaults to working_s so this layer is provably behaviour-identical
     # apart from the two intended fixes. Tightening it (10 s is the target)
@@ -80,9 +91,56 @@ def classify_session(age_s, alive, pending_tools, delegated,
         # not "ended". This rule was implicit in the old first branch; it is
         # now named, bounded, and testable.
         return ("working", False) if age < orphan_grace_s else ("ended", False)
-    if age < thinking_s:
+    if age < quiet_s:
         return "working", False              # decay, LAST
     return "waiting", False
+
+
+# How much attention a status asks for — lower is LOUDER. The ranking is the
+# same one `collect_state` sorts sessions by; it is repeated here rather than
+# imported because this module owns policy and imports nothing.
+LOUDER = {"needs_input": 0, "limit": 1, "blocked": 2, "working": 3,
+          "waiting": 4, "ended": 5}
+FLICKER_DWELL_S = 3.0
+
+
+def settle(prev, proposed, now, since, dwell_s=FLICKER_DWELL_S):
+    """Asymmetric hysteresis on a published status (ENGINE.md §6.3(a)).
+    Returns `(status, since)` — the status to publish and when it was ADOPTED.
+
+    Flicker is worse than lag: a board that oscillates ● WORKING → ◆ YOUR TURN
+    → ● WORKING summons the user for nothing, and a board that cries wolf gets
+    ignored. So escalation toward MORE attention publishes on the sweep that
+    sees it, always, with no clock consulted; de-escalation may only publish
+    once the current status has stood for `dwell_s`. The cost of the rule is
+    bounded by construction: it can never delay bad news, only good news, and
+    only by `dwell_s`.
+
+    `since` is the clock of the last ADOPTION and is deliberately NOT refreshed
+    while a status merely persists. ENGINE.md's sketch refreshes it on the
+    equal-status path, which under the hot cadence (`hot_s` 0.15 s) turns the
+    dwell into a 0–3 s sawtooth: `since` is bumped every dwell_s, so how long a
+    real de-escalation waits depends on where in that cycle it lands. Keeping
+    `since` fixed makes the rule what it says it is — a status must stand for
+    `dwell_s` before it may quieten — and makes the wait deterministic. It also
+    means the dwell does not stack on top of `quiet_s`: a session that has been
+    WORKING for the whole quiet window crosses at `quiet_s` exactly, because by
+    then `now - since` is `quiet_s`, far past the dwell.
+
+    An unranked status (`unknown`, from a wholesale `ps`/`lsof` failure, or
+    anything a later version adds) is treated as louder than everything: it
+    publishes at once and is never suppressed. Never hold back a status this
+    table cannot reason about.
+    """
+    if prev is None:
+        return proposed, now
+    if proposed == prev:
+        return prev, since                       # nothing adopted, nothing moves
+    if LOUDER.get(proposed, -1) < LOUDER.get(prev, -1):
+        return proposed, now                     # escalate instantly, always
+    if now - since < dwell_s:
+        return prev, since                       # de-escalation must dwell
+    return proposed, now
 
 
 def closeout_step(paired_status, any_working, sent, now, nudge_after_s=60):

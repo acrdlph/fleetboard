@@ -34,6 +34,39 @@ CFG = {
     "homes": [],               # Claude home dirs; [] = auto-discover ~/.claude*
     "session_window_h": 48,    # ignore transcripts idle longer than this
     "working_s": 90,           # transcript written within this => working
+    # `quiet_s` is what is left of the 90 s lie. `working_s` used to decide the
+    # end of a turn on its own; the CLI's own end-of-turn marker now decides it
+    # for 84 % of in-window sessions by OBSERVATION, and this timer covers only
+    # the residual — a live agent with no pending tool, no delegated workflow
+    # or background agent, no live shell and no marker. `working_s` keeps its
+    # other two jobs (the approval grace, the orphan grace).
+    #
+    # A "misfire" is a genuine thinking pause long enough to be mistaken for
+    # the end of a turn: the board says ◆ YOUR TURN, summons you, and the agent
+    # carries on. Measured over 14,006 such gaps in the 79 in-window
+    # transcripts (p50 2.2 s, p95 27.7 s, p99 72.7 s):
+    #
+    #     quiet_s   misfire   1 in     of which recover < 120 s
+    #        10     16.23 %      6            15.94 %
+    #        20      7.78 %     13             7.50 %
+    #        25      5.80 %     17             5.53 %     <- ENGINE.md's proposal
+    #        45      2.71 %     37             2.53 %     <- shipped
+    #        60      1.54 %     65             1.37 %
+    #        90      0.61 %    165             0.51 %     <- today
+    #
+    # Almost every misfire recovers within two minutes, so the misfire rate IS
+    # the flicker rate — this is the WORKING → YOUR TURN → WORKING oscillation,
+    # not a harmless late correction. 45 sits between the p95 and p99 of the
+    # pauses it must tolerate, halves today's staleness, and costs 2.1 % more
+    # misfires than 90 on the one session in six that reaches it — a fleet-wide
+    # 0.34 pp. 25 would double the flicker (5.80 %) to buy 20 s on a fallback
+    # path; the return per second of added lateness falls off a cliff after 45
+    # (25→45 buys 0.155 pp/s, 45→60 buys 0.078, 60→90 buys 0.031).
+    "quiet_s": 45,             # unexplained silence before a live agent is idle
+    # De-escalation dwell (ENGINE.md §6.3(a)): a status must stand this long
+    # before it may quieten. Escalation toward more attention never waits. It
+    # does NOT stack on `quiet_s` — see `status.settle`.
+    "flicker_dwell_s": 3.0,
     "max_sessions": 6,         # per worktree card
     "exclude_accounts": [],    # account labels never AUTO-picked for dispatch
     "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)

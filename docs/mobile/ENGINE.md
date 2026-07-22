@@ -5,8 +5,10 @@ document. Where it contradicts an earlier ADR, this document wins and an ADR is 
 the reversal (see §11).
 
 > **Read [ADR 0011](adr/0011-measurement-supersedes-the-design-doc.md) alongside this document.**
-> Implementing steps 0–2 found three places where following this literally would have shipped a
-> defect — two of them silent — plus one cadence unreachable on real hardware. This remains the
+> Implementing steps 0–2 and 5 found six places where following this literally would have shipped
+> a defect — three of them silent, and two of them in §6.2/§6.3 below (`QUIET_S = 25` misfires on
+> one thinking pause in 17; `settle()`'s sketch re-stamps `since` on agreement and turns the dwell
+> into a sawtooth) — plus one cadence unreachable on real hardware. This remains the
 > authority on *structure*: the decomposition, the state model, versioning, the seam rules, the
 > mitigations for statefulness. It is **not** authoritative on numbers or platform behaviour,
 > which were reasoned rather than measured. ADR 0011 indexes where it is stale.

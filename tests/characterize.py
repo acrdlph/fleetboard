@@ -80,6 +80,41 @@ def _classify_inputs():
                    skip_perms=skip, working_s=90, shells=shells, turn_ended=ended)
 
 
+def _quiet_inputs():
+    """`quiet_s` — the last branch of the ladder, and the only clock in it that
+    now carries a measured number rather than `working_s`.
+
+    A separate product rather than a `quiet_s` axis on the one above, because
+    the interesting question is narrow and the existing 2,880 cases would
+    double for nothing: does the quiet timer decide ONLY the silence that
+    nothing else explains, and does it leave the other two jobs of the old
+    single number — the approval grace and the orphan grace — where they were?
+    So `working_s` is pinned at 90 while `quiet_s` moves, and the ages straddle
+    both. `turn_ended` is fixed False here: it returns above this branch and is
+    already pinned across the full product above.
+    """
+    ages = [0, 24, 25, 44, 45, 46, 89, 90, 91, 200]
+    for age, quiet, alive, pend, deleg, shells, skip in itertools.product(
+            ages, [None, 25, 45], [True, False], [[], ["Bash"]], [0, 1],
+            [0, 1], [False, True]):
+        yield dict(age_s=age, alive=alive, pending_tools=pend, delegated=deleg,
+                   skip_perms=skip, working_s=90, shells=shells, quiet_s=quiet)
+
+
+def _settle_inputs():
+    """Anti-flicker: escalate now, de-escalate after a dwell. `since` is the
+    clock of the last ADOPTION, so the elapsed values straddle the boundary
+    exactly, and `unknown` is in the list because it is a status `LOUDER` does
+    not rank — a wholesale ps/lsof failure produces it and it must never be
+    held back."""
+    sts = ["needs_input", "limit", "blocked", "working", "waiting", "ended", "unknown"]
+    now = 1000.0
+    for prev, proposed, elapsed in itertools.product(
+            [None] + sts, sts, [0.0, 2.999, 3.0, 100.0]):
+        yield dict(prev=prev, proposed=proposed, now=now,
+                   since=now - elapsed, dwell_s=3.0)
+
+
 def _closeout_inputs():
     statuses = [None, "working", "needs_input", "blocked", "waiting", "ended", "unknown"]
     for st, anyw, sent, now in itertools.product(
@@ -128,6 +163,12 @@ def build(mod):
 
     snap["classify_session"] = [
         {"in": kw, "out": _safe(mod, "classify_session", **kw)} for kw in _classify_inputs()
+    ]
+    snap["classify_quiet"] = [
+        {"in": kw, "out": _safe(mod, "classify_session", **kw)} for kw in _quiet_inputs()
+    ]
+    snap["settle"] = [
+        {"in": kw, "out": _safe(mod, "settle", **kw)} for kw in _settle_inputs()
     ]
     snap["closeout_step"] = [
         {"in": kw, "out": _safe(mod, "closeout_step", **kw)} for kw in _closeout_inputs()

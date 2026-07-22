@@ -5,7 +5,7 @@
 ## Context
 
 `ENGINE.md` is the design authority for the observer work. Implementing steps 0–2 and 5 against it
-has now produced **four** places where following it literally would have shipped a defect, each
+has now produced **six** places where following it literally would have shipped a defect, each
 caught only because the number was measured rather than assumed:
 
 | § | the document says | measured reality |
@@ -15,7 +15,10 @@ caught only because the number was measured rather than assumed:
 | §2.5 | `git_s = 5.0`, a re-probe cadence **within** a sweep (i.e. a memo) | There cannot be a memo. `dirty` is the working tree and no cheap stat detects an edit there — `.git/index` mtime does not, because it moves when *git* writes the index, which `--no-optional-locks` exists to prevent. Implemented as a **between-sweep cadence** at 15.0. |
 | §6.3 | the `working_s` work lands **after** hooks (§7 ranks hooks above every other signal) | The CLI already writes its own end-of-turn marker, and it is present after the agent's last word in **66 of 79** in-window sessions (**84 %**). Hooks would improve the residual 16 %, not the majority path — so the majority path shipped first, off `system`/`turn_duration`, with `working_s` untouched at 90. Note this is *not* the threshold change §6.3 sequences: no timer moved. What lands is §7's rank 3 (precise file writes) displacing rank 4 (mtime heuristics) for 84 % of sessions, which §7 itself says is the right order. |
 
-A fifth, softer case, on cadence rather than status: §2.5 specifies `idle_s = 1.0`. At the measured 1.68 CPU-s per sweep that
+| §6.2 | `QUIET_S = 25.0`, "25 s is generous for it" | Measured over **14,006** unexplained mid-turn gaps in the 79 in-window transcripts, 25 misfires on **5.80 %** of them — one genuine thinking pause in 17 mistaken for the end of a turn — and it sits *below* the p95 (27.7 s) of the very population it exists to tolerate. 95 % of those misfires recover inside two minutes, so the rate is not a late correction, it is the ● WORKING → ◆ YOUR TURN → ● WORKING oscillation §6.3 opens by forbidding. Shipped at **45** (2.71 %), between the p95 and the p99 (72.7 s). |
+| §6.3(a) | `settle()`'s final `return proposed, now` also runs when `proposed == prev` | That re-stamps `since` on every sweep that merely *agrees*, so under the hot cadence (`hot_s = 0.15`) the dwell becomes a 0–3 s sawtooth and how long a real de-escalation waits depends on where in the cycle it lands. `since` is now the clock of the last **adoption** and does not move while a status persists — which also means the dwell does not stack on `quiet_s`: the board says ◆ YOUR TURN at 45 s, not 48. Pinned by `test_the_dwell_does_not_stack_on_top_of_the_quiet_timer` and `test_an_unchanged_status_never_restamps_its_clock`. |
+
+A seventh, softer case, on cadence rather than status: §2.5 specifies `idle_s = 1.0`. At the measured 1.68 CPU-s per sweep that
 is **164 % of one core, continuously** — not aggressive, unreachable. It became affordable only
 after the sweep got cheap, and even then costs 43 %.
 
@@ -70,4 +73,5 @@ test that could not have succeeded is not evidence.
 
 - **Rewrite `ENGINE.md` to match the implementation.** Destroys the record of what was
   considered and why, and invites the same errors to be re-derived later.
-- **Treat the document as binding.** Would have shipped three defects, two of them silent.
+- **Treat the document as binding.** Would have shipped five defects, three of them silent — a
+  board that flickered on one thinking pause in 17 among them.

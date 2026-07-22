@@ -67,6 +67,12 @@ Plus a 4 s server cache and a 5 s browser poll → **~10.6 s** from a real chang
 Separately, `CFG["working_s"] = 90` holds `● WORKING` for up to **90 seconds** after a session
 stops. That is not lag; that is the heuristic being coarse.
 
+> **Both are now fixed (steps 1–3 and 5).** `/api/state` is a 0.8 ms dict read off a background
+> sweep, a write reaches the board in ~1 s, and the 90 s window is gone: 84 % of sessions resolve
+> on the CLI's own end-of-turn marker with no clock at all, and the residual falls to
+> `quiet_s = 45` — a number taken off the measured misfire table, not off a feeling. The
+> paragraphs above are kept as the record of what the work started from.
+
 **The framing that organises all of this work** — three different problems needing three
 different fixes:
 
@@ -121,7 +127,7 @@ even if the phone client were cancelled.
 | **—** ✅ | make the sweep affordable: git on a 15 s cadence, transcript memo, `(pid,start)` cwd memo | 55% → 15% of a core |
 | **3** ✅ | kqueue watcher — react to writes instead of sweeping | idle **5.3%** of a core; write→board ~1 s (was a 30 s cadence); 220 fds |
 | **—** ✅ | identity-addressed mutations (ADR 0008) | a recycled pid is refused, not delivered to the wrong agent |
-| **5** ◧ | **status model — `working_s = 90`** | phase 1 landed: the CLI's own end-of-turn marker is read positionally and wired into `classify_session`, so **84 %** of in-window sessions resolve by observation and stop waiting out the window (median lateness removed: the full 90 s). The timer now covers only the 16 % with no marker. |
+| **5** ✅ | **status model — `working_s = 90`** | phase 1: the CLI's own end-of-turn marker is read positionally and wired into `classify_session`, so **84 %** of in-window sessions resolve by observation and stop waiting out the window (median lateness removed: the full 90 s). Phase 2: the residual 16 % fall to `quiet_s = 45`, chosen off the misfire table (2.71 % against 5.80 % at ENGINE.md's 25), with `settle()` making escalation instant and de-escalation dwell 3 s. |
 | **4** ⬜ | SSE + delta protocol; retire the 5 s browser poll | the browser finally sees the ~1 s the server already knows |
 | **6** ⬜ | Claude Code hooks; reconcile signal sources by rank | `BLOCKED`/`YOUR TURN` become observed, not inferred |
 | **7** ⬜ | auth, device pairing, tailnet bind | safe to reach from a phone |
@@ -139,7 +145,8 @@ could only ask "is the mtime within 90 s?" — precise write timestamps now exis
 | item | why it is parked | where |
 |---|---|---|
 | `age_s` still ships beside `last_write_at` | one release of overlap so nothing breaks; remove with step 6 | `transcripts.py` |
-| `working_s = 90`, and `thinking_s`/`block_grace_s`/`orphan_grace_s` default to it | Layer 0 kept them conservative so it was provably behaviour-identical. Step 5 phase 1 took 84 % of sessions off the timer entirely (observed end-of-turn); what is left is the 16 % with no marker, where tightening still needs the anti-flicker rule and the measured misfire table | `status.py`, `config.py` |
+| `block_grace_s`/`orphan_grace_s` still default to `working_s = 90` | Step 5 took the *end-of-turn* question off the 90 s clock — 84 % by observation, the rest on `quiet_s = 45`. These two are different questions with different costs: how long an unresolved `tool_use` is "running" rather than ■ BLOCKED, and how long a fresh write with no visible process is ● WORKING rather than ○ ENDED. The second feeds worktree-FREE feeds dispatch targeting, so it moves only behind reliable process detection, with its own measurement | `status.py`, `config.py` |
+| `subagents_active` still reads `working_s` | a display hint on the card, not a status, and there is no measured gap distribution for subagent writes yet. Moving it to `quiet_s` would be a guess wearing a measured number's name | `transcripts.py` |
 | transcript memo can be defeated by a size+mtime_ns+inode-identical rewrite | adversarial only — transcripts are append-only; the 60 s cold reconcile bounds it | ADR 0011 |
 | `dirty` cannot be memoised | it is the working tree; no cheap stat sees an edit. Bounded by `GIT_S` and dated by `freshness["git"]` | ADR 0011 |
 | a dispatch's new branch is not nudged | the branch is cut by the launched agent minutes later, with no signal back; bounded by `GIT_S` | `dispatch.py` |
