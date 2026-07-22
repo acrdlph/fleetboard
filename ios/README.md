@@ -26,7 +26,7 @@ Everything below runs from a shell. No Xcode GUI, no Apple ID, no team.
 
 ```sh
 # 1. the headless suites — models, transport classification, rules, formatters
-cd ios && swift test                    # 64 tests, ~1 s, macOS, no simulator
+cd ios && swift test                    # 96 tests, ~1 s, macOS, no simulator
 
 # 2. the app
 xcodebuild -project ios/Orchestra.xcodeproj -scheme Orchestra \
@@ -321,6 +321,82 @@ that changes when Tailscale reassigns the address.
 
 `NSAllowsArbitraryLoads` is never set. `NSAllowsLocalNetworking` does not help:
 it covers `.local` and link-local, not the `100.64/10` CGNAT range.
+
+## Final verification: the defect the app's own retries were hiding
+
+Found on 2026-07-22 by revoking this phone's device on the real server and then
+looking at what the app said. The board emptied — correct, a 401 clears `state`
+rather than dimming it — the connection bar said `this device is no longer
+paired` for about a second, and then the screen and the bar both settled on:
+
+```
+the server said 429
+too many failed authentication attempts from 100.113.110.31; try again in 3s
+```
+
+`audit.log.jsonl` says why. Thirty refusals in twenty-six seconds, from one
+phone, one per second, forever:
+
+```
+22:37:36 /api/state   device_revoked
+22:37:37 /api/state   device_revoked
+22:37:38 /api/state   device_revoked
+…
+```
+
+`streamLoop` gets this right — `a token problem is not retried`, and it returns.
+The **side fetch** was the half still hammering. `pump()` ticks every second and
+`refreshSide` guarded on `sideAt`, which was assigned inside the `do` block,
+*after* the `await`: only a SUCCESS ever advanced the window, so a fetch that
+kept failing re-fired on every tick. That storm spends orchestra's 10/min per-IP
+auth budget in about a second, and the 429 that follows overwrites the one
+sentence that tells the user what to do. **The client's own retries hid the real
+error.**
+
+Two changes, both in `FleetStore`:
+
+* the cadence clock is the last **attempt**, not the last success —
+  `beginSideFetch(now:force:)` decides and records in one call, deliberately, so
+  the rule and the write cannot drift apart;
+* `.unauthorized` is not polled at all, matching the stream. `force` still wins,
+  which is the retry arrow and pull-to-refresh.
+
+Three mutations, each watched red: dropping the 401 clause, moving the clock back
+onto the success path, and returning the polling period to 1 s. The first version
+of the test was a pure predicate over `mayFetchSide` and it **did not catch the
+second mutation** — the rule was pinned and the call site was not, which is
+exactly the shape of the original defect. That is why `beginSideFetch` exists and
+why the second test drives it against a store where nothing succeeds.
+
+Re-driven against the real server with the auth budget drained: **3 refusals in
+30 seconds**, and the screen reads
+
+```
+🔒 this device isn't paired
+device 'iPhone 17 Pro Max' was revoked; pair again to get a new token
+```
+
+which is the server's own words and was there the whole time.
+
+**What the same pass confirmed rather than broke.** A clean
+`xcodebuild clean && build` with no source warning; 96 headless tests; fourteen
+screens screenshotted and looked at, none blank; an untracked file created in
+`ConfidAi6` moving the phone from no-Δ to `Δ1 uncommitted` and `v94 → v96` with
+no interaction; a server killed mid-stream reading `reconnecting… (2) · showing
+data from 6s ago` and then `orchestra isn't running · showing data from 31s ago`,
+recovering by itself when the server came back **with its version reset 96 → 1**
+(the cursor-ahead branch of `delta_since`, driven by accident and then on
+purpose); one socket across background/foreground (`1 → 0 → 1`, same pid) with
+`resyncs: 0`; `no upstream` rather than `↑0` on the two detached worktrees whose
+`ahead`/`behind` are null; and `tailnet unreachable` distinguished from
+`this build cannot reach that address` distinguished from `orchestra isn't
+running` — three different failures, three different sentences.
+
+One cosmetic note from the same sweep: the pairing fixture in
+`Tests/OrchestraKitTests/DecodeTests.swift` carries a token-shaped string whose
+device-id segment collides with a real (long-revoked) device in `devices.json`.
+It is synthetic — its sha256 matches nothing in the registry and the live server
+answers it 401 — but a fixture that looks like a credential is worth not writing.
 
 ## Phase 2: three defects found by RUNNING it, not by reading
 

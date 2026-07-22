@@ -236,11 +236,50 @@ public final class FleetStore {
     /// **It never seeds over a live stream.** `/api/state` carries no version,
     /// and the sweep that answered it may be older than the last frame applied;
     /// overwriting a streamed board with it would move the board backwards.
-    private func refreshSide(force: Bool) async {
-        if !force, let sideAt {
-            let period = link.isLive ? Self.sidePeriodLive : Self.sidePeriodPolling
-            guard Date().timeIntervalSince(sideAt) >= period else { return }
+    /// May the side fetch run now?
+    ///
+    /// **The clock is the last ATTEMPT, not the last success**, and that is the
+    /// whole rule. `pump()` ticks every second; when only a success recorded the
+    /// clock, a fetch that kept failing never advanced the window and the app
+    /// issued `GET /api/state` at 1 Hz for as long as the failure lasted.
+    /// Measured against the real server with a revoked device: 30 refusals in
+    /// 26 s from one phone, which spent orchestra's 10/min per-IP auth budget in
+    /// about a second — so `this device is no longer paired` was replaced by
+    /// `the server said 429` before anybody could read it. A client whose own
+    /// retries hide the one sentence that says what to do.
+    ///
+    /// And 401 is not polled at all: `streamLoop` already refuses to retry a
+    /// token problem, and the side fetch was the half still hammering. The
+    /// exception is `force` — the retry arrow and pull-to-refresh, where the
+    /// user is the one asking.
+    static func mayFetchSide(link: LinkState, force: Bool,
+                             sinceLastAttempt: TimeInterval?) -> Bool {
+        if force { return true }
+        if case .unauthorized = link { return false }
+        guard let sinceLastAttempt else { return true }
+        return sinceLastAttempt >= (link.isLive ? sidePeriodLive : sidePeriodPolling)
+    }
+
+    /// Ask, and — if the answer is yes — spend the window, in one step.
+    ///
+    /// Deciding and recording are the same call on purpose. Split, the decision
+    /// is a pure function a test can pin while the recording sits at a call site
+    /// no test reaches, which is exactly how this defect shipped: the rule was
+    /// right and the clock was written in the `do` block, after the `await`, so
+    /// only a SUCCESS ever advanced it. `now` is a parameter for the same reason
+    /// `staleness(now:)` takes one — a rule that reads a hidden clock can only
+    /// be tested by waiting.
+    func beginSideFetch(now: Date, force: Bool) -> Bool {
+        let since = sideAt.map { now.timeIntervalSince($0) }
+        guard Self.mayFetchSide(link: link, force: force, sinceLastAttempt: since) else {
+            return false
         }
+        sideAt = now
+        return true
+    }
+
+    private func refreshSide(force: Bool) async {
+        guard beginSideFetch(now: Date(), force: force) else { return }
         if state == nil, phase == .cold { phase = .loading }
         do {
             let fresh = try await client.fleetState()
@@ -249,7 +288,6 @@ public final class FleetStore {
                 applier.seed(fresh)
             }
             publish(at: Date(), countingAsFrame: false)
-            sideAt = Date()
             lastError = nil
             if state != nil { phase = .loaded }
         } catch let error as OrchestraError {

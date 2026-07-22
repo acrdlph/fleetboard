@@ -424,6 +424,64 @@ struct LiveLinkTests {
         #expect(!FleetStore.maySeed(link: .live, holdingVersion: false))
     }
 
+    /// **A refused fetch must back off, and a refused TOKEN must stop.**
+    ///
+    /// Found by driving a revoked device against the real server on 2026-07-22.
+    /// `pump()` ticks every second and `refreshSide` only recorded the clock on
+    /// SUCCESS, so a fetch that kept failing never advanced the window and the
+    /// app issued `GET /api/state` at **1 Hz forever** — measured in
+    /// `audit.log.jsonl`: 30 refusals in 26 seconds from one phone. That storm
+    /// spent the server's 10/min per-IP auth budget in about a second, so the
+    /// honest `this device is no longer paired` was overwritten by
+    /// `the server said 429` before it could be read, on the bar AND on the
+    /// screen — the one sentence that tells the user what to do, lost to the
+    /// client's own retries.
+    ///
+    /// Two rules, and the third clause is why the retry arrow still works.
+    @Test func aFailingSideFetchBacksOffAndATokenProblemStopsIt() {
+        // The cadence applies to the last ATTEMPT, not the last success.
+        #expect(!FleetStore.mayFetchSide(link: .offline(.serverStopped),
+                                         force: false, sinceLastAttempt: 1))
+        #expect(FleetStore.mayFetchSide(link: .offline(.serverStopped),
+                                        force: false, sinceLastAttempt: 6))
+        // A live stream keeps its slower side period.
+        #expect(!FleetStore.mayFetchSide(link: .live, force: false, sinceLastAttempt: 6))
+        #expect(FleetStore.mayFetchSide(link: .live, force: false, sinceLastAttempt: 21))
+        // 401 is never polled at all — the stream loop already refuses to retry
+        // it, and the side fetch was the half still hammering.
+        #expect(!FleetStore.mayFetchSide(link: .unauthorized,
+                                         force: false, sinceLastAttempt: 3600))
+        #expect(!FleetStore.mayFetchSide(link: .unauthorized,
+                                         force: false, sinceLastAttempt: nil))
+        // …except when the user asks, which is the retry arrow and pull-to-refresh.
+        #expect(FleetStore.mayFetchSide(link: .unauthorized,
+                                        force: true, sinceLastAttempt: 0))
+        // Nothing has been fetched yet: go.
+        #expect(FleetStore.mayFetchSide(link: .connecting,
+                                        force: false, sinceLastAttempt: nil))
+    }
+
+    /// **A refusal spends the window a success would have spent.**
+    ///
+    /// The rule above is a pure function, and a pure function cannot see WHERE
+    /// the clock is written — which is precisely how the defect shipped: the
+    /// cadence was correct and `sideAt` was assigned inside the `do` block,
+    /// after the `await`, so only a success ever advanced it. Moving the write
+    /// back out is the other half of the fix and this is the half that pins it:
+    /// nothing here succeeds, and the window must still close.
+    @Test func aRefusedSideFetchStillSpendsItsWindow() {
+        let store = Self.store()                      // never live, never fetched
+        let t0 = Date()
+        #expect(store.beginSideFetch(now: t0, force: false))
+        #expect(!store.beginSideFetch(now: t0.addingTimeInterval(1), force: false),
+                "1 Hz against a server that is refusing us is the whole bug")
+        #expect(!store.beginSideFetch(now: t0.addingTimeInterval(4.9), force: false))
+        #expect(store.beginSideFetch(now: t0.addingTimeInterval(5), force: false))
+        // And the user asking is always honoured, and spends the window too.
+        #expect(store.beginSideFetch(now: t0.addingTimeInterval(5.1), force: true))
+        #expect(!store.beginSideFetch(now: t0.addingTimeInterval(6), force: false))
+    }
+
     /// Nothing has ever loaded is its own state — the only one that may show a
     /// skeleton.
     @Test func anEmptyStoreIsAbsentRatherThanStale() {
