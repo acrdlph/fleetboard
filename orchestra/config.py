@@ -37,6 +37,7 @@ CFG = {
     "max_sessions": 6,         # per worktree card
     "exclude_accounts": [],    # account labels never AUTO-picked for dispatch
     "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)
+    "git_s": 15.0,             # min seconds between git fan-outs on the sweep (ENGINE.md §2.5)
     "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
     "resume_message": "continue",  # what auto-resume types at the stalled agent
 }

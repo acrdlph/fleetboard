@@ -26,6 +26,10 @@ screenshots. `cached_state` is the one entry point the server calls.
 
 `Observer` is the publish point (ENGINE.md §2.5): one perpetual thread that
 sweeps on its own cadence and publishes an immutable, versioned `Snapshot`.
+`GitCadence` is what makes that thread affordable: git is 79 % of a sweep's
+CPU and cannot be stat-memoised (`dirty` is the working tree), so it runs on
+its own slower clock and the sweep reuses the last answer — honestly, because
+`freshness["git"]` publishes how old it is, and a `nudge()` pulls it forward.
 It exists because observation today happens only when a client asks — with no
 browser attached nothing computes, nothing is detected, and no notification
 can ever fire. That is structural, not a tuning problem.
@@ -52,7 +56,7 @@ _cache = {"t": 0.0, "state": None}
 
 # ---------------------------------------------------------------- collectors
 
-def collect_state(fresh=None):
+def collect_state(fresh=None, git=None):
     """Compose the board. `fresh` is an optional out-parameter.
 
     Pass a dict and the collector stamps it `kind -> wall clock of that kind's
@@ -60,6 +64,13 @@ def collect_state(fresh=None):
     git is 47s stale because a fetch wedged. Left None it costs nothing and this
     function behaves exactly as it did before there was an Observer — which is
     what keeps `python3 tests/characterize.py` byte-identical across this change.
+
+    `git` is the other seam, and the same shape of promise: left None the git
+    fan-out runs in full on this thread, exactly as it always has. The sweep
+    passes `GitCadence.resolve` instead — `roots -> ({root: info}, probed_at)`
+    — so git runs on its own slower clock and the sweep reuses the last answer
+    in between. `probed_at` is what lands in `fresh["git"]`, so the freshness
+    map reports when git ACTUALLY ran rather than when this function did.
     """
     def stamp(kind):
         if fresh is not None:
@@ -132,8 +143,17 @@ def collect_state(fresh=None):
 
     # one fan-out for every worktree's git state, rather than one blocking call
     # per card — this path is dominated by waiting on `git`, not by our own work
-    git_by_root = gitrepo.git_info_many([w["git"] for w in worktrees])
-    stamp("git")
+    roots = [w["git"] for w in worktrees]
+    if git is None:
+        git_by_root = gitrepo.git_info_many(roots)
+        stamp("git")
+    else:
+        git_by_root, git_at = git(roots)
+        if fresh is not None and git_at:
+            # NOT `now`: the honest clock is when git last ran, which under a
+            # cadence is up to GIT_S ago. Stamping `now` here would claim a
+            # freshness this data does not have — §3.3's whole point.
+            fresh["git"] = git_at
 
     cards = []
     for w in worktrees:
@@ -206,39 +226,80 @@ def collect_state(fresh=None):
 
 # ------------------------------------------------------- the publish point
 
-# Cadences, §2.5. IDLE_S deviates from the document's 1.0 and the reason is
-# measured: §2.5's 1.0 assumes the within-sweep git memo it paces with git_s,
-# which does not exist yet, so every sweep is a full collect.
+# Cadences, §2.5.
 #
-# What that costs, corrected. The first number written here was a WALL duty
-# cycle — sweep_ms over the cadence — and it understates the truth by ~2x,
-# because the sweep is a parallel fan-out: 785 ms of wall time spends 1640 ms
-# of CPU, and battery is charged in CPU-seconds, not wall. `ps -o time` hides
-# it too, since 1378 of those 1640 ms are billed to the `git`/`ps` children and
-# never appear against the server process (measured: 8 % parent-only against
-# 56 % actual). Measured over a real 60 s run of the shipped loop, 9 worktrees:
+# What a sweep costs, in the only unit that matters. The first number written
+# here was a WALL duty cycle — sweep_ms over the cadence — and it understates
+# the truth by ~2x, because the sweep is a parallel fan-out: 600 ms of wall
+# time spends 1600 ms of CPU, and battery is charged in CPU-seconds. `ps -o
+# time` hides it too, since most of those ms are billed to the `git`/`ps`
+# children and never appear against the server process (measured: 8 %
+# parent-only against 56 % actual). Measured with getrusage(SELF)+(CHILDREN)
+# over this fleet — 9 worktrees, 709 transcripts on disk, ~47 in window:
 #
-#   1.64 CPU-s per sweep  ->  IDLE_S 3.0 = ~55 % of one core, CONTINUOUSLY
-#                             IDLE_S 5.0 = ~33 %      IDLE_S 8.0 = ~21 %
+#   stage                      wall      CPU    share
+#   git_info_many             253 ms   1264 ms   79 %      <- the whole problem
+#   scan_sessions             206 ms    205 ms   13 %
+#   claude_processes          114 ms    114 ms    7 %
+#   collect_state (full)      600 ms   1586 ms
 #
-# Roughly 1.3 of those 1.64 s is the git fan-out (two spawns per worktree);
-# ps+lsof is ~0.14 s and the transcript scan ~0.19 s. Before this step an open
-# tab polling every 5 s already paid ~33 % — so the honest framing is not
-# "barely more than a tab", it is: the same order as a tab, now paid forever
-# with nobody watching. That is the deliberate price of the publish point
-# (§1.1 — nothing computes with no client attached, so nothing can notify),
-# and 3.0 is a placeholder for it, not a number anything vindicates.
+#   1.59 CPU-s every sweep  ->  IDLE_S 3.0 = 53 % of one core, CONTINUOUSLY
+#                               IDLE_S 1.0 (the document's value) = 159 %
 #
-# The fix is the within-sweep git memo (§4.3), which is what makes a sweep stop
-# costing 1.6 CPU-s; tighten toward the document's 1.0 only after it lands.
-# Until then IDLE_S is the one knob that trades notification latency for
-# battery, and it deserves to be a config key rather than a constant.
+# So §2.5's prescribed 1.0 was not merely aggressive, it was unreachable: more
+# than a full core, forever, with nobody watching. GIT_S is what makes it
+# reachable. Git is 79 % of that CPU and the least volatile thing on the card,
+# so it moves to its own slower clock and the sweep reuses the last answer in
+# between. After: 0.31 CPU-s on a sweep that skips git, 1.65 on one that does
+# not. Measured over 60 s of the real loop, not arithmetic:
+#
+#   IDLE_S  GIT_S   measured                     git_probes in 60 s
+#     3.0     off     52 % of one core                 20        <- before
+#     3.0     15      19 %                              4        <- shipped
+#     2.0     15      27 %                              4
+#     1.0     15      43 %                              4
+#
+# 2.7x off the shipped cadence, and the document's 1.0 goes from impossible to
+# merely expensive. IDLE_S stays 3.0: what it buys is notification latency, and
+# 3 s is already far below the threshold for "did the board notice". Tightening
+# it is now an argument somebody can win, which it was not before — but it is
+# their argument, with their own measurement, not a free rider on this one.
+#
+# What is left is 0.31 CPU-s of transcript scan (0.20) and ps+lsof (0.11), and
+# those are the next two steps. The scan is the one that can be memoised for
+# real: a transcript is append-only and stat-keyed (§4.3), unlike `dirty`.
 IDLE_S = 3.0        # cadence with no evidence of change
 HOT_S = 0.15        # floor between sweeps after a nudge
-# A cold sweep bypasses the parse memo (§4.3) and counts the disagreements as
-# drift. There is no memo yet, so a cold sweep is identical to a warm one and
-# `drift` is honestly always 0 — the clock and the counter are here so step 4
-# has somewhere to land, not because they do anything today.
+
+# git's own clock, §2.5's `git_s`. The document says 5.0 and calls it a
+# "re-probe cadence WITHIN a sweep", implying a memo; there cannot be one.
+# branch/commit/ahead-behind could be keyed on `.git/HEAD` and the refs, but
+# `dirty` depends on the WORKING TREE — any file the user or an agent saves —
+# and no cheap stat detects that. (`.git/index` mtime does not: it moves when
+# git writes the index, and `--no-optional-locks` exists precisely to stop git
+# rewriting it when we look.) So this is a CADENCE, not a skip-if-unchanged
+# memo: git is re-probed on a slower clock and the last answer is reused in
+# between, which is honest only because `freshness["git"]` publishes its age.
+#
+# 15.0, not 5.0. At 5.0, git runs on ~2 sweeps in 3 and the loop still costs
+# ~40 % of a core; at 15.0 it is 19 %. What the extra 10 s delays is a branch
+# name, an ahead/behind count and a dirty count — none of which is why anybody
+# watches this board, and all of which are dated on the card by
+# `freshness["git"]`. Every event that MAKES git move (finish parking a
+# worktree on the trunk, a dispatch cutting a branch) already calls `nudge()`,
+# and a nudge pulls git forward, so the 15 s is only ever paid for edits nobody
+# told us about. Worst case on the board is git_s + idle_s + the fan-out
+# itself, ~18 s at the defaults.
+GIT_S = 15.0        # minimum interval between git fan-outs; config key "git_s"
+
+# A cold sweep bypasses every memo and cadence (§4.3 #1) and counts what they
+# would have got wrong as `drift`. Today that is exactly one term — the git
+# cadence — and, unlike a stat memo, a disagreement there is not a lie: the
+# cadence never claimed to be current, `freshness["git"]` says how old it is.
+# It is the measured COST of the cadence, and it is counted because a number
+# nobody can see is a number nobody can argue with. `git_drift` breaks it out
+# of the total in `stats()` so step 4's parse memo — where drift IS a lie — is
+# still attributable.
 RECONCILE_S = 60.0
 MAX_STALE_S = 8.0   # never wait longer than this between sweeps
 HIST = 512          # version/changed-keys ring, §3.5
@@ -304,6 +365,76 @@ def _diffable_procs(plist):
     return _strip(plist, _UNDIFFED_PROC_KEYS)
 
 
+class GitCadence:
+    """git on its own clock: `roots -> ({root: info}, oldest probe clock)`.
+
+    Four rules, and every one of them is the difference between a slower sweep
+    and a board that lies:
+
+    * DUE. A full fan-out runs when `every_s` has passed since the last one.
+      Between them every root is served from `_info`.
+    * NEW. A root with no cached answer is probed the moment it appears, on the
+      spot, off-clock — a card that shows up with no branch, no commit and
+      `dirty 0` is worse than one whose dirty count is 12 s old. A root that
+      disappears is dropped, so a dead worktree cannot drag the freshness clock
+      backwards forever.
+    * FORCED. `force()` makes the next resolve a full fan-out. `Observer.nudge`
+      calls it, so anything that moves git — finish parking a worktree on the
+      trunk, a dispatch cutting a branch — is on the board next sweep instead of
+      up to `every_s` later.
+    * COLD. `cold=True` bypasses the clock entirely (§4.3 #1) and compares the
+      fresh answer against what the cache would have served. Disagreements land
+      in `drift`.
+
+    The returned clock is the OLDEST probe backing any root on the board, not
+    `now`, so `freshness["git"]` reads as "no card's git data is older than
+    this". It only advances when git actually ran.
+    """
+
+    def __init__(self, every_s=None):
+        self.every_s = float(config.CFG.get("git_s", GIT_S)
+                             if every_s is None else every_s)
+        self._info = {}          # root -> the last git_info for it
+        self._at = {}            # root -> wall clock of the probe that produced it
+        self._full_at = 0.0      # last full fan-out
+        self._forced = True      # the first resolve always probes
+        self.probes = 0          # fan-outs run
+        self.reuses = 0          # sweeps that shelled out to git not at all
+        self.drift = 0           # cold-sweep disagreements with the cache
+
+    def force(self, reason=""):
+        """Evidence that git moved. The next resolve re-probes, whatever the clock."""
+        self._forced = True
+
+    def resolve(self, roots, cold=False):
+        now = time.time()
+        uniq = list(dict.fromkeys(roots))
+        due = cold or self._forced or (now - self._full_at) >= self.every_s
+        want = uniq if due else [r for r in uniq if r not in self._info]
+        if want:
+            got = gitrepo.git_info_many(want)
+            self.probes += 1
+            if cold:
+                # what the cache WOULD have served, against the truth
+                self.drift += sum(1 for r, info in got.items()
+                                  if r in self._info and self._info[r] != info)
+            for r, info in got.items():
+                self._info[r], self._at[r] = info, now
+        else:
+            self.reuses += 1
+        if due:
+            self._full_at, self._forced = now, False
+        for gone in [r for r in self._info if r not in set(uniq)]:
+            self._info.pop(gone, None)
+            self._at.pop(gone, None)
+        return ({r: self._info[r] for r in uniq if r in self._info},
+                min((self._at[r] for r in uniq if r in self._at), default=None))
+
+    def stats(self):
+        return {"git_s": self.every_s, "git_probes": self.probes,
+                "git_reuses": self.reuses, "git_drift": self.drift}
+
+
 class Observer:
     """Owns the ONLY perpetual read loop. Never mutates the world.
 
@@ -313,15 +444,16 @@ class Observer:
     attribute read of a frozen object.
     """
 
-    def __init__(self, *, idle_s=IDLE_S, hot_s=HOT_S,
+    def __init__(self, *, idle_s=IDLE_S, hot_s=HOT_S, git_s=None,
                  reconcile_s=RECONCILE_S, max_stale_s=MAX_STALE_S):
-        # §2.5 also lists git_s and limits_s. Neither is implemented here and
-        # neither is accepted: git_s paces a WITHIN-sweep memo that does not
-        # exist yet, and limits_s would start polling cclimits from the sweep —
-        # that is step 7. A parameter that silently does nothing is worse than
-        # an absent one.
+        # §2.5 also lists limits_s. It is not implemented and not accepted: it
+        # would start polling cclimits from the sweep, which is step 7. A
+        # parameter that silently does nothing is worse than an absent one.
+        # `git_s` left None reads config.CFG["git_s"], so the cadence is a
+        # setting on disk and not a constant you have to edit code to change.
         self.idle_s, self.hot_s = idle_s, hot_s
         self.reconcile_s, self.max_stale_s = reconcile_s, max_stale_s
+        self._git = GitCadence(git_s)
         self._cv = threading.Condition()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -403,9 +535,13 @@ class Observer:
         started = time.time()
         t0 = time.perf_counter()
         fresh = {}
-        state = collect_state(fresh=fresh)
+        state = collect_state(
+            fresh=fresh, git=lambda roots: self._git.resolve(roots, cold=cold))
         ms = (time.perf_counter() - t0) * 1000.0
         self._sweeps += 1
+        # Every memo's and cadence's disagreement with the cold recompute,
+        # summed (§4.3 #4). One term today; step 4's parse memo adds the second.
+        self._drift = self._git.drift
         if cold:
             self._cold_at = started
         # Compare-and-swap, never a blind write. A mutation that parked
@@ -448,7 +584,7 @@ class Observer:
                 # the cards carry the current stopwatch readings.
                 self._snap = replace(prev, at=now, cards=cards, other_procs=other,
                                      freshness=dict(self._fresh),
-                                     sweep_ms=self._sweep_ms)
+                                     drift=self._drift, sweep_ms=self._sweep_ms)
                 return self._snap
             old_d = self._dcards if prev is not None else {}
             changed = [k for k, c in new_d.items() if old_d.get(k) != c]
@@ -511,7 +647,8 @@ class Observer:
                 "nudges": self._nudges, "errors": self._errors,
                 "last_error": self._last_error,
                 "freshness": dict(self._fresh),
-                "idle_s": self.idle_s, "hot_s": self.hot_s}
+                "idle_s": self.idle_s, "hot_s": self.hot_s,
+                **self._git.stats()}
 
     # ----------------------------------------------------------- write API
 
@@ -520,11 +657,21 @@ class Observer:
 
         Never blocks, never fails, never a source of truth — a dropped nudge
         costs latency and nothing else.
+
+        Sooner AND fuller: the nudge also pulls git off its cadence. Every
+        caller is a completed mutation (finish/exit parks a worktree back on
+        the trunk, finish/brief and finish/nudge type at an agent that is about
+        to commit, a dispatch cuts a branch), and a board that re-sweeps in
+        150 ms only to serve 15 s-old branch data has answered the wrong half
+        of the question. git is nudged unconditionally rather than per-reason:
+        guessing which mutations move the working tree is a second source of
+        truth that goes stale the first time somebody adds a route.
         """
         try:
             self._nudge_at = time.time()
             self._nudge_reason = reason
             self._nudges += 1
+            self._git.force(reason)
             self._wake.set()
         except Exception:                          # noqa: BLE001
             pass
@@ -638,7 +785,11 @@ def cached_state():
 
     The branch is also the freshness guarantee after a mutation: the act layer
     parks `_cache["t"] = 0.0`, and that still forces one synchronous collect on
-    the very next request rather than making the user wait out a sweep.
+    the very next request rather than making the user wait out a sweep. It
+    passes no `git=`, so that collect probes git in full — the cadence is a
+    background economy, and the one moment a user has just acted is not where
+    to spend it. The nudge that accompanies every such mutation re-arms the
+    sweep's own cadence, so the two agree rather than race.
     """
     if config.DEMO:
         return demo_state()

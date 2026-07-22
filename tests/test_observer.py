@@ -246,7 +246,7 @@ class TestSweepThread(CacheGuard):
         super().tearDown()
 
     def _stub(self, at=None):
-        def collect(fresh=None):
+        def collect(fresh=None, git=None):
             self.calls.append(time.time())
             if fresh is not None:
                 fresh["procs"] = time.time()
@@ -290,7 +290,7 @@ class TestSweepThread(CacheGuard):
         started = threading.Event()
         release = threading.Event()
 
-        def collect(fresh=None):
+        def collect(fresh=None, git=None):
             started.set()
             release.wait(5)
             return fake_state(time.time())
@@ -332,7 +332,7 @@ class TestSweepThread(CacheGuard):
         carries pre-mutation data, so the nudge has to survive it."""
         inside, release = threading.Event(), threading.Event()
 
-        def collect(fresh=None):
+        def collect(fresh=None, git=None):
             self.calls.append(time.time())
             if len(self.calls) == 1:
                 inside.set()
@@ -383,7 +383,7 @@ class TestSweepThread(CacheGuard):
     def test_a_wedged_probe_does_not_kill_the_loop(self):
         boom = [3]
 
-        def collect(fresh=None):
+        def collect(fresh=None, git=None):
             self.calls.append(time.time())
             if boom[0] > 0:
                 boom[0] -= 1
@@ -447,9 +447,16 @@ class TestSynchronousFallback(CacheGuard):
 
     def test_a_real_unchanged_fleet_publishes_no_second_version(self):
         """The claim, end to end: two full sweeps of the real compose path over
-        a fleet nobody touched, and `v` does not move."""
+        a fleet nobody touched, and `v` does not move.
+
+        `git_s=0` puts git back on every sweep, which is what this test is
+        about: it asserts the DIFF is quiet on an unchanged fleet and loud on a
+        changed one, not that the cadence is. The cadence has its own class
+        below, and the whole point of it is that a working-tree edit lands
+        within GIT_S rather than instantly.
+        """
         with FleetFixture():
-            o = fb.Observer()
+            o = fb.Observer(git_s=0.0)
             o.sweep()
             self.assertEqual(o.snapshot().v, 1)
             o.sweep()
@@ -460,6 +467,169 @@ class TestSynchronousFallback(CacheGuard):
             o.sweep()
             self.assertEqual(o.snapshot().v, 2)
             self.assertEqual(tuple(o._hist)[-1][1], ("alpha",))
+
+
+# --------------------------------------------------------- git's own clock
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestGitCadence(CacheGuard):
+    """§2.5's `git_s`. The git fan-out is 79 % of a sweep's CPU (1.26 of
+    1.59 CPU-s over nine worktrees, getrusage including children), so the
+    perpetual loop is unaffordable until git stops running every sweep.
+
+    It cannot be a stat memo: `dirty` is the working tree and nothing cheap
+    detects an edit there. So it is a cadence, and a cadence is only honest if
+    three things hold — the age is published, a nudge can pull it forward, and
+    the cold reconcile catches it lying. One test each.
+    """
+
+    def _dirty(self, o, name="alpha"):
+        return o.snapshot().cards[name]["git"]["dirty"]
+
+    def test_git_runs_once_and_is_reused_until_its_clock_comes_round(self):
+        with FleetFixture():
+            o = fb.Observer(git_s=60.0)
+            for _ in range(3):
+                fb._cache["state"] = None
+                o.sweep()
+            st = o.stats()
+            self.assertEqual(st["git_probes"], 1)      # one fan-out, three sweeps
+            self.assertEqual(st["git_reuses"], 2)
+            # …and every card still carries FULL git data, not a hole
+            for card in o.snapshot().cards.values():
+                self.assertEqual(card["git"]["branch"], "main")
+                self.assertTrue(card["git"]["commit"]["hash"])
+
+    def test_a_working_tree_edit_lands_within_git_s_not_instantly(self):
+        """The cost of the cadence, stated as a test rather than a hope."""
+        with FleetFixture():
+            o = fb.Observer(git_s=60.0)
+            o.sweep()
+            (Path(o.snapshot().cards["alpha"]["path"]) / "new").write_text("x\n")
+            o.sweep()
+            self.assertEqual(self._dirty(o), 0)        # still the cached answer
+            self.assertEqual(o.snapshot().v, 1)
+            o._git.every_s = 0.0                       # the clock comes round
+            o.sweep()
+            self.assertEqual(self._dirty(o), 1)
+            self.assertEqual(o.snapshot().v, 2)
+
+    def test_freshness_git_is_the_clock_of_the_probe_not_of_the_sweep(self):
+        """§3.3. A board that renders 'git 0s ago' off a reused answer is worse
+        than one that renders nothing."""
+        with FleetFixture():
+            o = fb.Observer(git_s=60.0)
+            o.sweep()
+            probed = o.snapshot().freshness["git"]
+            time.sleep(0.05)
+            o.sweep()
+            snap = o.snapshot()
+            self.assertEqual(snap.freshness["git"], probed)   # did NOT advance
+            self.assertLess(snap.freshness["git"], snap.at)   # …and says so
+            self.assertGreater(snap.freshness["transcripts"], probed)
+            o._git.force()
+            o.sweep()
+            self.assertGreater(o.snapshot().freshness["git"], probed)
+
+    def test_a_nudge_pulls_git_forward(self):
+        """Every mutation that moves git already nudges — finish/exit parks a
+        worktree on the trunk, dispatch cuts a branch. Serving 15 s-old branch
+        data straight after one is the whole failure this prevents."""
+        with FleetFixture():
+            o = fb.Observer(git_s=600.0)
+            o.sweep()
+            (Path(o.snapshot().cards["alpha"]["path"]) / "new").write_text("x\n")
+            o.sweep()
+            self.assertEqual(self._dirty(o), 0)
+            o.nudge("finish/exit")
+            o.sweep()
+            self.assertEqual(self._dirty(o), 1)
+            self.assertEqual(o.stats()["git_probes"], 2)
+
+    def test_a_worktree_that_appears_probes_git_on_the_spot(self):
+        """A new card with no git data is worse than a slightly stale one."""
+        with FleetFixture() as fx:
+            o = fb.Observer(git_s=600.0)
+            o.sweep()
+            d = fx.tmp / "code" / "gamma"
+            d.mkdir()
+            _git(d, "init", "-q", "-b", "trunk")
+            _git(d, "config", "user.email", "t@t.t")
+            _git(d, "config", "user.name", "t")
+            (d / "f").write_text("1\n")
+            _git(d, "add", "-A")
+            _git(d, "commit", "-q", "-m", "seed")
+            fb._cache["state"] = None
+            o.sweep()
+            card = o.snapshot().cards["gamma"]
+            self.assertEqual(card["git"]["branch"], "trunk")
+            self.assertTrue(card["git"]["commit"]["hash"])
+            # off-clock and per-root: the sitting worktrees were NOT re-probed,
+            # so the new card cost one `git`, not nine
+            self.assertEqual(o.stats()["git_probes"], 2)
+            self.assertEqual(set(o._git._at) - {str(d)},
+                             {str(fx.tmp / "code" / n) for n in ("alpha", "beta")})
+            self.assertLess(o._git._at[str(fx.tmp / "code" / "alpha")],
+                            o._git._at[str(d)])
+
+    def test_a_worktree_that_vanishes_stops_dragging_the_clock(self):
+        cad = fb.GitCadence(every_s=600.0)
+        with FleetFixture() as fx:
+            roots = [str(fx.tmp / "code" / n) for n in ("alpha", "beta")]
+            by, at = cad.resolve(roots)
+            self.assertEqual(set(by), set(roots))
+            by, at2 = cad.resolve(roots[:1])
+            self.assertEqual(set(cad._info), {roots[0]})   # beta forgotten
+            self.assertEqual(at2, cad._at[roots[0]])
+
+    def test_the_cold_reconcile_bypasses_the_cadence_and_counts_the_lie(self):
+        """LAW: a memo nobody audits is worse than a slow sweep (§4.3 #1/#4).
+        Here the disagreement is not a lie — the cadence never claimed to be
+        current — but it is the measured cost of the cadence, and unmeasured
+        cost is how 15.0 quietly becomes 300.0."""
+        with FleetFixture():
+            o = fb.Observer(git_s=600.0)
+            o.sweep(cold=True)
+            self.assertEqual(o.snapshot().drift, 0)
+            (Path(o.snapshot().cards["alpha"]["path"]) / "new").write_text("x\n")
+            o.sweep()                       # warm: serves the stale answer
+            self.assertEqual(self._dirty(o), 0)
+            o.sweep(cold=True)              # cold: recomputes, and compares
+            self.assertEqual(self._dirty(o), 1)
+            self.assertEqual(o.stats()["git_drift"], 1)
+            self.assertEqual(o.stats()["drift"], 1)
+            self.assertEqual(o.snapshot().drift, 1)
+            # beta was never touched, so exactly one card disagreed
+            o.sweep(cold=True)
+            self.assertEqual(o.stats()["git_drift"], 1)
+
+    def test_drift_reaches_a_snapshot_that_published_no_new_version(self):
+        o = fb.Observer()
+        o.publish(fake_state(1000.0))
+        o._drift = 3
+        snap = o.publish(fake_state(1001.0))
+        self.assertEqual(snap.v, 1)
+        self.assertEqual(snap.drift, 3)
+
+    def test_git_s_is_a_config_key_not_a_constant(self):
+        saved = fb.CFG.get("git_s")
+        try:
+            fb.CFG["git_s"] = 7.5
+            self.assertEqual(fb.Observer()._git.every_s, 7.5)
+            self.assertEqual(fb.Observer(git_s=1.0)._git.every_s, 1.0)
+        finally:
+            fb.CFG["git_s"] = saved
+        self.assertEqual(fb.CFG["git_s"], fb.observer.GIT_S)
+
+    def test_collect_state_with_no_git_seam_is_the_old_function(self):
+        """The rollback, and what keeps characterize.py byte-identical: nothing
+        about the cadence exists unless a caller passes it in."""
+        with FleetFixture():
+            fresh = {}
+            before = time.time()
+            st = fb.collect_state(fresh=fresh)
+            self.assertGreaterEqual(fresh["git"], before)
+            self.assertEqual(st["worktrees"][0]["git"]["branch"], "main")
 
 
 # ------------------------------------------------------- the read-only rule
