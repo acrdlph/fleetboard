@@ -104,7 +104,7 @@ class Wire(io.RawIOBase):
             return None
 
 
-def drained(deadline_s=10.0):
+def drained(deadline_s=5.0):
     """Wait for the process-wide census to reach zero, and say whether it did.
 
     The census outlives a test case, so a stream still unwinding when the next
@@ -326,6 +326,22 @@ class TestResume(StreamGuard):
         self.obs.publish(state(2000.0, cards=(("alpha", 9), ("beta", 0))))
         self.assertEqual(frame(wire.next())[0], 4)
 
+    def test_a_client_already_at_the_current_version_is_answered_at_once(self):
+        """A reconnect that missed nothing still gets an answer immediately.
+
+        This is the case the eager first frame exists for, and the only one:
+        for any cursor BEHIND the server the loop's own `wait_for` returns at
+        once and would send the same frame, so dropping the eager send is
+        invisible there. At `cursor == v` it is not — `wait_for` blocks, and a
+        client that reconnected across a blip would hear nothing at all until
+        the fleet next changed. On a quiet board that is a whole keepalive of
+        silence and reads as a stream that never started.
+        """
+        self.wind(3)
+        wire, _ = self.connect(Last_Event_ID=3)
+        fid, _, data = frame(wire.next())
+        self.assertEqual((fid, data["type"], data["cards"]), (3, "delta", {}))
+
     def test_a_cursor_older_than_the_ring_gets_a_full_snapshot(self):
         self.wind(fb.observer.HIST + 20)
         wire, _ = self.connect(Last_Event_ID=1)
@@ -446,14 +462,25 @@ class TestTeardown(StreamGuard):
 
     def test_a_client_that_speaks_is_not_mistaken_for_a_dead_one(self):
         """Readability is not death. A byte from the client is unexpected —
-        EventSource never sends one — but it is not a reason to hang up."""
-        fb.CFG["sse_liveness_s"] = 0.02
+        EventSource never sends one — but it is not a reason to hang up.
+
+        Asserted through the KEEPALIVE, not through the next frame. Publishing
+        and waiting for the frame proves nothing: `wait_for` returns the moment
+        the version moves, so the liveness check never runs and a stream that
+        treated any readable byte as death would pass anyway. A keepalive can
+        only be reached via QUIET, and QUIET requires every liveness slice in
+        the interval to have looked at this socket and found somebody there.
+        """
+        fb.CFG["sse_liveness_s"] = 0.01
+        fb.CFG["sse_keepalive_s"] = 0.15       # ~15 liveness checks per beat
         self.obs.publish(state(1000.0))
         wire, _ = self.connect()
         wire.next()
         wire.peer.sendall(b"hello?")
+        self.assertEqual(wire.next(), ": keepalive\n\n")
+        self.assertEqual(wire.next(), ": keepalive\n\n")
         self.bump()
-        self.assertEqual(frame(wire.next())[0], 2)   # still streaming
+        self.assertEqual(frame(wire.next())[0], 2)   # …and still streaming
 
     def test_a_client_that_dies_on_the_keepalive_is_reclaimed_too(self):
         """The quiet path matters more than the busy one: a phone that drops

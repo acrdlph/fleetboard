@@ -223,16 +223,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._stream(obs)
         finally:
-            pass
+            with _subs_lock:
+                _subs["open"] -= 1
 
     def _stream(self, obs):
         """The stream proper: a snapshot, then one frame per version bump.
 
-        The loop never polls. `Observer.wait_for` blocks on the same Condition
-        that `publish` notifies, so a version that does not move produces no
-        wakeup, no frame and no bytes — which is the whole point of §3.2. A
-        board that re-rendered on a heartbeat would be back to polling with
-        extra steps.
+        The loop never polls the OBSERVER. `Observer.wait_for` blocks on the
+        same Condition that `publish` notifies, so a version that does not move
+        produces no wakeup, no frame and no bytes — which is the whole point of
+        §3.2. A board that re-rendered on a heartbeat would be back to polling
+        with extra steps.
         """
         keep = float(_knob("sse_keepalive_s", KEEPALIVE_S))
         # `Last-Event-ID` is EventSource's own reconnect cursor: the browser

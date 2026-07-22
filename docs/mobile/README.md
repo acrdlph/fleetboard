@@ -19,7 +19,7 @@ are.
 | **Phase** | B — backend, in flight |
 | **Shipped** | steps 0–3 + 5 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core. An ended turn is read off the transcript rather than waited out, and delegated work — including the background tasks the CLI's own counts miss — holds the turn open |
 | **Next** | step 4 phase 2 — move `index.html` off `setInterval(tick, 5000)` and onto the stream |
-| **Tests** | 464 · characterization 5,656 cases (18 sections) |
+| **Tests** | 465 · characterization 5,656 cases (18 sections) |
 | **Last updated** | 2026-07-22 |
 
 Design documents are being generated and reconciled. Until each is listed as **settled** below,
