@@ -4,6 +4,13 @@
 document. Where it contradicts an earlier ADR, this document wins and an ADR is raised to record
 the reversal (see §11).
 
+> **Read [ADR 0011](adr/0011-measurement-supersedes-the-design-doc.md) alongside this document.**
+> Implementing steps 0–2 found three places where following this literally would have shipped a
+> defect — two of them silent — plus one cadence unreachable on real hardware. This remains the
+> authority on *structure*: the decomposition, the state model, versioning, the seam rules, the
+> mitigations for statefulness. It is **not** authoritative on numbers or platform behaviour,
+> which were reasoned rather than measured. ADR 0011 indexes where it is stale.
+
 > **`orchestra.py:NNN` citations throughout are historical.**
 > [ADR 0010](adr/0010-split-into-a-package.md) split that file into the `orchestra/` package;
 > the line numbers were true at the 2,302-line commit this was written against. Grep for the

@@ -101,6 +101,7 @@ objections have already been considered and answered there.
 | [0007](adr/0007-hooks-as-first-class-signal.md) | Claude Code hooks as a first-class signal source | accepted in principle |
 | [0008](adr/0008-identity-addressed-mutations.md) | Mutations addressed by durable identity, never by pid | accepted, **fixes a live bug** |
 | [0009](adr/0009-api-v1.md) | The versioned API starts at `/api/v1` | accepted |
+| [0011](adr/0011-measurement-supersedes-the-design-doc.md) | Where ENGINE.md and measurement disagree, measurement wins | accepted |
 
 ---
 
