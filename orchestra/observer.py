@@ -55,7 +55,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 
-from . import config, gitrepo, procs, transcripts, status, limits, watcher
+from . import (config, gitrepo, hooks as hooks_mod, procs, transcripts, status,
+               limits, watcher)
 
 STATE_TTL_S = 4.0              # cache collector output between requests
 _cache = {"t": 0.0, "state": None}
@@ -63,7 +64,7 @@ _cache = {"t": 0.0, "state": None}
 
 # ---------------------------------------------------------------- collectors
 
-def collect_state(fresh=None, git=None, cold=False, settle=None):
+def collect_state(fresh=None, git=None, cold=False, settle=None, hooks=None):
     """Compose the board. `fresh` is an optional out-parameter.
 
     Pass a dict and the collector stamps it `kind -> wall clock of that kind's
@@ -94,6 +95,21 @@ def collect_state(fresh=None, git=None, cold=False, settle=None):
     world as it is this instant. The `Observer` passes its own `Settler`, so
     the hysteresis belongs to the thing that publishes rather than to a module
     global two callers share.
+
+    `hooks` is the fourth seam and the same promise a fourth time: `None` and
+    this function knows nothing about Claude Code hooks and composes exactly the
+    board it composed before ADR 0007. The `Observer` passes
+    `HookEdges.live()` — `sid -> status`, ONE snapshot for the whole sweep, so
+    every card in a frame is reconciled against the same instant and the
+    hook store's lock is taken once rather than once per session.
+
+    ORDER, and it is load-bearing three times over: the hook lands inside
+    `scan_sessions` (it is an input to the status ladder, not a decoration on
+    its output), so it is already applied when the limit join runs — a hooked
+    ◆ YOUR TURN on an exhausted account still becomes ⛔ LIMIT HIT — and when
+    `settle` runs, so a hook EXPIRING is damped by the anti-flicker dwell like
+    any other de-escalation. A hook that could skip `settle` would be a source
+    that can make the board blink, which is the one thing §6.3 forbids.
     """
     def stamp(kind):
         if fresh is not None:
@@ -105,7 +121,8 @@ def collect_state(fresh=None, git=None, cold=False, settle=None):
     # `all_procs`, not `procs`: a local of that name would shadow the module.
     all_procs = procs.claude_processes(cold=cold)
     stamp("procs")
-    sessions = transcripts.scan_sessions(worktrees, all_procs, now, cold=cold)
+    sessions = transcripts.scan_sessions(worktrees, all_procs, now, cold=cold,
+                                         hooks=hooks)
     stamp("transcripts")
 
     # An agent parked at the prompt on an exhausted account isn't "your turn" —
@@ -709,7 +726,8 @@ class Observer:
 
     def __init__(self, *, idle_s=None, hot_s=None, git_s=None,
                  reconcile_s=None, max_stale_s=None, idle_blind_s=None,
-                 watch=None, watcher_factory=None, dwell_s=None):
+                 watch=None, watcher_factory=None, dwell_s=None,
+                 hook_ttl_s=None):
         # §2.5 also lists limits_s. It is not implemented and not accepted: it
         # would start polling cclimits from the sweep, which is step 7. A
         # parameter that silently does nothing is worse than an absent one.
@@ -729,6 +747,12 @@ class Observer:
         self.max_stale_s = _cadence("max_stale_s", MAX_STALE_S, max_stale_s)
         self._git = GitCadence(git_s)
         self._settler = Settler(dwell_s)
+        # The hook edges (§2.5, ADR 0007). Owned by the OBSERVER because they
+        # are evidence, and evidence is this class's whole job; the SERVER
+        # merely carries them in off a route. It is created unconditionally and
+        # costs one empty dict on a fleet where no hook ever fires.
+        self._hooks = hooks_mod.HookEdges(
+            _cadence("hook_ttl_s", hooks_mod.HOOK_TTL_S, hook_ttl_s))
         self._cv = threading.Condition()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -870,7 +894,12 @@ class Observer:
         fresh = {}
         state = collect_state(
             fresh=fresh, cold=cold, settle=self._settler.apply,
-            git=lambda roots: self._git.resolve(roots, cold=cold))
+            git=lambda roots: self._git.resolve(roots, cold=cold),
+            # ONE snapshot of the edges, taken here, before the scan. Read
+            # `HookEdges.live` for why it is a dict and not the store: a hook
+            # POST that has to wait for this sweep's lock is an AGENT that has
+            # to wait for it.
+            hooks=self._hooks.live(started))
         ms = (time.perf_counter() - t0) * 1000.0
         self._sweeps += 1
         # Every memo's and cadence's disagreement with the cold recompute,
@@ -1122,7 +1151,7 @@ class Observer:
                 # and `max_stale_s` if somebody set that below `idle_s`
                 "idle_effective_s": min(self.effective_idle_s, self.max_stale_s),
                 **self._git.stats(), **self._settler.stats(),
-                **transcripts.memo_stats(),
+                **self._hooks.stats(), **transcripts.memo_stats(),
                 **procs.proc_memo_stats(),
                 **(self._watcher.stats() if self._watcher is not None
                    else {"watching": False})}
@@ -1164,6 +1193,44 @@ class Observer:
         except Exception:                          # noqa: BLE001
             pass
 
+    def hook(self, sid, event, at=None, notification_type=None):
+        """A Claude Code hook edge (§2.5, ADR 0007). Evidence, never a command.
+
+        Lowers latency and raises confidence; expires after `hooks.HOOK_TTL_S`,
+        after which sweep inference resumes. A DROPPED HOOK COSTS LATENCY, NEVER
+        TRUTH — that sentence is the whole safety argument and `HookEdges` is
+        built around it.
+
+        Returns the status the event asserts, or None for an event that asserts
+        nothing (which is most of the 30). The route echoes it back so a human
+        debugging an install can see whether the board understood the event, and
+        it is the only reason this returns anything at all.
+
+        NUDGES, and only when the edge means something. That is the point of a
+        hook: a `Stop` should collapse ● WORKING → ◆ YOUR TURN on the next
+        sweep, not up to `idle_s` later. An event that asserts no status does
+        not nudge, because waking the loop for a `MessageDisplay` would run the
+        board's sweep at the model's token rate. `git=False`, like the watcher's
+        nudge: an agent finishing a turn does not move the working tree, and
+        forcing a git fan-out per turn is the cost `GIT_S` exists to bound.
+
+        Never raises. This is called from a request thread serving a route that
+        an AGENT IS BLOCKED ON; an exception here would surface as a hook
+        timeout in somebody's terminal.
+        """
+        try:
+            st = self._hooks.record(sid, event, at,
+                                    notification_type=notification_type)
+            if st is not None:
+                self.nudge(f"hook:{event}", git=False)
+            return st
+        except Exception:                          # noqa: BLE001
+            return None
+
+    def hooked(self, sid, now=None):
+        """The live edge for one session, or None. For diagnostics and tests."""
+        return self._hooks.edge(sid, now)
+
 
 # The process-wide sweep. Rebound by `start_observer`, so it is deliberately
 # NOT re-exported on the facade (ADR 0010: a facade copy of a rebound global is
@@ -1193,6 +1260,25 @@ def nudge(reason="", git=True):
     passes `git=False`."""
     if _observer is not None:
         _observer.nudge(reason, git=git)
+
+
+def hook(sid, event, at=None, notification_type=None):
+    """Module-level ingest, for the route (ENGINE.md §7.1's `ingest_hook`).
+
+    A no-op returning None when no sweep thread is running, so the route can be
+    served unconditionally: a board started without an Observer — the documented
+    rollback, and every unit test that does not want a thread — must still
+    answer an agent's hook with a 200 rather than a 500. THE AGENT IS BLOCKED ON
+    THIS CALL. It always answers.
+    """
+    return None if _observer is None else \
+        _observer.hook(sid, event, at, notification_type=notification_type)
+
+
+def hook_stats():
+    """The edge counters, for `/api/health`-adjacent diagnostics."""
+    return _observer._hooks.stats() if _observer is not None else \
+        {"hook_received": 0, "hook_live": 0, "hook_sessions": 0}
 
 
 # --------------------------------------------------------------- demo state
@@ -1313,7 +1399,12 @@ def cached_state():
         # hysteresis at all, which is the documented rollback.
         state = collect_state(
             fresh=fresh,
-            settle=_observer._settler.apply if _observer is not None else None)
+            settle=_observer._settler.apply if _observer is not None else None,
+            # …and through the same hook edges, for the same reason. A collect
+            # on the request thread that ignored them would show a hooked
+            # session as `inferred` for one poll and `observed` on the next,
+            # which is the board disagreeing with itself about how sure it is.
+            hooks=_observer._hooks.live(now) if _observer is not None else None)
         _cache["state"], _cache["t"] = state, now
         if _observer is not None:
             # a collect is a collect: publish it, or the version and the

@@ -27,9 +27,9 @@ script, else cwd) > defaults. See README.md.
 import time                    # unused here, but tests reach time.sleep as
                                # `orchestra.time.sleep` — keep the name bound
 
-from . import (config, shell, status, gitrepo, procs, transcripts, limits,
-               watcher, observer, identity, auth, terminal, chat, finish,
-               dispatch, resume, qr, tailnet, pairing, server)
+from . import (config, shell, status, gitrepo, procs, hooks, transcripts,
+               limits, watcher, observer, identity, auth, terminal, chat,
+               finish, dispatch, resume, qr, tailnet, pairing, server)
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO,
@@ -48,6 +48,12 @@ from .procs import (claude_processes, pair_sessions_with_procs, shell_children,
                     _pid_cwds, _pid_config_dirs, _host_of, _tmux_pane_map,
                     ProcMemo, proc_memo_stats, proc_memo_drift,
                     proc_memo_clear, PROC_MEMO_CAP)
+# `install`, `installed` and `status` are deliberately NOT re-exported: at the
+# top level `install` reads as installing orchestra and `status` collides with
+# the module of that name. Reach them as `orchestra.hooks.install`.
+from .hooks import (HookEdges, Edge, hook_status, settings_fragment,
+                    settings_arg, HOOK_STATUS, NOTIFY_STATUS, HOOK_TTL_S,
+                    INSTALLED_EVENTS, MAX_EDGES)
 from .transcripts import (claude_homes, _read_chunk, _clean, _real_prompt,
                           session_topic, last_assistant_text, find_last_user,
                           parse_session_tail, scan_sessions, _subagent_files,

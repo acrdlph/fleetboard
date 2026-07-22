@@ -5,6 +5,10 @@ devices.json
 devices.json.tmp
 audit.log.jsonl
 __pycache__/
+# the generated hook fragment + script (orchestra.hooks.install). Regenerated on
+# every dispatch, and it carries THIS machine's port — committing it would ship
+# somebody else's port to everyone else's board.
+.orchestra/
 *.log
 nohup.out
 .DS_Store

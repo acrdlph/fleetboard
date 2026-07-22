@@ -743,7 +743,7 @@ class TestTheObserverSide(unittest.TestCase):
             "other_procs": [{"pid": 13, "cpu": 0.0, "etime": "1"}]}
         collect = fb.observer.collect_state
         try:
-            fb.observer.collect_state = lambda fresh=None, git=None, cold=False, settle=None: state
+            fb.observer.collect_state = lambda fresh=None, git=None, cold=False, settle=None, hooks=None: state
             o.sweep()
         finally:
             fb.observer.collect_state = collect

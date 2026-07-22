@@ -630,7 +630,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        if self.path.startswith("/api/reserve"):
+        if self.path.startswith("/api/hook"):
+            # ENGINE.md §7.1: one route, one dict. The hottest POST this server
+            # has — several per agent turn, from every hooked session on the
+            # machine — and the only one an AGENT IS BLOCKED ON while it is
+            # served. Claude Code runs its hooks synchronously; a slow answer
+            # here is a slow agent, and a 500 here is a red line in somebody's
+            # terminal in the middle of their work.
+            #
+            # So it does exactly two things — record the edge, nudge the loop —
+            # and it cannot fail: `observer.hook` swallows everything, and this
+            # branch answers 200 for an unknown event, a malformed session id
+            # and a board running with no Observer at all. `status` in the reply
+            # is what the board UNDERSTOOD (null for the ~22 events that assert
+            # nothing), which is the only thing that makes a broken install
+            # debuggable without reading this file.
+            #
+            # AUTHENTICATION is `parse_request`, like every other route, and for
+            # a hook that means loopback trust: the agent runs on this Mac and
+            # posts to 127.0.0.1 (see `hooks.SCRIPT`). Nothing weaker would be
+            # possible — a hook has no credential to present and we will not
+            # mint one per session — and nothing stronger is bought: a local
+            # process that wanted to lie about a status can already type at the
+            # agent through `/api/send`, which is a far worse power than
+            # mislabelling a card. The cross-site guards still run above, so a
+            # page you are visiting cannot post one through your browser.
+            result = {"ok": True, "status": observer.hook(
+                payload.get("session_id"), payload.get("hook_event_name"),
+                notification_type=payload.get("notification_type"))}
+        elif self.path.startswith("/api/reserve"):
             result = limits.set_reserve(payload.get("account"), payload.get("percent"))
         elif self.path.startswith("/api/resume/schedule"):
             result = resume.schedule_resume(

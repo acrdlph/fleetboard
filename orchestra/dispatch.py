@@ -35,7 +35,7 @@ import shlex
 import threading
 import time
 
-from . import config, shell, gitrepo, transcripts, limits, observer
+from . import config, shell, gitrepo, hooks, transcripts, limits, observer
 
 
 # --------------------------------------------------------------- dispatch
@@ -219,6 +219,30 @@ def deliver_text(name, text):
     return False
 
 
+def _hook_flag():
+    """`--settings <fragment>` for a launch we control, or `''`.
+
+    THE ONE PLACE ADOPTION HAPPENS (ADR 0007, `hooks.py`'s installation note).
+    An agent orchestra starts gets hooks; an agent the user starts does not, and
+    we do not go looking for their settings.json to fix that.
+
+    It returns a STRING for a shell command line, and it is quoted here rather
+    than by the caller because both callers build their command by
+    interpolation. Empty on any failure — a dispatch that cannot write a
+    settings fragment must still dispatch, and the resulting agent reads
+    exactly as every unhooked agent on the board does.
+
+    The flag ADDS a layer; it replaces nothing. Measured against 2.1.218: hooks
+    from `--settings` and hooks from the settings the CLI loaded itself both
+    fired, for the same events, in the same session. Somebody's own
+    `PostToolUse` hook keeps running next to ours.
+    """
+    try:
+        return " --settings " + shlex.quote(str(hooks.install()))
+    except OSError:
+        return ""
+
+
 def closeout_shell(home, model, brief, trunk):
     """The tmux command for a one-shot closeout: run claude headless, then let
     git itself verify the landing. Verified clean -> exit, the tmux session
@@ -230,15 +254,19 @@ def closeout_shell(home, model, brief, trunk):
     DISPATCH runs, _run_dispatch is its only caller, and keeping it on this
     side is what stops finish and dispatch importing each other (ADR 0010)."""
     model_flag = f" --model {shlex.quote(model)}" if model else ""
+    hook_flag = _hook_flag()
     return (
         f"export CLAUDE_CONFIG_DIR={shlex.quote(str(home))}\n"
-        f"claude --dangerously-skip-permissions{model_flag} -p {shlex.quote(brief)}\n"
+        f"claude --dangerously-skip-permissions{model_flag}{hook_flag} "
+        f"-p {shlex.quote(brief)}\n"
         f"if git merge-base --is-ancestor HEAD {shlex.quote(trunk)} 2>/dev/null "
         '&& [ -z "$(git status --porcelain)" ]; then exit 0; fi\n'
         "echo; echo '⚠ closeout could not verify a clean landing — resuming the session:'\n"
         # no --model here on purpose: the rescue resumes on the account's
-        # default (stronger) model, so a haiku closeout escalates on failure
-        "exec claude --dangerously-skip-permissions --continue\n"
+        # default (stronger) model, so a haiku closeout escalates on failure.
+        # The hook flag DOES carry over: the rescue is the branch that parks as
+        # needs-you, so it is the branch whose status most needs to be observed.
+        f"exec claude --dangerously-skip-permissions{hook_flag} --continue\n"
     )
 
 
@@ -307,7 +335,8 @@ def _run_dispatch(job, mission, worktree, account, model, effort,
            + time.strftime("-%H%M%S")
     model_flag = f" --model {shlex.quote(model)}" if model else ""
     shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
-                 f"exec claude --dangerously-skip-permissions{model_flag}")
+                 f"exec claude --dangerously-skip-permissions"
+                 f"{model_flag}{_hook_flag()}")
     _log(job, f"② creating tmux session {name}…")
     rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
                          "-c", wt["path"], shell_cmd])

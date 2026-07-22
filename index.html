@@ -294,6 +294,15 @@ header .wrap { max-width:none; }
 .st.ended    { color:var(--muted-2); }
 .acct { color:var(--cyan); font-size:var(--fs-xs); }
 .meta { color:var(--muted-2); font-size:var(--fs-xs); }
+/* Hook-backed sessions (ADR 0007). QUIET ON PURPOSE. Most people's agents are
+   not hooked and never will be — an agent you started yourself cannot be — so
+   this must read as "this one is extra sure", never as "the others are
+   suspect". A dim dot after the status, and the tooltip carries the sentence.
+   `.observed` is the brighter half: the status we are showing IS what the CLI
+   said. `.inferred` is a hooked session whose hook the ladder overruled. */
+.hookdot { font-size:var(--fs-2xs); cursor:help; }
+.hookdot.observed { color:var(--green); opacity:.85; }
+.hookdot.inferred { color:var(--muted-2); opacity:.6; }
 .subdir { color:var(--yellow); font-size:var(--fs-xs); }
 .topic { color:var(--fg); font-weight:500; margin-top:4px; font-size:var(--fs-sm);
   display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
@@ -509,9 +518,20 @@ function render(st) {
         ? `<span class="until" data-until="${s.limit.resets_at}" data-prefix=" · resets "></span>` : "";
       const pend = (s.status !== "working" && s.pending_tools.length)
         ? `<div class="pending">⧗ waiting on: ${esc(s.pending_tools.join(", "))}</div>` : "";
+      // ADR 0007. `hooked` says the CLI is talking to us about this session;
+      // `status_src` says whether THIS answer is the one it gave. The two are
+      // separate because a hooked session whose `Stop` lost to a live
+      // background shell is still inferred, and saying otherwise would be the
+      // board claiming a certainty it does not have.
+      const hookDot = s.hooked
+        ? `<span class="hookdot ${s.status_src === "observed" ? "observed" : "inferred"}" title="${
+            s.status_src === "observed"
+              ? "observed — Claude Code's own hook reported this status"
+              : "hook-backed session, but this status came from inference (the hook was outranked)"
+          }">◦</span>` : "";
       return `<div class="sess ${s.status}">
         <div class="row1">
-          <span class="st ${s.status}"><span class="g">${stt.glyph}</span> ${stt.label}${resetTick}</span>
+          <span class="st ${s.status}"><span class="g">${stt.glyph}</span> ${stt.label}${resetTick}</span>${hookDot}
           <span class="acct">[${esc(s.account)}]</span>
           <span class="meta">${esc(s.model || "?")}</span>
           <span class="meta age" data-since="${s.last_write_at != null ? s.last_write_at : ""}"></span>

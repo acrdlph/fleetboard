@@ -222,6 +222,29 @@ ADMIN_ONLY = "admin_local_only"
 # way to close it is a counter in `meta`, not a log nobody can grep.
 SIDE_EFFECT_GETS = ("/api/focus",)
 
+# …and the one mutation that is NOT logged, which is the same argument running
+# the other way.
+#
+# `POST /api/hook` is a Claude Code hook edge (ADR 0007). It fires several times
+# per agent turn from every hooked session on the machine — the comment above
+# says logging reads would "write a line every few seconds forever and bury the
+# eleven lines that matter", and this route is an order of magnitude louder than
+# `/api/state` polling ever was. A busy fleet would push a megabyte a day of
+# `POST /api/hook allow` through `audit.log.jsonl` and make the log useless for
+# the thing it exists for.
+#
+# It is safe to leave out because of what the route can DO, which is nothing: it
+# writes one entry to an in-memory dict that expires in 90 s and never leaves
+# the process. It types at no agent, reads no transcript and returns no fleet
+# data. The honest replacement is exactly what that comment prescribes — a
+# COUNTER rather than a log — and `observer.stats()` carries it as
+# `hook_received` / `hook_live` / `hook_ignored`.
+#
+# REFUSALS ARE STILL LOGGED. `audited` only governs the allow path, so a peer
+# that is refused here appears in the log like any other refusal — which is the
+# half that could ever be evidence of anything.
+NOT_AUDITED = ("/api/hook",)
+
 # The failure budget. A token is 256 bits from `secrets`, so this is NOT what
 # stops it being guessed — nothing can guess it, and 10 tries a minute across a
 # long weekend (60 h) is 36,000 of 2**256. What the budget actually buys:
@@ -631,9 +654,15 @@ def exempt(method, path):
 
 def audited(method, path):
     """Is this request written to the audit log when it is allowed?"""
+    clean = path.split("?", 1)[0]
+    if any(clean == p or clean.startswith(p + "/") for p in NOT_AUDITED):
+        # Segment-exact, like `_under_admin`, and for the mirror-image reason:
+        # this list SUPPRESSES logging, so matching too eagerly is the unsafe
+        # direction and a substring match on `/api/hook` would also silence
+        # `/api/hooked-up-to-something-else`. Write it correctly once.
+        return False
     if method != "GET":
         return True
-    clean = path.split("?", 1)[0]
     # Device management is audited even when it only reads. `GET /api/v1/devices`
     # is the inventory of every credential to this machine, which is a very
     # different thing to read than a status page — and unlike `/api/state`, it

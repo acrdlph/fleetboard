@@ -228,6 +228,19 @@ class StatMemo:
 _FACTS = StatMemo(MEMO_FILES)     # transcript -> the facts a card needs
 _TREES = StatMemo(MEMO_DIRS)      # subagent directory -> its entry names
 
+# Times a live hook edge asserted a status and the LADDER PUBLISHED SOMETHING
+# ELSE — ENGINE.md §7.3 rule (2), a lower-ranked source vetoing a question the
+# higher one cannot answer. A list of one so `scan_sessions` can bump it without
+# a `global`, which is the same shape the memos use (an object with a counter on
+# it) for the same reason.
+#
+# Unlike `scan_drift` this is NOT a bug and NOT a lie. It is the number of times
+# "the turn closed" lost to "a background shell is still running", which is the
+# ladder working. It is counted because a reconciliation nobody can see is a
+# reconciliation nobody can audit, and because the RATIO of it to `hook_live` is
+# how you tell a vocabulary mistake (every hook vetoed) from a healthy fleet.
+_HOOK_VETOES = [0]
+
 
 def memo_stats():
     """Counters for `observer.stats()`. `scan_drift` is the load-bearing one:
@@ -237,7 +250,8 @@ def memo_stats():
             "scan_drift": _FACTS.drift, "scan_entries": len(_FACTS),
             "tree_hits": _TREES.hits, "tree_misses": _TREES.misses,
             "tree_drift": _TREES.drift, "tree_entries": len(_TREES),
-            "memo_evictions": _FACTS.evictions + _TREES.evictions}
+            "memo_evictions": _FACTS.evictions + _TREES.evictions,
+            "hook_vetoed": _HOOK_VETOES[0]}
 
 
 def memo_drift():
@@ -245,6 +259,10 @@ def memo_drift():
 
 
 def memo_clear():
+    # `_HOOK_VETOES` too: a test that clears the memos is starting a scenario,
+    # and a counter that survives the reset is a counter that makes the next
+    # assertion depend on the previous test.
+    _HOOK_VETOES[0] = 0
     _FACTS.clear()
     _TREES.clear()
 
@@ -781,7 +799,7 @@ def _subagent_said(fp, st, now, cold=False):
     return val[0]
 
 
-def scan_sessions(worktrees, all_procs, now, cold=False):
+def scan_sessions(worktrees, all_procs, now, cold=False, hooks=None):
     """All recent sessions across every Claude home, mapped to worktrees.
 
     `all_procs`, not `procs`: the module object of that name is what the
@@ -792,7 +810,25 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
     the file and every directory re-scanned, and whatever the memo would have
     served is compared against the truth and counted into `drift`. Left False —
     which is every call but the reconcile sweep's — this reuses the parse of any
-    transcript whose `(path, dev, ino, size, mtime_ns)` has not moved."""
+    transcript whose `(path, dev, ino, size, mtime_ns)` has not moved.
+
+    `hooks` is `sid -> status`, ONE snapshot of the live hook edges taken by the
+    caller before the scan starts (`hooks.HookEdges.live()`), or None for a
+    fleet with no hooks installed — which is what every call outside the
+    Observer passes, and what keeps `tests/characterize.py` reproducible. It is
+    a plain dict rather than the store itself on purpose: this function walks
+    every home and every project directory between its first session and its
+    last, and taking the store's lock once per session would give a 300 ms scan
+    eighty chances to stall a hook POST — i.e. to stall an AGENT, because Claude
+    Code blocks on its hooks.
+
+    Two conditional fields ride out of here when a hook was involved, both
+    absent otherwise so an unhooked fleet's payload is byte-identical to before:
+    `hooked` (a live edge exists for this session) and `status_src: "observed"`
+    (…and what we are publishing is what it said). The pair is deliberate —
+    `hooked` is about the SESSION and is what the board badges; `status_src` is
+    about THIS ANSWER, and a hooked session whose hook was vetoed by the ladder
+    is honestly `inferred`."""
     by_wt = {w["path"]: [] for w in worktrees}
     wt_prefixes = {w["path"]: gitrepo.munge(w["path"]) for w in worktrees}
     window_s = config.CFG["session_window_h"] * 3600
@@ -930,12 +966,17 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
             # never reaches the wire. The old `int(age)` rounding is gone with
             # it, which changes nothing: every threshold is an integer, and
             # `int(a) < T` and `a < T` agree for integer T on a non-negative a.
+            hook = (hooks or {}).get(s["sid"])
             sess_status, tool_running = status.classify_session(
                 now - s["last_write_at"], alive, s["pending_tools"],
                 s["pending_workflows"] + s["pending_bg_agents"]
                 + s["pending_bg_tools"],
                 skip_perms, config.CFG["working_s"], shell_n,
                 turn_ended=s.get("turn_ended", False),
+                # The CLI's own word, within its TTL, or None (ENGINE.md §7).
+                # `classify_session` decides where it enters the ladder and what
+                # still vetoes it; this module only carries it.
+                hook=hook,
                 # All three clocks now come from config, each with its own
                 # measurement and its own misfire rate beside it there. They
                 # are separate arguments because they answer separate
@@ -947,6 +988,22 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                 orphan_grace_s=config.CFG["orphan_grace_s"],
                 quiet_s=config.CFG["quiet_s"])
             s["status"] = sess_status
+            if hook is not None:
+                s["hooked"] = True
+                if sess_status == hook:
+                    # ENGINE.md §7.3: `status_src` ships so the board can be
+                    # honest. "observed" is claimed for THIS answer only when
+                    # the answer IS what the CLI said — a hooked session whose
+                    # `waiting` was vetoed by a live shell is inferred, and says
+                    # so. Absent means inferred; nothing writes the string, so a
+                    # fleet with no hooks pays nothing on the wire.
+                    s["status_src"] = "observed"
+                else:
+                    # The two sources disagreed and the better-ranked one did
+                    # NOT win — §7.3 rule (2) fired, a veto. Counted, because
+                    # that section promises a disagreement is VISIBLE; see
+                    # `_HOOK_VETOES`.
+                    _HOOK_VETOES[0] += 1
             if tool_running:
                 s["tool_running"] = True
                 if shell_n and not s["pending_tools"]:

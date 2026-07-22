@@ -15,7 +15,7 @@ the contract — see `classify_session`.
 def classify_session(age_s, alive, pending_tools, delegated,
                      skip_perms, working_s, shells=0, *, turn_ended=False,
                      evidence_age=None, procs_known=True, quiet_s=None,
-                     block_grace_s=None, orphan_grace_s=None):
+                     block_grace_s=None, orphan_grace_s=None, hook=None):
     """Base session status from observable signals (before limit/handoff
     overrides). `delegated` counts every piece of work this session is waiting
     on itself: the CLI's own pending workflows and background agents, plus the
@@ -56,6 +56,48 @@ def classify_session(age_s, alive, pending_tools, delegated,
         agent, no live shell, no observed turn end — so it covers exactly "it
         has gone quiet and nothing says why". (It was called `thinking_s`
         while it was still a placeholder defaulting to 90.)
+
+    `hook` is the status a LIVE Claude Code hook edge asserts — the CLI itself,
+    in the first person, within `hooks.HOOK_TTL_S` (ADR 0007, ENGINE.md §7).
+    None means no hook, an expired one, or an event that asserts nothing, and
+    None is the default because most sessions on most machines will never have
+    one; with it None this function is byte-identical to what it was.
+
+    IT IS NOT AN OVERRIDE, and getting that wrong is how this feature breaks the
+    ladder. ENGINE.md §7.3 states two rules, not one:
+
+      (1) a higher-ranked source WINS on the same question;
+      (2) a lower-ranked source VETOES on a question the higher one cannot
+          answer.
+
+    So each hook status enters at the rung that answers ITS question, and keeps
+    every veto that already sat above that rung:
+
+      blocked / needs_input   a dialog is ON SCREEN. Nothing on disk can see it
+                              and nothing on disk can contradict it, so it
+                              enters at the top. It still requires `alive`:
+                              rank 2 vetoes a hook claiming a dead process is
+                              waiting for you.
+      waiting                 the turn closed — the SAME fact as `turn_ended`,
+                              delivered by push instead of by re-reading the
+                              file, so it enters at exactly that rung. It
+                              therefore stays BELOW delegated work, live shells
+                              and unresolved tool_uses, because `Stop` fires
+                              while background tasks keep running and "the agent
+                              is still busy" beats "the turn closed". (`Stop`'s
+                              payload even carries `background_tasks`, which is
+                              the CLI agreeing.)
+      working                 enters just above the `quiet_s` decay: it can only
+                              ever save a session that has gone quiet with no
+                              other explanation — a long WebFetch, a model
+                              thinking hard — from being called ◆ YOUR TURN
+                              early. Above it, every branch already returns
+                              WORKING, so placing it higher would change nothing
+                              except which branch got the credit.
+
+    A hook can therefore make this function faster and more certain; it cannot
+    make it say a dead process is alive, or that an agent with a running shell
+    is done.
     """
     pend = pending_tools or []
     age = age_s if evidence_age is None else evidence_age
@@ -66,6 +108,13 @@ def classify_session(age_s, alive, pending_tools, delegated,
     if not procs_known:                      # ps/lsof failed wholesale: never
         return "unknown", False              # claim ENDED, never claim FREE
 
+    if alive and hook in ("needs_input", "blocked"):
+        # The CLI says a dialog is on screen — a permission prompt
+        # (`Notification`/permission_prompt, `PermissionRequest`) or an
+        # elicitation. This is the ambiguity ADR 0007 exists for: from outside
+        # the process a dialog and a finished turn are the same bytes, and this
+        # is the only branch in this function that is not a guess about them.
+        return hook, False
     if alive and "AskUserQuestion" in pend:  # the question is ON DISK
         return "needs_input", False
     if alive and delegated:                  # awaiting work it launched itself
@@ -88,8 +137,10 @@ def classify_session(age_s, alive, pending_tools, delegated,
         if skip_perms or age < block_grace_s:
             return "working", True
         return "blocked", False
-    if alive and turn_ended:
-        # The CLI wrote its own end-of-turn marker after the agent's last word.
+    if alive and (turn_ended or hook == "waiting"):
+        # The CLI wrote its own end-of-turn marker after the agent's last word,
+        # or a `Stop` / `idle_prompt` hook said the same thing without us having
+        # to re-read the file. ONE branch for both, because they are one fact.
         # OBSERVED, so no clock is consulted: today this session reads WORKING
         # for the rest of the 90 s window and the user is told to come back
         # late. It sits BELOW every positive sign of work above — delegated
@@ -106,6 +157,20 @@ def classify_session(age_s, alive, pending_tools, delegated,
         # covers is a probe that came back empty, and config.py says why that
         # keeps it at 90 rather than at the ~0 the lag itself would buy.
         return ("working", False) if age < orphan_grace_s else ("ended", False)
+    if hook == "working":
+        # A live edge (UserPromptSubmit / PreToolUse / PostToolUse) inside the
+        # TTL on a session NOTHING above could explain: alive, nothing pending,
+        # no delegated work, no shell, no end-of-turn marker, and quiet for
+        # longer than `quiet_s`. That combination has exactly one common cause —
+        # THE MODEL IS THINKING. A long turn with no tool call in it writes
+        # nothing between the user's message and the answer, so at `quiet_s`
+        # (25 s) the board calls a working agent ◆ YOUR TURN and summons the
+        # user to an agent that is mid-sentence. The last hook says otherwise.
+        #
+        # Below `alive`, so it can never resurrect a dead process; below every
+        # branch above, all of which already return WORKING, so it changes only
+        # which branch gets the credit — never the answer.
+        return "working", False
     if age < quiet_s:
         return "working", False              # decay, LAST
     return "waiting", False

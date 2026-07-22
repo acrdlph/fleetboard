@@ -518,7 +518,7 @@ class TestSweepThread(CacheGuard):
         super().tearDown()
 
     def _stub(self, at=None):
-        def collect(fresh=None, git=None, cold=False, settle=None):
+        def collect(fresh=None, git=None, cold=False, settle=None, hooks=None):
             self.calls.append(time.time())
             if fresh is not None:
                 fresh["procs"] = time.time()
@@ -609,7 +609,7 @@ class TestSweepThread(CacheGuard):
         started = threading.Event()
         release = threading.Event()
 
-        def collect(fresh=None, git=None, cold=False, settle=None):
+        def collect(fresh=None, git=None, cold=False, settle=None, hooks=None):
             started.set()
             release.wait(5)
             return fake_state(time.time())
@@ -651,7 +651,7 @@ class TestSweepThread(CacheGuard):
         carries pre-mutation data, so the nudge has to survive it."""
         inside, release = threading.Event(), threading.Event()
 
-        def collect(fresh=None, git=None, cold=False, settle=None):
+        def collect(fresh=None, git=None, cold=False, settle=None, hooks=None):
             self.calls.append(time.time())
             if len(self.calls) == 1:
                 inside.set()
@@ -702,7 +702,7 @@ class TestSweepThread(CacheGuard):
     def test_a_wedged_probe_does_not_kill_the_loop(self):
         boom = [3]
 
-        def collect(fresh=None, git=None, cold=False, settle=None):
+        def collect(fresh=None, git=None, cold=False, settle=None, hooks=None):
             self.calls.append(time.time())
             if boom[0] > 0:
                 boom[0] -= 1
@@ -1128,7 +1128,7 @@ class TestSettlerDampsOnlyTheWayDown(CacheGuard):
     def test_the_sweep_publishes_through_its_own_settler(self):
         state = {"v": fake_state(time.time())}
 
-        def collect(fresh=None, git=None, cold=False, settle=None):
+        def collect(fresh=None, git=None, cold=False, settle=None, hooks=None):
             st = dict(state["v"])
             if settle is not None:
                 settle({"/wt": st["worktrees"][0]["sessions"]}, time.time())

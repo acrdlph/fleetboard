@@ -520,8 +520,14 @@ dispatch (kickoff → READY → instruction → DONE).
 
 - The transcript format is an undocumented Claude Code internal (tested
   against v2.1.x); statuses are honest heuristics, not ground truth.
-- BLOCKED / YOUR TURN are inferred — permission prompts aren't recorded in
-  transcripts.
+- BLOCKED / YOUR TURN are inferred **for agents orchestra did not launch** —
+  permission prompts aren't recorded in transcripts. Agents dispatched *by*
+  orchestra get a `--settings` fragment that POSTs Claude Code's own hooks to
+  the board, and their statuses are observed instead: a permission dialog reads
+  ■ BLOCKED within a couple of seconds of appearing rather than after
+  `block_grace_s`, and those sessions carry a dim `◦` on the board. orchestra
+  never writes your `settings.json`; an agent you started yourself has no hooks
+  and reads exactly as it always did.
 - Each clone's `origin/main` is only as fresh as its last `git fetch`; the
   map's trunk uses the freshest clone's view.
 - Handoff detection reads "fresher live session in the same worktree" as

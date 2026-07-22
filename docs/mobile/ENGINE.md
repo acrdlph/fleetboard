@@ -1047,6 +1047,26 @@ of the crossing is itself a 5 s poll produces exactly the flicker this section f
 hooks (observed)  >  process table  >  precise file writes  >  mtime heuristics  >  tmux capture-pane
 ```
 
+> **SHIPPED 2026-07-22 (step 6), and §7.3's sketch is superseded by the code.** The document
+> reconciles by REPLACING the inferred status with the hook's, outside `classify_session`. That
+> implements only the first of its own two rules. What shipped implements both: `classify_session`
+> takes a `hook=` argument and **each hook status enters the ladder at the rung that answers ITS
+> question**, so every veto that already sat above that rung still applies —
+>
+> * `blocked` / `needs_input` (a dialog is on screen) enters at the top, because nothing on disk
+>   can see a dialog and nothing on disk can contradict one. Still requires `alive`.
+> * `waiting` (`Stop`, `idle_prompt`) merges into the `turn_ended` rung, because it is the SAME
+>   fact delivered by push instead of by re-reading the file. It therefore still loses to
+>   delegated work, a live background shell and an unresolved `tool_use` — `Stop` fires while
+>   background tasks keep running, and its own payload carries `background_tasks[]` to prove it.
+> * `working` enters just above the `quiet_s` decay, where it rescues the one case inference
+>   cannot see: a long turn with no tool call in it writes nothing between the prompt and the
+>   answer, so at 45 s the board summoned the user to an agent that was mid-sentence.
+>
+> A hook that is overruled is counted as `hook_vetoed` and the card honestly reports `inferred`.
+> The `status_for()` in §7.3 below would have let a `Stop` free a worktree that still had a shell
+> running in it. See `orchestra/hooks.py` and `orchestra/status.py`.
+
 | rank | source | ingested by | confidence | freshness contract |
 |---|---|---|---|---|
 | 1 | **Claude Code hooks** | `POST /api/hook` → `observer.hook(sid, event, at)` | 100 | edge, **hard 90 s TTL** |
@@ -1121,6 +1141,23 @@ Two rules:
 configured automatically; agents the user starts independently cannot. The installation flow must
 not hijack the user's own `settings.json` hooks. ADR 0007 fixes the direction; the mechanism is an
 open question (§11).
+
+> **Resolved (step 6).** `claude --settings <file>` loads an **additional** layer — measured
+> against 2.1.218: a fragment's hooks and the hooks in the settings the CLI loaded itself both
+> fired, for the same events, in the same session. So `orchestra.hooks.install()` writes a
+> fragment and a one-line `sh` script under `.orchestra/`, `dispatch` passes `--settings` on both
+> launch paths, and **no file Claude Code owns is ever opened for writing**. Two things this
+> cannot reach, and they are not defects: an agent the user started (no flag, no hooks, falls to
+> rank 2–4 — today's behaviour exactly), and `claude --bare`, which skips hooks wholesale. The
+> second is an unmodelled kill switch and is the strongest argument for §7.2's TTL: under `--bare`
+> the absence of hooks is indistinguishable from a wedged server, and the system must be correct
+> either way.
+>
+> The route is **not audited** (`auth.NOT_AUDITED`). It fires several times per agent turn from
+> every hooked session; logging it would bury the eleven lines `audit.log.jsonl` exists for, which
+> is the same volume argument that module already makes for not logging reads. Counters replace it
+> (`hook_received` / `hook_live` / `hook_ignored` / `hook_vetoed` in `observer.stats()`), and
+> refusals are still logged.
 
 ### 7.5 cclimits — the fifth input class
 
