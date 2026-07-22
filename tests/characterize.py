@@ -13,6 +13,11 @@ So the unit suite cannot be its own safety net for this change. This harness is 
   * it records a golden JSON and compares against it, so "behaviour is identical" is a
     byte-comparison rather than an opinion.
 
+Mutation-testing this harness: clear __pycache__ first. A same-size edit
+(`+= 1` -> `+= 2`) within the same second leaves mtime and size unchanged, so
+Python happily reuses the stale .pyc and the mutation appears to be "caught"
+when it never ran at all. Observed here; it cost a confused half hour.
+
 Usage:
     python3 tests/characterize.py --record     # before the refactor
     python3 tests/characterize.py              # after — must be byte-identical
@@ -27,6 +32,7 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import os
 import pathlib
 import sys
 
@@ -182,7 +188,144 @@ def build(mod):
         {"in": t, "out": _safe(mod, "session_topic", t)} for t in TEXTS
     ]
 
+    snap["state_payload"] = _state_payload(mod)
+
     return snap
+
+
+# ---------------------------------------------------------- the wire payload
+
+VOLATILE = {
+    # wall-clock and machine readings that legitimately differ between runs.
+    # Normalised rather than dropped, so a field VANISHING is still caught.
+    "generated_at", "at", "cpu", "etime", "age_s", "last_write_at",
+    "resets_in", "resets_at", "due_at", "created_at", "fired_at",
+    "closeout_sent", "ts", "sweep_ms", "freshness", "pid", "uptime_s",
+}
+
+
+def _normalise(obj, path="", subs=()):
+    """Replace volatile leaf values with a type marker, keeping structure.
+
+    The point of this snapshot is the SHAPE of the wire payload — which keys
+    exist, nested how, holding what type — not the readings of the moment. A
+    renamed or dropped field must fail; a clock tick must not.
+    """
+    if isinstance(obj, dict):
+        return {k: (f"<{type(v).__name__}>" if k in VOLATILE and not isinstance(v, (dict, list))
+                    else _normalise(v, f"{path}.{k}", subs))
+                for k, v in sorted(obj.items())}
+    if isinstance(obj, list):
+        return [_normalise(x, path + "[]", subs) for x in obj]
+    if isinstance(obj, str):
+        # The fixture lives under a randomly-named temp dir whose path is
+        # embedded throughout the payload (card paths, git roots, session cwds,
+        # munged project dirs). Without this the snapshot differs on every run
+        # and the check is useless — it was, until this was added.
+        for needle, token in subs:
+            if needle in obj:
+                obj = obj.replace(needle, token)
+        return obj
+    return obj
+
+
+def _fixture_fleet(mod, tmp):
+    """A tiny but real fleet on disk: two git worktrees and a Claude home.
+
+    Deliberately NOT demo mode. `cached_state()` under DEMO returns
+    `demo_state()` — a separate hand-written fixture that never touches the
+    compose path — so snapshotting it pins nothing about the code a restructure
+    actually moves. (Verified: a field added inside collect_state's card loop
+    went completely undetected against the demo payload.)
+
+    Nothing is monkeypatched here. The fixture is selected purely through
+    config — roots, pattern and homes — so the real discover_worktrees →
+    git_info → scan_sessions → collect_state path runs end to end. Live probes
+    (`ps`/`lsof`) still run for real, but no claude process has its cwd inside a
+    temp dir, so every card lands with an empty live_procs deterministically.
+    """
+    import subprocess
+    root = tmp / "code"
+    root.mkdir(parents=True)
+    for name, branch in (("alpha", "main"), ("beta", "feat/x"), ("gamma", "fix/y")):
+        d = root / name
+        d.mkdir()
+        env = {"GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
+               "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z"}
+        run = lambda *a, _d=d, _e=env: subprocess.run(
+            ["git", "-C", str(_d), *a], check=True, capture_output=True,
+            text=True, env={**os.environ, **_e})
+        run("init", "-q", "-b", "main")
+        run("config", "user.email", "t@t.t")
+        run("config", "user.name", "t")
+        (d / "f").write_text("1\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "seed")
+        if branch != "main":
+            run("checkout", "-q", "-b", branch)
+            (d / "g").write_text("2\n")
+            run("add", "-A")
+            run("commit", "-q", "-m", "work")
+        if name == "beta":
+            (d / "dirty1").write_text("x\n")
+            (d / "dirty2").write_text("y\n")
+
+    home = tmp / ".claude"
+    # gamma's transcript is backdated: in-window but long idle, so it lands on a
+    # different status to alpha/beta and the severity sort has something to sort.
+    for name in ("alpha", "beta", "gamma"):
+        cwd = root / name
+        proj = home / "projects" / mod.munge(str(cwd))
+        proj.mkdir(parents=True)
+        (proj / f"sess-{name}.jsonl").write_text("\n".join(json.dumps(e) for e in [
+            {"type": "user", "cwd": str(cwd), "gitBranch": "main",
+             "message": {"content": f"build the {name} feature"}},
+            {"type": "assistant", "cwd": str(cwd),
+             "message": {"model": "claude-opus-4-8",
+                         "content": [{"type": "text", "text": f"working on {name}"}]}},
+        ]) + "\n")
+        if name == "gamma":
+            old = 1784600000.0          # fixed, well inside the 48h window
+            os.utime(proj / f"sess-{name}.jsonl", (old, old))
+    return root, home
+
+
+def _state_payload(mod):
+    """The real compose path over a controlled fleet — the wire payload's shape.
+
+    This is the only check that notices when a restructure silently drops or
+    renames a field that index.html, map.html or the coming Swift client reads.
+    """
+    import shutil
+    import tempfile
+    if not shutil.which("git"):
+        return [{"in": "collect_state(fixture)", "out": {"__skipped__": "git absent"}}]
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="orchestra-char-"))
+    saved = {k: mod.CFG.get(k) for k in ("roots", "pattern", "homes")}
+    was_demo = getattr(mod.config, "DEMO", False)
+    try:
+        root, home = _fixture_fleet(mod, tmp)
+        mod.config.DEMO = False
+        mod.CFG["roots"] = [str(root)]
+        mod.CFG["pattern"] = ""
+        mod.CFG["homes"] = [str(home)]
+        state = mod.collect_state()
+        # Do NOT re-sort. The severity ordering is board-visible behaviour and
+        # sorting it away here made the snapshot blind to it — verified by
+        # mutation: inverting the severity rank went undetected until this came
+        # out. Python's sort is stable and the fixture is fixed, so the order is
+        # deterministic as it stands.
+        state.pop("other_procs", None)      # whatever else is running on the box
+        subs = ((str(tmp), "<TMP>"), (mod.munge(str(tmp)), "<MUNGED-TMP>"))
+        return [{"in": "collect_state(fixture)", "out": _normalise(state, subs=subs)}]
+    except Exception as exc:                        # noqa: BLE001
+        return [{"in": "collect_state(fixture)",
+                 "out": {"__raised__": type(exc).__name__, "__msg__": str(exc)[:200]}}]
+    finally:
+        mod.config.DEMO = was_demo
+        for k, v in saved.items():
+            mod.CFG[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def digest(snap):

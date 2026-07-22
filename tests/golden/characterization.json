@@ -51,6 +51,10 @@
   "session_topic": {
    "cases": 13,
    "sha256": "aee536a607e802c8"
+  },
+  "state_payload": {
+   "cases": 1,
+   "sha256": "222e3e69a18a0771"
   }
  },
  "snapshot": {
@@ -25618,6 +25622,149 @@
    {
     "in": "\ud83d\ude80 unicode \u2301 glyphs \u25b2 \u26d4",
     "out": null
+   }
+  ],
+  "state_payload": [
+   {
+    "in": "collect_state(fixture)",
+    "out": {
+     "counts": {
+      "blocked": 0,
+      "ended": 1,
+      "limit": 0,
+      "needs_input": 0,
+      "waiting": 0,
+      "working": 2
+     },
+     "free_worktrees": [
+      "gamma"
+     ],
+     "generated_at": "<float>",
+     "hostname": "MacBookPro",
+     "user": "achill",
+     "worktrees": [
+      {
+       "availability": "busy",
+       "git": {
+        "ahead": null,
+        "behind": null,
+        "branch": "main",
+        "commit": {
+         "hash": "a1b7c5a",
+         "subject": "seed",
+         "ts": "<int>"
+        },
+        "dirty": 0
+       },
+       "live_procs": [],
+       "name": "alpha",
+       "path": "<TMP>/code/alpha",
+       "sessions": [
+        {
+         "account": "main",
+         "age_s": "<int>",
+         "branch": "main",
+         "cwd": "<TMP>/code/alpha",
+         "id": "sess-alp",
+         "last_assistant": "working on alpha",
+         "last_user": "build the alpha feature",
+         "model": "opus-4-8",
+         "pending_bg_agents": 0,
+         "pending_tools": [],
+         "pending_workflows": 0,
+         "pid": "<NoneType>",
+         "pid_certain": false,
+         "sid": "sess-alpha",
+         "status": "working",
+         "subagent_said": null,
+         "subagents_active": false,
+         "subdir": null,
+         "topic": "build the alpha feature"
+        }
+       ]
+      },
+      {
+       "availability": "busy",
+       "git": {
+        "ahead": null,
+        "behind": null,
+        "branch": "feat/x",
+        "commit": {
+         "hash": "9af404e",
+         "subject": "work",
+         "ts": "<int>"
+        },
+        "dirty": 2
+       },
+       "live_procs": [],
+       "name": "beta",
+       "path": "<TMP>/code/beta",
+       "sessions": [
+        {
+         "account": "main",
+         "age_s": "<int>",
+         "branch": "main",
+         "cwd": "<TMP>/code/beta",
+         "id": "sess-bet",
+         "last_assistant": "working on beta",
+         "last_user": "build the beta feature",
+         "model": "opus-4-8",
+         "pending_bg_agents": 0,
+         "pending_tools": [],
+         "pending_workflows": 0,
+         "pid": "<NoneType>",
+         "pid_certain": false,
+         "sid": "sess-beta",
+         "status": "working",
+         "subagent_said": null,
+         "subagents_active": false,
+         "subdir": null,
+         "topic": "build the beta feature"
+        }
+       ]
+      },
+      {
+       "availability": "free",
+       "git": {
+        "ahead": null,
+        "behind": null,
+        "branch": "fix/y",
+        "commit": {
+         "hash": "9af404e",
+         "subject": "work",
+         "ts": "<int>"
+        },
+        "dirty": 0
+       },
+       "live_procs": [],
+       "name": "gamma",
+       "path": "<TMP>/code/gamma",
+       "sessions": [
+        {
+         "account": "main",
+         "age_s": "<int>",
+         "branch": "main",
+         "cwd": "<TMP>/code/gamma",
+         "id": "sess-gam",
+         "last_assistant": "working on gamma",
+         "last_user": "build the gamma feature",
+         "model": "opus-4-8",
+         "pending_bg_agents": 0,
+         "pending_tools": [],
+         "pending_workflows": 0,
+         "pid": "<NoneType>",
+         "pid_certain": false,
+         "sid": "sess-gamma",
+         "status": "ended",
+         "subagent_said": null,
+         "subagents_active": false,
+         "subdir": null,
+         "topic": "build the gamma feature"
+        }
+       ]
+      }
+     ]
+    }
    }
   ]
  }
