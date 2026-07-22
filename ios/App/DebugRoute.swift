@@ -29,6 +29,9 @@ enum DebugRoute: Equatable {
     case fleet
     case limits
     case server
+    /// The branch map, pushed on the Fleet stack. `ORC_SCREEN=map` — the only way
+    /// `xcrun simctl` reaches a pushed destination that has no camera and no tap.
+    case map
     case worktree(String)
     case chat(worktree: String, account: String, sid: String)
     /// A `cclimits` slug — the key `/api/limits` uses, which is NOT always
@@ -58,6 +61,7 @@ enum DebugRoute: Equatable {
             guard parts.count == 2, !parts[1].isEmpty else { return .limits }
             return .account(parts[1])
         case "server": return .server
+        case "map": return .map
         case "mission": return .mission
         case "finish":
             guard parts.count == 2, !parts[1].isEmpty else { return nil }
@@ -86,7 +90,7 @@ enum DebugRoute: Equatable {
     /// Which tab the route lives on.
     var tab: Int {
         switch self {
-        case .fleet, .worktree, .chat, .mission, .finish, .resume: 0
+        case .fleet, .map, .worktree, .chat, .mission, .finish, .resume: 0
         case .limits, .account: 1
         case .server: 2
         }
@@ -110,6 +114,7 @@ enum DebugRoute: Equatable {
     /// What the Fleet tab should push, if anything.
     var fleetRoute: FleetRoute? {
         switch self {
+        case .map: .map
         case .worktree(let name): .worktree(name)
         case .chat(let w, let a, let s): .chat(worktree: w, account: a, sid: s)
         case .finish(let name): .worktree(name)

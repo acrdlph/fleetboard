@@ -13,6 +13,7 @@ public struct FleetView: View {
     @Bindable private var store: FleetStore
     @Bindable private var actions: ActionsStore
     @Bindable private var limits: LimitsStore
+    @Bindable private var topology: TopologyStore
     private let client: OrchestraClient
     private let serverLabel: String
     private let onUnpair: () -> Void
@@ -40,6 +41,7 @@ public struct FleetView: View {
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     public init(store: FleetStore, actions: ActionsStore, limits: LimitsStore,
+                topology: TopologyStore,
                 client: OrchestraClient, serverLabel: String,
                 initialRoute: FleetRoute? = nil, openComposer: Bool = false,
                 initialSheet: WorktreeSheet? = nil, initialSend: String? = nil,
@@ -47,6 +49,7 @@ public struct FleetView: View {
         self.store = store
         self.actions = actions
         self.limits = limits
+        self.topology = topology
         self.client = client
         self.serverLabel = serverLabel
         self.initialRoute = initialRoute
@@ -68,6 +71,12 @@ public struct FleetView: View {
             .navigationTitle("orchestra")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    NavigationLink(value: FleetRoute.map) {
+                        Image(systemName: "arrow.triangle.branch")
+                    }
+                    .accessibilityLabel("branch map")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     // The one control on the board that spends money, and it is
                     // one tap from a confirmation, never from a launch.
@@ -94,6 +103,11 @@ public struct FleetView: View {
                 case .chat(let worktree, let account, let sid):
                     ChatView(worktree: worktree, account: account, sid: sid,
                              store: store, client: client, autoSend: initialSend)
+                case .map:
+                    BranchMapView(store: topology, board: boardJoin,
+                                  boardWorktrees: store.state?.worktrees.map(\.name) ?? []) { name in
+                        path.append(.worktree(name))
+                    }
                 }
             }
             .sheet(isPresented: $composing) {
@@ -256,6 +270,20 @@ public struct FleetView: View {
                 .stroke(Palette.hairline, lineWidth: 1)
         )
         .padding(.top, Space.sm)
+    }
+
+    /// The board → map join, by worktree name. Computed here because this view
+    /// already holds the live board; the map takes it as a value so a status
+    /// change recolours a tip with no topology fetch (§5.11).
+    private var boardJoin: [String: MapBoardInfo] {
+        var out: [String: MapBoardInfo] = [:]
+        for card in store.state?.worktrees ?? [] {
+            out[card.name] = MapBoardInfo(
+                section: Triage.section(for: card),
+                sessionCount: card.sessions.count,
+                working: card.sessions.contains { $0.status == .working })
+        }
+        return out
     }
 
     /// `resumes` is keyed `"{worktree}|{sid}"` with a literal pipe.

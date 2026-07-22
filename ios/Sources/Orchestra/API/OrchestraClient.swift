@@ -67,6 +67,12 @@ public actor OrchestraClient {
         try await send(.chat(account: account, sid: sid), to: profile, as: ChatTranscript.self)
     }
 
+    /// The branch map. A cache read on the server (30 s TTL); fetched on appear
+    /// and pull-to-refresh only — never on a phone timer (§5.11).
+    public func topology() async throws -> Topology {
+        try await send(.topology, to: profile, as: Topology.self)
+    }
+
     /// Per-account usage. The cache read only: `refresh=1` is a 90-second
     /// whole-fleet subprocess and is not something a phone should be able to
     /// start by accident.

@@ -34,6 +34,10 @@ final class AppModel {
     let pairing: PairingStore
     let fleet: FleetStore
     let limits: LimitsStore
+    /// The branch map. App-level rather than per-screen so an appear-fetch is not
+    /// re-paid every time the map is pushed and popped — the git sweep behind it
+    /// is the one server read a phone must not repeat casually.
+    let topology: TopologyStore
     /// Everything the app can make the fleet DO. App-level and not per-screen,
     /// because a dispatch outlives the sheet that started it — see `ActionsStore`.
     let actions: ActionsStore
@@ -45,6 +49,7 @@ final class AppModel {
         let fleet = FleetStore(client: client)
         self.fleet = fleet
         self.limits = LimitsStore(client: client)
+        self.topology = TopologyStore(client: client)
         self.actions = ActionsStore(client: client, fleet: fleet)
     }
 

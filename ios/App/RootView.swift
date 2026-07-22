@@ -98,6 +98,7 @@ struct RootView: View {
                 FleetView(store: model.fleet,
                           actions: model.actions,
                           limits: model.limits,
+                          topology: model.topology,
                           client: model.client,
                           serverLabel: model.pairing.profile?.display ?? "—",
                           initialRoute: initialFleetRoute,

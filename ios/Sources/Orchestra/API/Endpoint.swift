@@ -65,6 +65,18 @@ public struct Endpoint: Sendable {
                  timeout: 10, requiresToken: true)
     }
 
+    /// `GET /api/topology` — the branch map.
+    ///
+    /// **The legacy route, because it is the only one that exists.** `API.md`
+    /// §9.7's `GET /api/v1/topology` (with `worktree_id`, `subject_short`, an
+    /// `axis` block and a `dropped[]`) is not served — `server.py:335` routes
+    /// `/api/topology` alone, to `gitrepo.cached_topology`. Server-side it is ~90
+    /// git subprocesses behind a 30 s TTL (`gitrepo.TOPO_TTL_S`), so this is
+    /// fetched on appear and on pull-to-refresh, NEVER on a timer (§5.11). The
+    /// deadline is generous because a cold cache pays the full sweep.
+    public static let topology = Endpoint(method: .get, path: "/api/topology",
+                                          timeout: 20, requiresToken: true)
+
     /// `GET /api/limits`. Without `refresh=1` this is a cache read and is fast;
     /// `refresh=1` shells out to `cclimits` for EVERY account under a 90 s
     /// server-side timeout, which is why this build never sends it. See

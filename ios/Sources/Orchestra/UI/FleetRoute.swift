@@ -8,6 +8,11 @@ import Foundation
 /// `DebugRoute`.
 public enum FleetRoute: Hashable, Sendable {
     case worktree(String)
+    /// The branch map (`UX.md` §5). Pushed from the board's toolbar rather than
+    /// spending one of the three permanent tabs on it — the map answers "which
+    /// worktree is safe to dispatch into", which is a question you ask FROM the
+    /// board, so it lives one push away from it.
+    case map
     /// Addressed by `(account, sid)` and NOT by anything positional, for the
     /// same reason every mutation is (ADR 0008): the board re-sorts under you,
     /// so "the second session on ConfidAI2" names a different agent a second
