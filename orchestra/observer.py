@@ -208,12 +208,31 @@ def collect_state(fresh=None):
 
 # Cadences, §2.5. IDLE_S deviates from the document's 1.0 and the reason is
 # measured: §2.5's 1.0 assumes the within-sweep git memo it paces with git_s,
-# which does not exist yet, so every sweep is a full collect — 600 ms against
-# the live fleet here (14 worktrees, 41 sessions). At 1.0 s that is a ~38 %
-# duty cycle, forever, on battery, with nobody watching. At 3.0 s it is ~17 %,
-# barely more than the ~12 % an open tab already costs at today's 5 s poll,
-# and it keeps `_cache` warm inside STATE_TTL_S so /api/state never collects.
-# Tighten it when the memo lands and a sweep stops costing 600 ms.
+# which does not exist yet, so every sweep is a full collect.
+#
+# What that costs, corrected. The first number written here was a WALL duty
+# cycle — sweep_ms over the cadence — and it understates the truth by ~2x,
+# because the sweep is a parallel fan-out: 785 ms of wall time spends 1640 ms
+# of CPU, and battery is charged in CPU-seconds, not wall. `ps -o time` hides
+# it too, since 1378 of those 1640 ms are billed to the `git`/`ps` children and
+# never appear against the server process (measured: 8 % parent-only against
+# 56 % actual). Measured over a real 60 s run of the shipped loop, 9 worktrees:
+#
+#   1.64 CPU-s per sweep  ->  IDLE_S 3.0 = ~55 % of one core, CONTINUOUSLY
+#                             IDLE_S 5.0 = ~33 %      IDLE_S 8.0 = ~21 %
+#
+# Roughly 1.3 of those 1.64 s is the git fan-out (two spawns per worktree);
+# ps+lsof is ~0.14 s and the transcript scan ~0.19 s. Before this step an open
+# tab polling every 5 s already paid ~33 % — so the honest framing is not
+# "barely more than a tab", it is: the same order as a tab, now paid forever
+# with nobody watching. That is the deliberate price of the publish point
+# (§1.1 — nothing computes with no client attached, so nothing can notify),
+# and 3.0 is a placeholder for it, not a number anything vindicates.
+#
+# The fix is the within-sweep git memo (§4.3), which is what makes a sweep stop
+# costing 1.6 CPU-s; tighten toward the document's 1.0 only after it lands.
+# Until then IDLE_S is the one knob that trades notification latency for
+# battery, and it deserves to be a config key rather than a constant.
 IDLE_S = 3.0        # cadence with no evidence of change
 HOT_S = 0.15        # floor between sweeps after a nudge
 # A cold sweep bypasses the parse memo (§4.3) and counts the disagreements as
