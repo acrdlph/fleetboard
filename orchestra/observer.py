@@ -965,9 +965,35 @@ class Observer:
         """What changed for a client at version `n` (§3.5).
 
         An unknown, too-old or ahead-of-us `n` gets a full snapshot; that is the
-        entire resync path. Nothing consumes this yet — SSE is step 3 — but the
-        envelope carries `type` from day one, so if deltas prove worthless
-        deleting them removes lines and no concept.
+        entire resync path. The envelope carries `type` from day one, so if
+        deltas prove worthless deleting them removes lines and no concept.
+
+        THE CONTRACT IS RECONSTRUCTION, not "the fields that moved". A client
+        holding version `n` and applying this must end up with the SAME view as
+        a client that took the snapshot at `v` whole — same cards, same order,
+        same counts, same loose processes. Only `cards` is actually diffed,
+        because cards are ~99% of the bytes; everything beside them travels in
+        full on every frame precisely so that reconstruction is exact. Two of
+        those used to be missing, and both were silent divergence rather than a
+        visible break:
+
+        * **`order`.** `Snapshot.cards` is in the board's triage order and the
+          board renders it in the order it arrives. A delta names only the
+          changed keys, so a client patching its own dict keeps its OLD
+          positions — a card that flips to `needs_input` would sort to the top
+          on the server and stay where it was on a streaming board, forever.
+          It is also what makes the wire independent of JSON object key order:
+          `JSON.parse` in a browser reorders integer-like keys ahead of the
+          rest, so a worktree named `42` sorts itself to the front of any
+          client that trusted the dict.
+        * **`other_procs`.** It is part of the composed view `publish` diffs, so
+          a claude process appearing outside every watched worktree bumps the
+          version ON ITS OWN — an otherwise EMPTY delta. Without the list on the
+          frame that bump says "something changed" and carries no way to learn
+          what, and the board's "⌁ live agents" tile drifts.
+
+        Both are small and bounded (a name list; a handful of loose processes)
+        next to the cards a delta exists to avoid resending.
         """
         snap = self._snap
         if snap is None:
@@ -975,6 +1001,7 @@ class Observer:
         hist = tuple(self._hist)
         if n <= 0 or n > snap.v or not hist or n < hist[0][0] - 1:
             return {"type": "snapshot", "v": snap.v, "at": snap.at,
+                    "order": list(snap.cards),
                     "cards": snap.cards, "counts": snap.counts,
                     "other_procs": snap.other_procs, "freshness": snap.freshness}
         keys = set()
@@ -982,8 +1009,10 @@ class Observer:
             if ver > n:
                 keys.update(ks)
         return {"type": "delta", "v": snap.v, "base": n, "at": snap.at,
+                "order": list(snap.cards),
                 "cards": {k: snap.cards.get(k) for k in keys},   # None = removed
-                "counts": snap.counts, "freshness": snap.freshness}
+                "counts": snap.counts, "other_procs": snap.other_procs,
+                "freshness": snap.freshness}
 
     def stats(self):
         snap = self._snap

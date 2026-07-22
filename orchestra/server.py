@@ -161,6 +161,15 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.split("?", 1)[0] in ("/", "/index", "/index.html"):
             body = (config.HERE / "index.html").read_bytes()
             ctype = "text/html; charset=utf-8"
+        elif self.path.split("?", 1)[0] == "/stream.js":
+            # The SharedWorker that holds the board's ONE EventSource, and the
+            # reason it is a route rather than a Blob URL: a SharedWorker's
+            # identity is (origin, script URL, name), and a Blob URL is unique
+            # per document — every tab would get its OWN worker, its own stream,
+            # and the six-connection ceiling this exists to stay under
+            # (ENGINE.md §5.4). A stable path is what makes it shared.
+            body = (config.HERE / "stream.js").read_bytes()
+            ctype = "application/javascript; charset=utf-8"
         elif self.path.startswith("/map"):
             body = (config.HERE / "map.html").read_bytes()
             ctype = "text/html; charset=utf-8"

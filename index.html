@@ -705,17 +705,29 @@ async function focusPid(pid, ident) {
 }
 
 let lastState = null;
+// The header is the board's only claim about its own liveness, so it names
+// which of the two paths it is on. "live" means frames are arriving off
+// /api/events and the five-second poll is retired; "polling" means the stream
+// was refused or died and the board is asking for itself again. A board that
+// silently stopped updating because a socket died would be far worse than one
+// that polls, and this is where you can see which happened.
+function showSync(s) {
+  $("sync").classList.toggle("err", !!s.err);
+  $("syncText").textContent =
+    s.err ? "reconnecting…"
+    : s.mode === "stream" ? `live · v${s.v}${s.tabs > 1 ? ` · ${s.tabs} tabs` : ""}`
+    : s.mode === "poll" ? "polling · " + new Date().toLocaleTimeString()
+    : "connecting…";
+}
 async function tick() {
   try {
     const r = await fetch("/api/state");
     lastState = await r.json();
     render(lastState);
     refreshMissionPickers();   // composer may be open and waiting on this
-    $("sync").classList.remove("err");
-    $("syncText").textContent = "sync " + new Date().toLocaleTimeString();
+    showSync({ mode: "poll", tabs: 1 });
   } catch (e) {
-    $("sync").classList.add("err");
-    $("syncText").textContent = "reconnecting…";
+    showSync({ mode: "poll", tabs: 1, err: true });
   }
 }
 $("showEnded").addEventListener("change", () => { localStorage.fbEnded = $("showEnded").checked ? "1" : ""; lastState && render(lastState); });
@@ -855,7 +867,7 @@ document.addEventListener("click", async (ev) => {
     }
     if (d.job) pollFinishJob(d.job);
   } catch (e) { toast("✗ finish request failed"); }
-  tick();   // the server drops its state cache on finish — pick up ✓→✕ now
+  requestRefresh();   // the server drops its state cache on finish — pick up ✓→✕ now
 });
 function pollFinishJob(job) {
   const t = setInterval(async () => {
@@ -952,7 +964,7 @@ async function quickArm(key) {
   const res = await apiResume("schedule", resumeBody(key));
   if (!res.ok && res.need_time) return openResumeDrawer(key);  // needs a time
   toast((res.ok ? "⏱ " : "✗ ") + res.message);
-  tick();
+  requestRefresh();
 }
 async function disarmResume(key) {
   const r = REG[key];
@@ -960,7 +972,7 @@ async function disarmResume(key) {
   const res = await apiResume("cancel", { worktree: r.wt, sid: r.s.sid });
   toast((res.ok ? "✓ " : "✗ ") + res.message);
   closeDrawer();
-  tick();
+  requestRefresh();
 }
 function openResumeDrawer(key) {
   const r = REG[key];
@@ -1019,7 +1031,7 @@ async function armFromDrawer(key) {
   const res = await apiResume("schedule", body);
   toast((res.ok ? "⏱ " : "✗ ") + res.message);
   if (res.ok) closeDrawer();
-  tick();
+  requestRefresh();
 }
 
 // ---- mission composer ------------------------------------------------------
@@ -1248,6 +1260,14 @@ async function launchMission(missionArg) {
       failedMission = inFlight; reeditMission();
       return;
     }
+    // STAYS A POLL, deliberately, even though it is the fastest one here. A
+    // dispatch job is not fleet state: the observer never sees it, so it moves
+    // no version and could not ride /api/events however the frame were shaped.
+    // It is also bounded in every direction — one job, in the one tab that
+    // launched it, for the few seconds until `done` clears the interval — so it
+    // is not what the connection budget has to survive. Streaming it would mean
+    // teaching the observer to diff dispatch jobs: a second source of truth for
+    // a thing that already has one.
     clearInterval(dispatchPoll);
     dispatchPoll = setInterval(() => pollDispatch(job), 1000);
     pollDispatch(job);
@@ -1332,9 +1352,71 @@ function primeLimits() {
     .then(d => { LIMITS = d; if (lastState) render(lastState); refreshMissionPickers(); })
     .catch(() => {});
 }
-tick();
+
+// ---- the board is TOLD, not asked ------------------------------------------
+//
+// ONE EventSource per BROWSER, held in a SharedWorker (stream.js) and fanned to
+// every tab. This tab holds no socket of its own: browsers allow six
+// connections per origin, so a stream per tab would starve the POSTs at three
+// tabs and deadlock at six — the server was measured to 32 concurrent streams
+// and it is the BROWSER that is the ceiling here (ENGINE.md §5.4).
+//
+// Everything below is about what happens when that is not available, because
+// sometimes it is not: Safari has shipped without SharedWorker in private
+// browsing, and a worker script fails ASYNCHRONOUSLY, so "the constructor did
+// not throw" is not proof of anything. Detect and degrade — polling is not a
+// legacy path, it is the floor.
+let stateWorker = null, fellBack = false;
+function fallBackToPolling(why) {
+  if (fellBack) return;
+  fellBack = true;
+  stateWorker = null;
+  console.info("orchestra: state stream unavailable (" + why + ") — polling");
+  tick();
+  setInterval(tick, 5000);
+}
+// A mutation just landed and the server dropped its state cache, so ask NOW
+// rather than on the next cadence — and ask through the WORKER, so the other
+// tabs see the result of this click too instead of waiting out their own.
+function requestRefresh() {
+  if (stateWorker && !fellBack) stateWorker.port.postMessage({ cmd: "refresh" });
+  else tick();
+}
+function startStateWorker() {
+  if (typeof SharedWorker !== "function") return false;
+  let w;
+  try { w = new SharedWorker("/stream.js", { name: "orchestra-state" }); }
+  catch (e) { return false; }
+  stateWorker = w;
+  let heard = false;
+  w.port.onmessage = (ev) => {
+    if (fellBack) return;
+    heard = true;
+    const m = ev.data || {};
+    // The delta was applied in the WORKER, so what arrives here is one
+    // complete, ordered fleet state — byte-shaped exactly like /api/state.
+    // render() is therefore fed what it has always been fed, and every
+    // invariant it earned (keyed per-card diffing, the re-sort hold, controls
+    // that are refreshed rather than rebuilt) is untouched by this step.
+    if (m.st) { lastState = m.st; render(lastState); refreshMissionPickers(); }
+    if (m.status) showSync(m.status);
+  };
+  w.onerror = () => fallBackToPolling("worker error");
+  w.port.start();
+  // a worker that never speaks is indistinguishable from no worker at all
+  setTimeout(() => { if (!heard) fallBackToPolling("silent worker"); }, 5000);
+  addEventListener("pagehide", () => {
+    try { w.port.postMessage({ cmd: "bye" }); } catch (e) {}
+  });
+  return true;
+}
+if (!startStateWorker()) fallBackToPolling("no SharedWorker");
+
+// STAYS A POLL, deliberately. /api/limits is not observed state — the sweep
+// explicitly does not probe cclimits (that is step 7), so there is no version
+// for it to move and nothing to stream. It is already cached server-side, and
+// at one request per tab per five minutes there is nothing to win by moving it.
 primeLimits();
-setInterval(tick, 5000);
 setInterval(primeLimits, 300000);
 
 // deep link: /?mission opens the composer, /?mission=<text> prefills it.

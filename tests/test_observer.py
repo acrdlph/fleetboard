@@ -265,6 +265,177 @@ class TestDeltaSince(CacheGuard):
         self.assertIsNone(fb.Observer().delta_since(0))
 
 
+# ------------------------------------------- a delta RECONSTRUCTS the snapshot
+
+def ordered_state(at, cards, *, other=(9,)):
+    """A collect_state() result with the card ORDER and each card's status
+    under the test's control — the two things the reconstruction claim is
+    about. `cards` is [(name, dirty, status)]; `other` is loose-process pids."""
+    return {
+        "generated_at": at,
+        "counts": {"working": len(cards)},
+        "worktrees": [
+            {"name": name, "availability": "busy",
+             "git": {"branch": "main", "dirty": dirty},
+             "sessions": [{"sid": f"s-{name}", "status": status,
+                           "last_write_at": 1000.0}],
+             "live_procs": []}
+            for name, dirty, status in cards],
+        "other_procs": [{"pid": pid, "cpu": 0.5, "etime": "01:00",
+                         "cwd": "/elsewhere"} for pid in other],
+    }
+
+
+class Client:
+    """The browser's half of §3.5, in the smallest form that can still be wrong.
+
+    This is `Fleet.apply` from `stream.js` transcribed — the SharedWorker holds
+    exactly this state and patches it exactly this way. Two reasons it lives
+    here as well as in JS: it makes the delta contract a claim the Python suite
+    can falsify with no browser and no node, and it is the reference the JS is
+    checked against in `tests/test_stream_js.py`.
+
+    A gap is an exception rather than a silent resync, because these tests
+    never lose a frame — one arriving out of sequence would mean `delta_since`
+    changed its cursor semantics.
+    """
+
+    def __init__(self):
+        self.v, self.cards, self.counts, self.other = None, {}, None, None
+
+    def apply(self, f):
+        if f["type"] == "snapshot":
+            self.cards = dict(f["cards"])
+        else:
+            assert f["base"] == self.v, f"gap: base {f['base']} at v {self.v}"
+            for key, card in f["cards"].items():
+                if card is None:
+                    self.cards.pop(key, None)      # None = the card was removed
+                else:
+                    self.cards[key] = card
+        assert set(self.cards) == set(f["order"]), (
+            f"the frame's order names {sorted(f['order'])}, the client holds "
+            f"{sorted(self.cards)} — the delta did not carry every change")
+        self.cards = {k: self.cards[k] for k in f["order"]}
+        self.counts, self.other, self.v = f["counts"], f["other_procs"], f["v"]
+        return self
+
+    @property
+    def view(self):
+        """Everything the board draws off a frame, ORDER INCLUDED — a dict
+        compares equal regardless of key order, so the cards travel as a list."""
+        return {"cards": list(self.cards.items()),
+                "counts": self.counts, "other_procs": self.other}
+
+
+def served(snap):
+    """The same view, taken from the snapshot whole — what a client that had
+    just connected would render."""
+    return {"cards": list(snap.cards.items()),
+            "counts": snap.counts, "other_procs": snap.other_procs}
+
+
+class TestDeltaReconstructsTheSnapshot(CacheGuard):
+    """The claim the streaming board rests on: a client that applied every
+    delta sees EXACTLY what a client that took the snapshot whole sees.
+
+    Everything below drives the real `Observer.publish` / `delta_since` — the
+    only thing faked is `collect_state`'s output, so the composition, the
+    version rule and the changed-key ring are all the shipped ones.
+    """
+
+    def test_a_stream_of_deltas_ends_where_a_snapshot_would(self):
+        o, c = fb.Observer(), Client()
+        # a card arrives, a card changes, a card's status flips (which RE-SORTS
+        # the board), a card leaves, a loose process appears — one publish each
+        script = [
+            [("alpha", 0, "working"), ("beta", 0, "working")],
+            [("alpha", 1, "working"), ("beta", 0, "working")],
+            [("beta", 0, "needs_input"), ("alpha", 1, "working")],
+            [("beta", 0, "needs_input"), ("alpha", 1, "working"),
+             ("gamma", 0, "working")],
+            [("beta", 0, "needs_input"), ("gamma", 0, "working")],
+        ]
+        for i, cards in enumerate(script):
+            o.publish(ordered_state(1000.0 + i, cards))
+            c.apply(o.delta_since(c.v or 0))
+            self.assertEqual(c.view, served(o.snapshot()), f"step {i}")
+        o.publish(ordered_state(2000.0, script[-1], other=(9, 11)))
+        c.apply(o.delta_since(c.v))
+        self.assertEqual(c.view, served(o.snapshot()))
+
+    def test_the_delta_carries_the_board_order_not_just_the_changes(self):
+        """A status flip re-sorts the board on the server. The delta names only
+        the card that flipped, so a client patching its own dict keeps its OLD
+        positions unless the frame says otherwise."""
+        o, c = fb.Observer(), Client()
+        o.publish(ordered_state(1000.0, [("alpha", 0, "working"),
+                                         ("beta", 0, "working")]))
+        c.apply(o.delta_since(0))
+        self.assertEqual([k for k, _ in c.view["cards"]], ["alpha", "beta"])
+        # beta needs input -> the server sorts it first; alpha is untouched
+        o.publish(ordered_state(1001.0, [("beta", 0, "needs_input"),
+                                         ("alpha", 0, "working")]))
+        d = o.delta_since(c.v)
+        self.assertEqual(set(d["cards"]), {"beta"}, "alpha must not be resent")
+        c.apply(d)
+        self.assertEqual([k for k, _ in c.view["cards"]], ["beta", "alpha"])
+
+    def test_a_loose_process_alone_bumps_the_version_and_rides_the_delta(self):
+        """`other_procs` is part of the composed view `publish` diffs, so a
+        claude process outside every watched worktree moves `v` with no card
+        changing at all — an EMPTY delta. Without the list on the frame that
+        bump is unexplainable and the ⌁ live-agents tile drifts."""
+        o, c = fb.Observer(), Client()
+        o.publish(ordered_state(1000.0, [("alpha", 0, "working")]))
+        c.apply(o.delta_since(0))
+        before = o.snapshot().v
+        o.publish(ordered_state(1001.0, [("alpha", 0, "working")], other=(9, 11)))
+        self.assertEqual(o.snapshot().v, before + 1, "a loose proc must bump v")
+        d = o.delta_since(c.v)
+        self.assertEqual(d["cards"], {}, "no card changed")
+        c.apply(d)
+        self.assertEqual([p["pid"] for p in c.view["other_procs"]], [9, 11])
+        self.assertEqual(c.view, served(o.snapshot()))
+
+    def test_a_client_that_lagged_catches_up_in_one_delta(self):
+        """The suspended-phone path (ADR 0004): four versions happen while the
+        client is away, and the single delta it asks for lands it exactly where
+        a fresh snapshot would."""
+        o, c = fb.Observer(), Client()
+        o.publish(ordered_state(1000.0, [("alpha", 0, "working")]))
+        c.apply(o.delta_since(0))
+        away = c.v
+        for i, cards in enumerate([
+                [("alpha", 1, "working"), ("beta", 0, "working")],
+                [("alpha", 1, "working"), ("beta", 1, "working")],
+                [("beta", 1, "needs_input"), ("alpha", 1, "working")],
+                [("beta", 1, "needs_input")]]):
+            o.publish(ordered_state(1001.0 + i, cards))
+        self.assertEqual(o.snapshot().v, away + 4)
+        d = o.delta_since(away)
+        self.assertEqual(d["type"], "delta")
+        self.assertEqual(d["v"], away + 4, "one delta covers every version")
+        c.apply(d)
+        self.assertEqual(c.view, served(o.snapshot()))
+
+    def test_a_delta_can_span_more_than_one_version(self):
+        """The stream's loop waits on the version and THEN asks for a delta, so
+        publishes that land in between are coalesced into one frame. A client
+        that treated `v != base + 1` as a lost frame would resync on every
+        busy moment — the gap test is `base`, and only `base`."""
+        o, c = fb.Observer(), Client()
+        o.publish(ordered_state(1000.0, [("alpha", 0, "working")]))
+        c.apply(o.delta_since(0))
+        for i in range(3):
+            o.publish(ordered_state(1001.0 + i, [("alpha", i + 1, "working")]))
+        d = o.delta_since(c.v)
+        self.assertEqual(d["base"], c.v)
+        self.assertGreater(d["v"], d["base"] + 1)
+        c.apply(d)
+        self.assertEqual(c.view, served(o.snapshot()))
+
+
 # ------------------------------------------------------------------ threading
 
 class TestSweepThread(CacheGuard):
