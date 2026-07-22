@@ -30,6 +30,9 @@ sweeps on its own cadence and publishes an immutable, versioned `Snapshot`.
 CPU and cannot be stat-memoised (`dirty` is the working tree), so it runs on
 its own slower clock and the sweep reuses the last answer — honestly, because
 `freshness["git"]` publishes how old it is, and a `nudge()` pulls it forward.
+The transcript scan is the opposite case and gets the opposite treatment: it
+CAN be stat-memoised, so it is (`transcripts.StatMemo`), and the sweep's `cold`
+flag is what bypasses that memo once a minute to check it was telling the truth.
 It exists because observation today happens only when a client asks — with no
 browser attached nothing computes, nothing is detected, and no notification
 can ever fire. That is structural, not a tuning problem.
@@ -56,7 +59,7 @@ _cache = {"t": 0.0, "state": None}
 
 # ---------------------------------------------------------------- collectors
 
-def collect_state(fresh=None, git=None):
+def collect_state(fresh=None, git=None, cold=False):
     """Compose the board. `fresh` is an optional out-parameter.
 
     Pass a dict and the collector stamps it `kind -> wall clock of that kind's
@@ -71,6 +74,11 @@ def collect_state(fresh=None, git=None):
     — so git runs on its own slower clock and the sweep reuses the last answer
     in between. `probed_at` is what lands in `fresh["git"]`, so the freshness
     map reports when git ACTUALLY ran rather than when this function did.
+
+    `cold` is the reconcile sweep (§4.3 #1): it bypasses the transcript stat
+    memo so every transcript is re-read from the file, and every disagreement
+    with what the memo would have served is counted into `drift`. It costs a
+    full uncached scan once a minute and it is what makes the memo honest.
     """
     def stamp(kind):
         if fresh is not None:
@@ -82,7 +90,7 @@ def collect_state(fresh=None, git=None):
     # `all_procs`, not `procs`: a local of that name would shadow the module.
     all_procs = procs.claude_processes()
     stamp("procs")
-    sessions = transcripts.scan_sessions(worktrees, all_procs, now)
+    sessions = transcripts.scan_sessions(worktrees, all_procs, now, cold=cold)
     stamp("transcripts")
 
     # An agent parked at the prompt on an exhausted account isn't "your turn" —
@@ -265,9 +273,25 @@ def collect_state(fresh=None, git=None):
 # it is now an argument somebody can win, which it was not before — but it is
 # their argument, with their own measurement, not a free rider on this one.
 #
-# What is left is 0.31 CPU-s of transcript scan (0.20) and ps+lsof (0.11), and
-# those are the next two steps. The scan is the one that can be memoised for
-# real: a transcript is append-only and stat-keyed (§4.3), unlike `dirty`.
+# THEN the transcript scan stopped re-parsing files that had not changed
+# (transcripts.py, the stat memo). Same fleet, same instrument, and this time
+# the A/B is the memo turned off in the same process rather than a different
+# build, so the git fan-out — which still dominates and whose probe count
+# wobbles by one between runs — is held equal:
+#
+#   IDLE_S  memo    measured over 120 s      sweeps  git_probes
+#     3.0    off      22 % of one core         41        9
+#     3.0    on       18 %                     41        9        <- shipped
+#     1.0    off      46 %  (over 60 s)        61        5
+#     1.0    on       32 %                     61        5
+#     2.0    on       23 %                     31        5
+#
+# A sweep that skips git went 0.31 -> 0.19 CPU-s (six consecutive: 185/189/181/
+# 197/219/205 ms), because scan_sessions went 196 -> 76 CPU-ms at a 98 %/96 %
+# hit rate. The board-wide number moves less than that ratio suggests, and the
+# table says why: 9 git fan-outs are ~15 of those 21.75 CPU-s. Git is still the
+# bill. What is left of a git-free sweep is now ps+lsof (0.11) ahead of the
+# scan (0.076), so the process probe is the next step, not this one.
 IDLE_S = 3.0        # cadence with no evidence of change
 HOT_S = 0.15        # floor between sweeps after a nudge
 
@@ -293,13 +317,20 @@ HOT_S = 0.15        # floor between sweeps after a nudge
 GIT_S = 15.0        # minimum interval between git fan-outs; config key "git_s"
 
 # A cold sweep bypasses every memo and cadence (§4.3 #1) and counts what they
-# would have got wrong as `drift`. Today that is exactly one term — the git
-# cadence — and, unlike a stat memo, a disagreement there is not a lie: the
-# cadence never claimed to be current, `freshness["git"]` says how old it is.
-# It is the measured COST of the cadence, and it is counted because a number
-# nobody can see is a number nobody can argue with. `git_drift` breaks it out
-# of the total in `stats()` so step 4's parse memo — where drift IS a lie — is
-# still attributable.
+# would have got wrong as `drift`. Two terms now, and they mean opposite things,
+# which is why `stats()` breaks both out rather than shipping only the sum:
+#
+# * `git_drift` is not a lie. The cadence never claimed to be current and
+#   `freshness["git"]` says how old it is; a disagreement is the measured COST
+#   of running git on a slower clock, counted because a number nobody can see
+#   is a number nobody can argue with. Non-zero is normal.
+# * `scan_drift` / `tree_drift` ARE lies. The transcript stat memo claims the
+#   bytes have not changed. Non-zero means the key is wrong — the one failure
+#   mode that is otherwise completely silent, since a stale parse looks exactly
+#   like a quiet agent. Non-zero is a bug.
+#
+# The cold scan costs 260 CPU-ms against a warm 76 on this fleet, once a
+# minute: 0.4 % duty for the only thing that can catch a memo lying.
 RECONCILE_S = 60.0
 MAX_STALE_S = 8.0   # never wait longer than this between sweeps
 HIST = 512          # version/changed-keys ring, §3.5
@@ -338,7 +369,7 @@ class Snapshot:
 # the composed view is the card minus its stopwatches.
 #
 # Nothing is lost by removing them: every one has an ABSOLUTE twin already in
-# the same object — `last_write_at` beside `age_s` (transcripts.py:308) — and
+# the same object — `last_write_at` beside `age_s` in `scan_sessions` — and
 # `status`, which is what a threshold crossing actually means, keeps its vote.
 _UNDIFFED_PROC_KEYS = ("cpu", "etime")
 _UNDIFFED_SESSION_KEYS = ("age_s",)
@@ -536,12 +567,16 @@ class Observer:
         t0 = time.perf_counter()
         fresh = {}
         state = collect_state(
-            fresh=fresh, git=lambda roots: self._git.resolve(roots, cold=cold))
+            fresh=fresh, cold=cold,
+            git=lambda roots: self._git.resolve(roots, cold=cold))
         ms = (time.perf_counter() - t0) * 1000.0
         self._sweeps += 1
         # Every memo's and cadence's disagreement with the cold recompute,
-        # summed (§4.3 #4). One term today; step 4's parse memo adds the second.
-        self._drift = self._git.drift
+        # summed (§4.3 #4). Two terms: the git cadence, which never claimed to
+        # be current and whose drift is a measured cost; and the transcript stat
+        # memo, which DID claim to be current — its drift is a lie and any
+        # non-zero value is a bug. `stats()` breaks them out separately.
+        self._drift = self._git.drift + transcripts.memo_drift()
         if cold:
             self._cold_at = started
         # Compare-and-swap, never a blind write. A mutation that parked
@@ -648,7 +683,7 @@ class Observer:
                 "last_error": self._last_error,
                 "freshness": dict(self._fresh),
                 "idle_s": self.idle_s, "hot_s": self.hot_s,
-                **self._git.stats()}
+                **self._git.stats(), **transcripts.memo_stats()}
 
     # ----------------------------------------------------------- write API
 

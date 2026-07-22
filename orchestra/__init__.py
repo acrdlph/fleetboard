@@ -46,8 +46,10 @@ from .procs import (claude_processes, pair_sessions_with_procs, shell_children,
                     _pid_cwds, _pid_config_dirs, _host_of, _tmux_pane_map)
 from .transcripts import (claude_homes, _read_chunk, _clean, _real_prompt,
                           session_topic, last_assistant_text, find_last_user,
-                          parse_session_tail, scan_sessions,
-                          TAIL_BYTES, HEAD_BYTES)
+                          parse_session_tail, scan_sessions, _subagent_files,
+                          StatMemo, memo_stats, memo_drift, memo_clear,
+                          TAIL_BYTES, HEAD_BYTES, MEMO_FILES, MEMO_DIRS,
+                          MEMO_IDLE_S)
 from .limits import (cached_limits, account_reserve, _model_remaining,
                      model_candidates, set_reserve, limits_by_account,
                      demo_limits, _limit_active_until, _cclimits_bin,

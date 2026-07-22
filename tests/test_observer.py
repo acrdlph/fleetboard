@@ -246,7 +246,7 @@ class TestSweepThread(CacheGuard):
         super().tearDown()
 
     def _stub(self, at=None):
-        def collect(fresh=None, git=None):
+        def collect(fresh=None, git=None, cold=False):
             self.calls.append(time.time())
             if fresh is not None:
                 fresh["procs"] = time.time()
@@ -290,7 +290,7 @@ class TestSweepThread(CacheGuard):
         started = threading.Event()
         release = threading.Event()
 
-        def collect(fresh=None, git=None):
+        def collect(fresh=None, git=None, cold=False):
             started.set()
             release.wait(5)
             return fake_state(time.time())
@@ -332,7 +332,7 @@ class TestSweepThread(CacheGuard):
         carries pre-mutation data, so the nudge has to survive it."""
         inside, release = threading.Event(), threading.Event()
 
-        def collect(fresh=None, git=None):
+        def collect(fresh=None, git=None, cold=False):
             self.calls.append(time.time())
             if len(self.calls) == 1:
                 inside.set()
@@ -383,7 +383,7 @@ class TestSweepThread(CacheGuard):
     def test_a_wedged_probe_does_not_kill_the_loop(self):
         boom = [3]
 
-        def collect(fresh=None, git=None):
+        def collect(fresh=None, git=None, cold=False):
             self.calls.append(time.time())
             if boom[0] > 0:
                 boom[0] -= 1

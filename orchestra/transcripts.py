@@ -20,17 +20,176 @@ whole observe layer: it maps every recent session onto a worktree (gitrepo),
 hands the per-worktree session list and process list to `procs` for pairing,
 and asks `status` what each one MEANS. Everything is read-only — the board
 opens transcripts, it never writes one.
+
+`StatMemo` is what makes that affordable under a perpetual sweep: a transcript
+is append-only, so a read of it is a pure function of `(dev, ino, size,
+mtime_ns)` and can be reused verbatim until one of those four moves. It is the
+one piece of state in this file, and it is state that cannot go stale — see the
+comment on it for why that is a property of the key and not a hope, and for the
+bound that keeps it from growing with the corpus.
 """
 
 import json
 import os
 import re
+from collections import OrderedDict
 from pathlib import Path
 
 from . import config, gitrepo, procs, status
 
 TAIL_BYTES = 128 * 1024
 HEAD_BYTES = 16 * 1024
+
+
+# ------------------------------------------------------------------- the memo
+#
+# What a sweep spends here, measured with getrusage(SELF)+(CHILDREN) over the
+# real fleet — 9 worktrees, 539 transcripts under matched projects, 48 of them
+# inside the 48 h window, 18,187 `.jsonl` under 1,071 subagent directories:
+#
+#   stage                              CPU     share
+#   _subagent_files   (539 trees)    105 ms     54 %   <- 44 ms walk, 61 ms stat
+#   parse_session_tail (48 files)     43 ms     22 %
+#   find_last_user     (13 files)     27 ms     14 %
+#   session_topic      (48 files)      6 ms      3 %
+#   scan_sessions (whole)            196 ms
+#
+# Between two sweeps a second apart essentially none of that input changed. So
+# every read here is keyed on the stat of what it read, and reused when the key
+# is identical — ENGINE.md §4.3's stat memo, not §4.2's rejected byte offsets.
+#
+# TWO RULES, and they are the whole reason this is safe:
+#
+# * THE KEY CONTAINS EVERYTHING THAT CAN CHANGE THE ANSWER. Size AND mtime_ns,
+#   so an append is a miss; `(st_dev, st_ino)` and not just the path, so a
+#   transcript that is rotated or replaced under its own name is a miss too.
+#   That trap is not hypothetical: `_proven_in_transcript` kept a byte offset
+#   with no identity check, a delivered message read as undelivered, and an
+#   agent redid its work three times at 3x usage (ENGINE.md §4.2).
+# * IT IS BOUNDED. The corpus grows ~982 `.jsonl`/day, so an unbounded map is a
+#   leak with a multi-day uptime (§4.7). LRU cap plus an idle sweep, below.
+#
+# And it is audited: a cold sweep (RECONCILE_S, every 60 s) bypasses the memo,
+# re-reads from the file, and counts any disagreement into `drift`. A memo
+# nobody audits is worse than a slow sweep. Unlike the git cadence's drift —
+# which is a measured cost, the cadence never claimed to be current — drift
+# here is a LIE, and any non-zero `scan_drift`/`tree_drift` is a bug.
+#
+# After, same fleet: 196 -> 76 CPU-ms warm (2.6x), 98 % / 96 % hit rate. The
+# cold reconcile costs 260 ms — a third more than an uncached scan, because it
+# reads the directories twice to compare — once every 60 s, 0.4 % duty.
+
+# Caps are sized off the per-sweep WORKING SET, not off a memory target: an LRU
+# smaller than what one sweep touches thrashes to a 0 % hit rate and pays the
+# extra stat for nothing. Overflow is graceful — it degrades to the behaviour
+# this file had before the memo existed — but it is silent, so the caps are
+# multiples of a measured working set, not round numbers.
+#
+# `_FACTS` holds one entry per transcript actually parsed: the in-window ones,
+# 50 here (48 transcripts + 2 subagent reports). 2,048 is ~40x that; a fleet
+# needing more has two thousand agents awake inside 48 hours.
+#
+# `_TREES` holds one entry per DIRECTORY under a session's subagent tree, and
+# every session dir of every matched project is walked on every sweep — the
+# walk is what rescues a session whose main transcript is out of window, see
+# `_subagent_files` — so its working set is all 1,071 of them, not the 50.
+# 4,096 is ~3.8x today's fleet and is §4.7's number.
+#
+# Measured, deep-sized, on that fleet: _FACTS 50 entries = 0.10 MB, _TREES
+# 1,071 = 2.20 MB, i.e. ~2 KB per entry either way (a tree entry is the file
+# NAMES of one directory; a facts entry is one card's worth of cleaned text).
+# Both caps full would be ~12.6 MB, which is the number to argue with if these
+# ever look generous.
+MEMO_FILES = 2048
+MEMO_DIRS = 4096
+
+# Nothing outside the 48 h window is ever parsed again, and a session dir that
+# stops being walked has had its worktree removed. An hour idle means neither
+# will come back without a fresh stat anyway, so the entry is pure ballast.
+MEMO_IDLE_S = 3600.0
+
+
+class StatMemo:
+    """A pure-function cache whose key is the stat of the thing it read.
+
+    Not a model of the world and not a state machine: the value is a function
+    of the bytes, and the key changes whenever the bytes can have. So it never
+    goes stale — it is only ever evicted, and eviction costs one re-read.
+
+    `ident` is WHAT was read — `(path, st_dev, st_ino)`. Identity is in the
+    ident so a rotated file misses; the path is in it too so a recycled inode
+    at a different path cannot be mistaken for a hit. `key` is the part that
+    moves — `(st_size, st_mtime_ns)`.
+    """
+
+    def __init__(self, cap, idle_s=MEMO_IDLE_S):
+        self.cap, self.idle_s = cap, idle_s
+        self._d = OrderedDict()      # ident -> [key, value, last seen]
+        self.hits = self.misses = self.evictions = self.drift = 0
+
+    def get(self, ident, key, now):
+        e = self._d.get(ident)
+        if e is None or e[0] != key:
+            self.misses += 1
+            return None
+        e[2] = now
+        self._d.move_to_end(ident)
+        self.hits += 1
+        return e[1]
+
+    def peek(self, ident):
+        """What the memo holds, without counting a hit — the cold audit's view
+        of 'what would have been served'."""
+        e = self._d.get(ident)
+        return None if e is None else (e[0], e[1])
+
+    def put(self, ident, key, value, now):
+        self._d[ident] = [key, value, now]
+        self._d.move_to_end(ident)
+        while len(self._d) > self.cap:
+            self._d.popitem(last=False)
+            self.evictions += 1
+
+    def expire(self, now):
+        """Drop what has not been observed for `idle_s`. Least-recently-seen
+        sits at the front, so this stops at the first live entry."""
+        while self._d:
+            ident = next(iter(self._d))
+            if now - self._d[ident][2] < self.idle_s:
+                break
+            del self._d[ident]
+            self.evictions += 1
+
+    def clear(self):
+        """Everything is suspect — after a wake, per §4.5."""
+        self._d.clear()
+
+    def __len__(self):
+        return len(self._d)
+
+
+_FACTS = StatMemo(MEMO_FILES)     # transcript -> the facts a card needs
+_TREES = StatMemo(MEMO_DIRS)      # subagent directory -> its entry names
+
+
+def memo_stats():
+    """Counters for `observer.stats()`. `scan_drift` is the load-bearing one:
+    it is the number of times a cold re-read disagreed with what the memo would
+    have served, and it must be 0."""
+    return {"scan_hits": _FACTS.hits, "scan_misses": _FACTS.misses,
+            "scan_drift": _FACTS.drift, "scan_entries": len(_FACTS),
+            "tree_hits": _TREES.hits, "tree_misses": _TREES.misses,
+            "tree_drift": _TREES.drift, "tree_entries": len(_TREES),
+            "memo_evictions": _FACTS.evictions + _TREES.evictions}
+
+
+def memo_drift():
+    return _FACTS.drift + _TREES.drift
+
+
+def memo_clear():
+    _FACTS.clear()
+    _TREES.clear()
 
 
 # ---------------------------------------------------------------- collectors
@@ -217,7 +376,65 @@ def parse_session_tail(fp):
     return out
 
 
-def _subagent_files(sub_dir):
+def _dir_entries(d):
+    """(subdir names, *.jsonl names) for one directory, None if unreadable."""
+    try:
+        it = os.scandir(d)
+    except OSError:
+        return None                       # gone, or not a directory at all
+    subs, files = [], []
+    with it:
+        for e in it:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    subs.append(e.name)
+                elif e.name.endswith(".jsonl"):
+                    files.append(e.name)
+            except OSError:
+                continue                  # raced with a subagent finishing
+    return tuple(subs), tuple(files)
+
+
+def _tree_jsonl(sub_dir, memo=None, now=0.0, read=True, write=True):
+    """Every *.jsonl path under a session's subagent tree, in walk order.
+
+    `memo` halves the walk, and only the half that can be halved honestly. A
+    directory's mtime moves when an entry is created, removed or renamed in it,
+    so it is a sound key for WHICH FILES EXIST — that is what is memoised here.
+    It does NOT move when a file inside is appended to, which is why the mtimes
+    are not this function's business: see `_subagent_files`.
+
+    Names are stored, not paths, so a renamed tree cannot serve stale children.
+    `read=False` re-reads every directory for real but still re-keys the memo;
+    `write=False` consults it without refreshing it. The cold audit runs one of
+    each and compares them.
+    """
+    stack = [str(sub_dir)]
+    while stack:
+        d = stack.pop()
+        if memo is None:
+            ent = _dir_entries(d)
+        else:
+            try:
+                st = os.stat(d)
+            except OSError:
+                continue                  # gone, or not a directory at all
+            ident = (d, st.st_dev, st.st_ino)
+            key = (st.st_size, st.st_mtime_ns)
+            ent = memo.get(ident, key, now) if read else None
+            if ent is None:
+                ent = _dir_entries(d)
+                if ent is not None and write:
+                    memo.put(ident, key, ent, now)
+        if ent is None:
+            continue
+        subs, names = ent
+        stack.extend(os.path.join(d, s) for s in subs)
+        for n in names:
+            yield os.path.join(d, n)
+
+
+def _subagent_files(sub_dir, memo=None, now=0.0, read=True, write=True):
     """[(mtime, path)] for every *.jsonl under a session's subagent tree.
 
     A session running a Workflow writes only under <session-id>/ while its main
@@ -231,34 +448,121 @@ def _subagent_files(sub_dir):
     So the walk stays complete and gets cheap instead. os.scandir reuses one
     directory read per level and skips building a Path per entry; measured over
     163 real subagent dirs holding ~16k files, 146ms -> 84ms for an identical
-    result.
+    result. Then the directory reads themselves are memoised (`_tree_jsonl`):
+    of 105 CPU-ms over 539 trees, 44 was reading directories and 61 was
+    stat-ing the 18,187 files inside them.
+
+    THE 61 STAYS, EVERY SWEEP, DELIBERATELY. `sub_mtime` is the liveness of a
+    workflow session and it is never a remembered number: a directory's mtime
+    does not move when a file inside it is appended to, so a memo keyed on it
+    would report an active subagent as idle and the session would drop off the
+    board with nothing to show it had.
     """
     out = []
-    stack = [str(sub_dir)]
-    while stack:
+    for p in _tree_jsonl(sub_dir, memo, now, read, write):
         try:
-            it = os.scandir(stack.pop())
+            out.append((os.lstat(p).st_mtime, Path(p)))
         except OSError:
-            continue                      # gone, or not a directory at all
-        with it:
-            for e in it:
-                try:
-                    if e.is_dir(follow_symlinks=False):
-                        stack.append(e.path)
-                    elif e.name.endswith(".jsonl"):
-                        out.append((e.stat(follow_symlinks=False).st_mtime,
-                                    Path(e.path)))
-                except OSError:
-                    continue              # raced with a subagent finishing
+            continue                      # raced with a subagent finishing
     return out
 
 
-def scan_sessions(worktrees, all_procs, now):
+def _subagent_files_audited(sub_dir, now):
+    """The cold path (§4.3 #1): re-read every directory for real, and count a
+    disagreement with what the memo would have served into `_TREES.drift`.
+
+    Only the SET OF FILES is compared, never their mtimes — the mtimes were
+    never memoised, and the two walks stat them at two different instants, so
+    an mtime that moved between them is a subagent writing, not a memo lying.
+    """
+    before = sorted(_tree_jsonl(sub_dir, _TREES, now, write=False))
+    fresh = _subagent_files(sub_dir, memo=_TREES, now=now, read=False)
+    if before != sorted(str(p) for _, p in fresh):
+        _TREES.drift += 1
+    return fresh
+
+
+def _read_facts(fp):
+    """Everything a card needs from ONE transcript's bytes, in one place.
+
+    Bundled deliberately: these three reads share a key, so memoising them
+    together is one stat instead of three and one entry instead of three.
+    `find_last_user` re-reads a megabyte and only earns it when the 128 KB tail
+    was all tool traffic — that stays true, it is just no longer paid per sweep.
+    """
+    tail = parse_session_tail(fp)
+    return {"cwd": tail["cwd"], "branch": tail["branch"],
+            "model": tail["model"],
+            "pending_tools": tuple(tail["pending_tools"]),
+            "pending_workflows": tail["pending_workflows"],
+            "pending_bg_agents": tail["pending_bg_agents"],
+            "last_assistant": tail["last_assistant"],
+            "last_user": tail["last_user"] or find_last_user(fp),
+            "topic": session_topic(fp)}
+
+
+def _facts(fp, st, now, cold=False):
+    """`_read_facts`, memoised on the transcript's stat — and audited when cold.
+
+    Warm: `(path, dev, ino)` + `(size, mtime_ns)`. A transcript is append-only,
+    so an append moves the size; a rotation moves the inode; either is a miss.
+
+    Cold (§4.3 #1/#4): read from the file regardless, then compare against what
+    the memo WOULD have served. The comparison only counts when the file's key
+    is identical before and after the read — otherwise the file changed under
+    us and a difference is the world moving, not the memo lying.
+    """
+    ident = (str(fp), st.st_dev, st.st_ino)
+    key = (st.st_size, st.st_mtime_ns)
+    if not cold:
+        val = _FACTS.get(ident, key, now)
+        if val is None:
+            val = _read_facts(fp)
+            _FACTS.put(ident, key, val, now)
+        return val
+    was = _FACTS.peek(ident)
+    val = _read_facts(fp)
+    try:
+        after = os.stat(fp)
+    except OSError:
+        after = None
+    stable = after is not None and (after.st_size, after.st_mtime_ns) == key
+    if stable and was is not None and was[0] == key and was[1] != val:
+        _FACTS.drift += 1
+    _FACTS.put(ident, key, val, now)
+    return val
+
+
+def _subagent_said(fp, st, now, cold=False):
+    """Last assistant text of a subagent file — same memo, same key."""
+    ident = (str(fp), st.st_dev, st.st_ino, "said")
+    key = (st.st_size, st.st_mtime_ns)
+    if not cold:
+        val = _FACTS.get(ident, key, now)
+        if val is None:
+            val = (last_assistant_text(fp),)
+            _FACTS.put(ident, key, val, now)
+        return val[0]
+    was = _FACTS.peek(ident)
+    val = (last_assistant_text(fp),)
+    if was is not None and was[0] == key and was[1] != val:
+        _FACTS.drift += 1
+    _FACTS.put(ident, key, val, now)
+    return val[0]
+
+
+def scan_sessions(worktrees, all_procs, now, cold=False):
     """All recent sessions across every Claude home, mapped to worktrees.
 
     `all_procs`, not `procs`: the module object of that name is what the
     session↔process pairing now hangs off, and a parameter would shadow it.
-    Callers pass it positionally, so the name is local knowledge."""
+    Callers pass it positionally, so the name is local knowledge.
+
+    `cold` bypasses the stat memo (§4.3 #1): every transcript is re-read from
+    the file and every directory re-scanned, and whatever the memo would have
+    served is compared against the truth and counted into `drift`. Left False —
+    which is every call but the reconcile sweep's — this reuses the parse of any
+    transcript whose `(path, dev, ino, size, mtime_ns)` has not moved."""
     by_wt = {w["path"]: [] for w in worktrees}
     wt_prefixes = {w["path"]: gitrepo.munge(w["path"]) for w in worktrees}
     window_s = config.CFG["session_window_h"] * 3600
@@ -271,27 +575,33 @@ def scan_sessions(worktrees, all_procs, now):
                 continue
             for fp in proj.glob("*.jsonl"):
                 try:
-                    mtime = fp.stat().st_mtime
+                    st = fp.stat()
                 except OSError:
                     continue
+                mtime = st.st_mtime
                 # Workflows/subagents write to <session-id>/**/*.jsonl while the
                 # main transcript sits untouched — count them toward activity.
                 sub_dir = fp.with_suffix("")
-                sub_files = _subagent_files(sub_dir)
+                sub_files = (_subagent_files_audited(sub_dir, now) if cold else
+                             _subagent_files(sub_dir, memo=_TREES, now=now))
                 sub_mtime = max((m for m, _ in sub_files), default=0.0)
                 # The newest thing the session "said" may be a subagent's
                 # report (Claude Code shows those in the terminal too).
                 subagent_said = None
                 if sub_mtime > mtime:
                     for _, sf in sorted(sub_files, reverse=True)[:2]:
-                        subagent_said = last_assistant_text(sf)
+                        try:
+                            sst = sf.stat()
+                        except OSError:
+                            continue
+                        subagent_said = _subagent_said(sf, sst, now, cold)
                         if subagent_said:
                             break
                 last_write = max(mtime, sub_mtime)
                 age = now - last_write
                 if age > window_s:
                     continue
-                tail = parse_session_tail(fp)
+                tail = _facts(fp, st, now, cold)
                 cwd = tail["cwd"] or wt
                 by_wt[wt].append({
                     "id": fp.stem[:8],
@@ -311,15 +621,24 @@ def scan_sessions(worktrees, all_procs, now):
                     "subdir": os.path.relpath(cwd, wt) if cwd != wt else None,
                     "branch": tail["branch"],
                     "model": (tail["model"] or "").replace("claude-", ""),
-                    "pending_tools": tail["pending_tools"],
+                    # a fresh list per card: the memo hands out one shared
+                    # value to every sweep that hits it, and a Snapshot is
+                    # frozen — nothing on the wire may alias memo state.
+                    "pending_tools": list(tail["pending_tools"]),
                     "pending_workflows": tail["pending_workflows"],
                     "pending_bg_agents": tail["pending_bg_agents"],
-                    "topic": session_topic(fp),
+                    "topic": tail["topic"],
                     "last_assistant": tail["last_assistant"],
-                    "last_user": tail["last_user"] or find_last_user(fp),
+                    "last_user": tail["last_user"],
                     "subagent_said": subagent_said,
                     "subagents_active": bool(sub_mtime and now - sub_mtime < config.CFG["working_s"]),
                 })
+
+    # §4.7. The LRU cap is the hard bound; this is the one that matters in
+    # practice, because the corpus grows ~982 .jsonl/day and a file that has
+    # left the 48 h window is never read again.
+    _FACTS.expire(now)
+    _TREES.expire(now)
 
     rank = {"needs_input": 0, "blocked": 1, "working": 2, "waiting": 3, "ended": 4}
     for wt, sessions in by_wt.items():

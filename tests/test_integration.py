@@ -67,9 +67,9 @@ def turn_end(pending_workflows=0, pending_bg_agents=0):
             "pendingBackgroundAgentCount": pending_bg_agents}
 
 
-@unittest.skipUnless(HAVE_GIT, "git not available")
-class TestCollectPipeline(unittest.TestCase):
-    """discover_worktrees + git_info + scan_sessions + collect_state, for real."""
+class _Fleet(unittest.TestCase):
+    """One real git worktree, one real Claude home, live inputs stubbed empty.
+    No tests of its own — `setUp`/`tearDown` only."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="fb-it-"))
@@ -101,8 +101,21 @@ class TestCollectPipeline(unittest.TestCase):
         fb.limits.cached_limits = lambda refresh=False: {"available": False}
         fb._cache["state"] = None                              # bust the 4s cache
         self._closeouts = dict(fb._closeouts)
+        # The stat memo outlives a collect by design — never across a fixture,
+        # or one test's inodes answer for another's. Its counters are
+        # process-lifetime health readings (that is the point of `scan_drift`),
+        # so a test that deliberately poisons the memo has to put them back or
+        # every later assertion on `drift` inherits the lie.
+        fb.memo_clear()
+        self._counters = [(m, m.hits, m.misses, m.evictions, m.drift)
+                          for m in (fb.transcripts._FACTS, fb.transcripts._TREES)]
+        for m, *_ in self._counters:
+            m.hits = m.misses = m.evictions = m.drift = 0
 
     def tearDown(self):
+        fb.memo_clear()
+        for m, h, mi, e, d in self._counters:
+            m.hits, m.misses, m.evictions, m.drift = h, mi, e, d
         fb._closeouts.clear()
         fb._closeouts.update(self._closeouts)
         for k, v in self._save.items():
@@ -114,6 +127,11 @@ class TestCollectPipeline(unittest.TestCase):
          fb.limits.cached_limits) = self._demo, self._procs, self._cl
         fb._cache["state"] = None
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestCollectPipeline(_Fleet):
+    """discover_worktrees + git_info + scan_sessions + collect_state, for real."""
 
     def test_worktree_and_git_info(self):
         wts = fb.discover_worktrees()
@@ -259,6 +277,194 @@ class TestCollectPipeline(unittest.TestCase):
         fb._prune_closeouts()
         self.assertNotIn("ancient", fb._closeouts)
         self.assertIn("myapp", fb._closeouts)
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestTranscriptMemo(_Fleet):
+    """The stat memo underneath scan_sessions, against real files.
+
+    LAW, and the reason this class exists rather than a benchmark: a stale memo
+    is worse than a slow sweep. Every reuse below is proved to be defeated by
+    the thing that would make it wrong, and the cold reconcile is proved to
+    catch it when it is not.
+    """
+
+    def _sessions(self):
+        fb._cache["state"] = None
+        return fb.collect_state()["worktrees"][0]["sessions"]
+
+    def _count_parses(self):
+        """Wrap the real parse so a reuse is visible as a call that did not
+        happen, not as a stopwatch reading."""
+        real, seen = fb.transcripts.parse_session_tail, []
+
+        def counted(fp):
+            seen.append(str(fp))
+            return real(fp)
+        fb.transcripts.parse_session_tail = counted
+        self.addCleanup(setattr, fb.transcripts, "parse_session_tail", real)
+        return seen
+
+    def test_an_unchanged_transcript_is_parsed_once_not_once_per_sweep(self):
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"),
+            assistant_msg(text="working on it"), turn_end()])
+        seen = self._count_parses()
+        for _ in range(4):
+            self.assertEqual(self._sessions()[0]["last_assistant"], "working on it")
+        self.assertEqual(len(seen), 1)          # four sweeps, one parse
+
+    def test_an_append_defeats_the_memo(self):
+        """The one thing a transcript actually does. If this reuses, the board
+        shows an agent still saying what it said ten minutes ago."""
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"),
+            assistant_msg(text="working on it"), turn_end()])
+        self.assertEqual(self._sessions()[0]["last_assistant"], "working on it")
+        with open(fp, "a") as f:
+            f.write(json.dumps(assistant_msg(text="finished it")) + "\n")
+        self.assertEqual(self._sessions()[0]["last_assistant"], "finished it")
+
+    def test_a_transcript_replaced_at_the_same_path_size_and_mtime_is_a_miss(self):
+        """Step 0's trap, reproduced on disk: same path, same size, same mtime,
+        different inode. Keying on the path would serve the dead file's parse —
+        that exact mistake made a delivered message read as undelivered and
+        cost 3x usage."""
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"),
+            assistant_msg(text="aaaaaaa"), turn_end()])
+        self.assertEqual(self._sessions()[0]["last_assistant"], "aaaaaaa")
+        st = os.stat(fp)
+        other = fp.with_name("replacement.jsonl")
+        write_transcript(self.home, self.repo, "main", sid="replacement",
+                         entries=[user_msg("Build a login screen"),
+                                  assistant_msg(text="bbbbbbb"), turn_end()])
+        self.assertEqual(os.stat(other).st_size, st.st_size)   # same size…
+        os.utime(other, ns=(st.st_atime_ns, st.st_mtime_ns))   # …same mtime…
+        self.assertNotEqual(os.stat(other).st_ino, st.st_ino)  # …other inode
+        os.replace(other, fp)
+        self.assertEqual(self._sessions()[0]["last_assistant"], "bbbbbbb")
+
+    def test_the_cold_reconcile_re_reads_and_counts_a_memo_that_lies(self):
+        """§4.3 #1/#4. Nothing else can catch this: a stale parse looks exactly
+        like a quiet agent, so a memo nobody audits fails silently forever."""
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"),
+            assistant_msg(text="the truth"), turn_end()])
+        self.assertEqual(self._sessions()[0]["last_assistant"], "the truth")
+        st = os.stat(fp)
+        ident = (str(fp), st.st_dev, st.st_ino)
+        key = (st.st_size, st.st_mtime_ns)
+        poisoned = dict(fb.transcripts._FACTS.peek(ident)[1])
+        poisoned["last_assistant"] = "a lie"
+        fb.transcripts._FACTS.put(ident, key, poisoned, time.time())
+        self.assertEqual(self._sessions()[0]["last_assistant"], "a lie")
+        self.assertEqual(fb.memo_stats()["scan_drift"], 0)
+
+        fb._cache["state"] = None
+        s = fb.collect_state(cold=True)["worktrees"][0]["sessions"][0]
+        self.assertEqual(s["last_assistant"], "the truth")   # read from the file
+        self.assertEqual(fb.memo_stats()["scan_drift"], 1)   # …and counted
+        self.assertEqual(self._sessions()[0]["last_assistant"], "the truth")
+
+    def test_a_subagent_appending_inside_an_unchanged_directory_moves_the_clock(self):
+        """The memo remembers WHICH files a subagent tree holds, never WHEN
+        they were written — a directory's mtime does not move when a file
+        inside it is appended to. Cache that and a live workflow session goes
+        quiet on the board with nothing to show it ever ran."""
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("delegate everything"), assistant_msg(text="delegated"),
+            turn_end()])
+        old = time.time() - 600
+        os.utime(fp, (old, old))
+        sub = fp.with_suffix("")
+        (sub / "deep").mkdir(parents=True)
+        sf = sub / "deep" / "agent-1.jsonl"
+        sf.write_text(json.dumps(assistant_msg(text="starting")) + "\n")
+        stamp = time.time() - 300
+        os.utime(sf, (stamp, stamp))
+        dir_before = os.stat(sub / "deep").st_mtime_ns
+        self.assertAlmostEqual(self._sessions()[0]["last_write_at"], stamp, places=3)
+
+        with open(sf, "a") as f:               # the subagent says more
+            f.write(json.dumps(assistant_msg(text="still going")) + "\n")
+        moved = time.time() - 5
+        os.utime(sf, (moved, moved))
+        self.assertEqual(os.stat(sub / "deep").st_mtime_ns, dir_before)  # dir sat still
+        s = self._sessions()[0]
+        self.assertAlmostEqual(s["last_write_at"], moved, places=3)
+        self.assertTrue(s["subagents_active"])
+        self.assertEqual(s["subagent_said"], "still going")
+
+    def test_a_new_subagent_file_defeats_the_directory_memo(self):
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("delegate everything"), assistant_msg(text="delegated"),
+            turn_end()])
+        old = time.time() - 600
+        os.utime(fp, (old, old))
+        sub = fp.with_suffix("")
+        sub.mkdir()
+        (sub / "a.jsonl").write_text(json.dumps(assistant_msg(text="first")) + "\n")
+        os.utime(sub / "a.jsonl", (old + 1, old + 1))
+        self.assertEqual(self._sessions()[0]["subagent_said"], "first")
+        (sub / "b.jsonl").write_text(json.dumps(assistant_msg(text="second")) + "\n")
+        self.assertEqual(self._sessions()[0]["subagent_said"], "second")
+
+    def test_the_cold_reconcile_counts_a_directory_memo_that_lies(self):
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("delegate everything"), assistant_msg(text="delegated"),
+            turn_end()])
+        sub = fp.with_suffix("")
+        sub.mkdir()
+        (sub / "a.jsonl").write_text(json.dumps(assistant_msg(text="first")) + "\n")
+        self._sessions()
+        st = os.stat(sub)
+        ident = (str(sub), st.st_dev, st.st_ino)
+        key = (st.st_size, st.st_mtime_ns)
+        fb.transcripts._TREES.put(ident, key, ((), ()), time.time())  # "empty"
+        self.assertEqual(fb.memo_stats()["tree_drift"], 0)
+        fb._cache["state"] = None
+        fb.collect_state(cold=True)
+        self.assertEqual(fb.memo_stats()["tree_drift"], 1)
+
+    def test_nothing_on_the_wire_aliases_memo_state(self):
+        """A Snapshot is frozen and two sweeps share one memo value. A card
+        that handed out the memo's own list would let a later mutation of the
+        card rewrite an already-published snapshot."""
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"),
+            assistant_msg(text="working", tool="Bash")])
+        first = self._sessions()[0]["pending_tools"]
+        self.assertEqual(first, ["Bash"])
+        first.append("MUTATED")
+        self.assertEqual(self._sessions()[0]["pending_tools"], ["Bash"])
+
+    def test_the_memo_does_not_grow_with_the_number_of_sweeps(self):
+        """§4.7. The corpus grows ~982 .jsonl/day and the sweep never stops."""
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"), assistant_msg(text="working")])
+        self._sessions()
+        size = len(fb.transcripts._FACTS) + len(fb.transcripts._TREES)
+        for _ in range(10):
+            self._sessions()
+        self.assertEqual(len(fb.transcripts._FACTS) + len(fb.transcripts._TREES),
+                         size)
+
+    def test_the_scan_reaps_entries_nobody_is_reading_any_more(self):
+        """The cap is the hard bound; this is the one that matters day to day,
+        because a transcript that leaves the 48 h window is never read again
+        and would otherwise sit in the memo until 2,048 newer ones pushed it
+        out. Proved by wiring, not by waiting an hour."""
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"), assistant_msg(text="working")])
+        self._sessions()
+        self.assertTrue(len(fb.transcripts._FACTS))
+        for m in (fb.transcripts._FACTS, fb.transcripts._TREES):
+            self.addCleanup(setattr, m, "idle_s", m.idle_s)
+            m.idle_s = 0.0                      # everything is instantly idle
+        self._sessions()
+        self.assertEqual(len(fb.transcripts._FACTS), 0)
+        self.assertEqual(len(fb.transcripts._TREES), 0)
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")

@@ -1603,5 +1603,56 @@ class TestHTTPSmoke(ConfigGuard):
         cm.exception.close()
 
 
+# --------------------------------------------------------------- the stat memo
+
+class TestStatMemo(unittest.TestCase):
+    """The cache underneath the transcript scan. Two properties, and the whole
+    safety of the sweep rests on them: a key that contains everything which can
+    change the answer, and a bound that survives a multi-day uptime (§4.7)."""
+
+    def test_a_key_that_moves_is_a_miss(self):
+        m = fb.StatMemo(cap=8)
+        m.put(("/t", 1, 2), (10, 100), "old", 0.0)
+        self.assertEqual(m.get(("/t", 1, 2), (10, 100), 1.0), "old")
+        self.assertIsNone(m.get(("/t", 1, 2), (11, 100), 1.0))   # appended
+        self.assertIsNone(m.get(("/t", 1, 2), (10, 101), 1.0))   # touched
+
+    def test_identity_is_in_the_ident_not_just_the_path(self):
+        """The Step-0 trap: a transcript replaced under its own name, with the
+        same size and the same mtime, must not serve the old file's parse."""
+        m = fb.StatMemo(cap=8)
+        m.put(("/t", 1, 2), (10, 100), "old", 0.0)
+        self.assertIsNone(m.get(("/t", 1, 999), (10, 100), 1.0))  # new inode
+        self.assertIsNone(m.get(("/t", 9, 2), (10, 100), 1.0))    # new device
+
+    def test_the_cap_is_a_hard_bound_and_evicts_the_least_recently_seen(self):
+        m = fb.StatMemo(cap=3)
+        for i in range(3):
+            m.put((f"/{i}", 0, i), (0, 0), i, float(i))
+        m.get(("/0", 0, 0), (0, 0), 10.0)          # 0 is now the freshest
+        m.put(("/3", 0, 3), (0, 0), 3, 11.0)
+        self.assertEqual(len(m), 3)
+        self.assertEqual(m.evictions, 1)
+        self.assertIsNone(m.get(("/1", 0, 1), (0, 0), 12.0))   # 1 was oldest
+        self.assertEqual(m.get(("/0", 0, 0), (0, 0), 12.0), 0)
+
+    def test_an_entry_nobody_has_looked_at_expires(self):
+        m = fb.StatMemo(cap=99, idle_s=10.0)
+        m.put(("/old", 0, 1), (0, 0), "a", 0.0)
+        m.put(("/new", 0, 2), (0, 0), "b", 100.0)
+        m.expire(105.0)
+        self.assertIsNone(m.get(("/old", 0, 1), (0, 0), 105.0))
+        self.assertEqual(m.get(("/new", 0, 2), (0, 0), 105.0), "b")
+
+    def test_an_entry_replaces_itself_rather_than_accumulating(self):
+        """A transcript appended to 500 times is one entry, not 500 — the file
+        corpus grows ~982 .jsonl/day and the sweep is perpetual."""
+        m = fb.StatMemo(cap=1024)
+        for size in range(500):
+            m.put(("/t", 1, 2), (size, size), size, float(size))
+        self.assertEqual(len(m), 1)
+        self.assertEqual(m.evictions, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
