@@ -66,7 +66,7 @@
   },
   "state_payload": {
    "cases": 1,
-   "sha256": "3d75c4f46279cff4"
+   "sha256": "b4f2bba9c52b5bbf"
   }
  },
  "snapshot": {
@@ -72419,6 +72419,7 @@
          "last_write_at": "<float>",
          "model": "opus-4-8",
          "pending_bg_agents": 0,
+         "pending_bg_tools": 0,
          "pending_tools": [],
          "pending_workflows": 0,
          "pid": "<NoneType>",
@@ -72460,6 +72461,7 @@
          "last_write_at": "<float>",
          "model": "opus-4-8",
          "pending_bg_agents": 0,
+         "pending_bg_tools": 1,
          "pending_tools": [],
          "pending_workflows": 0,
          "pid": "<NoneType>",
@@ -72502,6 +72504,7 @@
          "last_write_at": "<float>",
          "model": "opus-4-8",
          "pending_bg_agents": 0,
+         "pending_bg_tools": 0,
          "pending_tools": [],
          "pending_workflows": 0,
          "pid": "<NoneType>",

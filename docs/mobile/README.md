@@ -17,9 +17,9 @@ are.
 | | |
 |---|---|
 | **Phase** | B — backend, in flight |
-| **Shipped** | steps 0–3 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core. Step 5 in flight: an ended turn is now read off the transcript, not waited out |
-| **Next** | finish step 5 (the residual timer) then step 4 (SSE) — see *Development path* |
-| **Tests** | 370 · characterization 3,032 cases |
+| **Shipped** | steps 0–3 + 5 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core. An ended turn is read off the transcript rather than waited out, and delegated work — including the background tasks the CLI's own counts miss — holds the turn open |
+| **Next** | step 4 (SSE) — see *Development path* |
+| **Tests** | 415 · characterization 4,216 cases |
 | **Last updated** | 2026-07-22 |
 
 Design documents are being generated and reconciled. Until each is listed as **settled** below,
@@ -127,7 +127,7 @@ even if the phone client were cancelled.
 | **—** ✅ | make the sweep affordable: git on a 15 s cadence, transcript memo, `(pid,start)` cwd memo | 55% → 15% of a core |
 | **3** ✅ | kqueue watcher — react to writes instead of sweeping | idle **5.3%** of a core; write→board ~1 s (was a 30 s cadence); 220 fds |
 | **—** ✅ | identity-addressed mutations (ADR 0008) | a recycled pid is refused, not delivered to the wrong agent |
-| **5** ✅ | **status model — `working_s = 90`** | phase 1: the CLI's own end-of-turn marker is read positionally and wired into `classify_session`, so **84 %** of in-window sessions resolve by observation and stop waiting out the window (median lateness removed: the full 90 s). Phase 2: the residual 16 % fall to `quiet_s = 45`, chosen off the misfire table (2.71 % against 5.80 % at ENGINE.md's 25), with `settle()` making escalation instant and de-escalation dwell 3 s. |
+| **5** ✅ | **status model — `working_s = 90`** | phase 1: the CLI's own end-of-turn marker is read positionally and wired into `classify_session`, so **84 %** of in-window sessions resolve by observation and stop waiting out the window (median lateness removed: the full 90 s). Phase 2: the residual 16 % fall to `quiet_s = 45`, chosen off the misfire table (2.71 % against 5.80 % at ENGINE.md's 25), with `settle()` making escalation instant and de-escalation dwell 3 s. Phase 3: `delegated` stops under-counting — a tool_use that LAUNCHED background work counts until its `<task-notification>` arrives (`delegated_s = 600`), taking the end-of-turn misfire rate from **5.09 % to 4.42 %** over 904 replayed claims at no measured cost. |
 | **4** ⬜ | SSE + delta protocol; retire the 5 s browser poll | the browser finally sees the ~1 s the server already knows |
 | **6** ⬜ | Claude Code hooks; reconcile signal sources by rank | `BLOCKED`/`YOUR TURN` become observed, not inferred |
 | **7** ⬜ | auth, device pairing, tailnet bind | safe to reach from a phone |

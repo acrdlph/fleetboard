@@ -326,6 +326,8 @@ def _fixture_fleet(mod, tmp):
     # is not, so the payload pins the `turn_ended` wire key both ways — present
     # only when observed — and pins that the marker alone never resurrects a
     # session with no live process.
+    import datetime
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     for name in ("alpha", "beta", "gamma"):
         cwd = root / name
         proj = home / "projects" / mod.munge(str(cwd))
@@ -336,9 +338,24 @@ def _fixture_fleet(mod, tmp):
             {"type": "assistant", "cwd": str(cwd),
              "message": {"model": "claude-opus-4-8",
                          "content": [{"type": "text", "text": f"working on {name}"}]}},
-        ] + ([{"type": "system", "subtype": "turn_duration", "cwd": str(cwd),
-               "durationMs": 1000, "pendingWorkflowCount": 0,
-               "pendingBackgroundAgentCount": 0}] if name == "beta" else [])) + "\n")
+        ] + ([
+            # beta also left a background task outstanding, dated NOW so the
+            # `delegated_s` shelf life is live rather than expired. Without a
+            # dated launch here `pending_bg_tools` would be pinned as the
+            # constant 0 and the wire key would be blind to the count behind
+            # it — the same blindness `_limits_payload` exists to fix.
+            {"type": "assistant", "cwd": str(cwd), "timestamp": now_iso,
+             "message": {"model": "claude-opus-4-8", "content": [
+                 {"type": "tool_use", "id": "toolu_char1", "name": "Bash",
+                  "input": {"command": "sleep 900", "run_in_background": True}}]}},
+            {"type": "user", "cwd": str(cwd), "timestamp": now_iso,
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "toolu_char1",
+                  "content": "Command running in background with ID: bchar1. "
+                             "You will be notified when it completes."}]}},
+            {"type": "system", "subtype": "turn_duration", "cwd": str(cwd),
+             "durationMs": 1000, "pendingWorkflowCount": 0,
+             "pendingBackgroundAgentCount": 0}] if name == "beta" else [])) + "\n")
         if name == "gamma":
             old = 1784600000.0          # fixed, well inside the 48h window
             os.utime(proj / f"sess-{name}.jsonl", (old, old))

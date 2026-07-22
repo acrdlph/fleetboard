@@ -1609,6 +1609,7 @@ Everything the summary omits: full free text, per-agent process facts, per-sessi
       "pending_tools": ["AskUserQuestion"],
       "pending_workflows": 0,
       "pending_bg_agents": 0,
+      "pending_bg_tools": 0,
       "topic": "clean up the CI matrix so tmux tests stop flaking on loaded runners",
       "last_user": "keep the 3.11 job, drop 3.10",
       "last_assistant": "Should I drop the legacy workflow file or keep it behind a flag? Dropping it removes the 3.10 job entirely; keeping it behind a flag means…",
@@ -3144,8 +3145,11 @@ excluded from this computation.
 
 ### 10.3 `session.flags`
 
-`tool_running`, `bg_shell`, `subagents_active`, `pending_workflows`, `pending_bg_agents`.
-Always an array; absence means the flag is false. Any of these set means the agent is
+`tool_running`, `bg_shell`, `subagents_active`, `pending_workflows`, `pending_bg_agents`,
+`pending_bg_tools`. Always an array; absence means the flag is false. `pending_bg_tools` counts
+background work the agent launched itself — a backgrounded Bash, a Workflow, an async Agent —
+that has not yet reported back through a `<task-notification>`; the CLI's own two counts do not
+see it, and it resolves its own `tool_use` immediately so `pending_tools` does not either. Any of these set means the agent is
 genuinely busy even when the transcript has gone quiet — treat it as a veto on "your turn".
 
 `turn_ended` is the one flag that argues the other way, and it is strictly weaker than all of

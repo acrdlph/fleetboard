@@ -63,6 +63,44 @@ CFG = {
     # path; the return per second of added lateness falls off a cliff after 45
     # (25→45 buys 0.155 pp/s, 45→60 buys 0.078, 60→90 buys 0.031).
     "quiet_s": 45,             # unexplained silence before a live agent is idle
+    # How long a background launch that has not reported back still counts as
+    # delegated work (transcripts.parse_session_tail / scan_sessions). It is a
+    # SHELF LIFE, not a timeout on the task: the task may well run longer, this
+    # is how long its launch alone is allowed to stand as the explanation for a
+    # quiet session.
+    #
+    # It has to exist because 3.8 % of background launches never report at all
+    # — 76 of 2,000 in ~/.claude* (Workflow 37, Bash 32, Agent 7), killed or
+    # lost to a restart — and an unbounded outstanding set would pin those
+    # sessions at ● WORKING for the whole 48 h window.
+    #
+    # Chosen off both sides of the trade, measured by replaying every
+    # end-of-turn claim in the corpus (908 of them, 720 transcripts, the same
+    # 128 KB tail the board reads). "Uncaught" is the board saying the turn
+    # ended and the agent then speaking again with no human prompt — the
+    # flicker; "held" is the opposite error, a turn that really had ended kept
+    # at WORKING by a launch that was never coming back:
+    #
+    #     bound      uncaught misfire   held wrongly
+    #      none        4.41 %            2  (0.22 %)
+    #     3600 s       4.41 %            2  (0.22 %)
+    #     1200 s       4.41 %            2  (0.22 %)
+    #      900 s       4.41 %            1  (0.11 %)
+    #      600 s       4.41 %            0  (0.00 %)   <- shipped
+    #      450 s       4.41 %            0  (0.00 %)
+    #      300 s       4.63 %            0  (0.00 %)
+    #      120 s       4.63 %            0  (0.00 %)
+    #
+    # The benefit saturates at 450 s and the cost starts at 750 s, so 600 is
+    # the top of the flat, free stretch — every longer bound buys nothing and
+    # starts paying. That it is well below the p90 of launch→notification
+    # latency (1,928 s; p50 278 s, p95 3,010 s) is not a contradiction: a task
+    # still running after ten minutes is one whose session has other evidence
+    # of work — an unresolved tool_use, a live shell, or a non-zero
+    # pendingWorkflowCount — and every branch of those sits ABOVE this one.
+    # Measured: of the 908 claims, no misfire had an outstanding launch older
+    # than 450 s (p50 16 s, p90 692 s, p95 2,069 s).
+    "delegated_s": 600,        # …and how long an unanswered launch explains it
     # De-escalation dwell (ENGINE.md §6.3(a)): a status must stand this long
     # before it may quieten. Escalation toward more attention never waits. It
     # does NOT stack on `quiet_s` — see `status.settle`.

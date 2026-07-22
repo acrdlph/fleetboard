@@ -11,6 +11,7 @@ a plain shell — it never launches `claude`.
     python3 -m unittest discover -s tests
 """
 
+import datetime
 import json
 import os
 import shutil
@@ -67,6 +68,68 @@ def turn_end(pending_workflows=0, pending_bg_agents=0):
             "pendingBackgroundAgentCount": pending_bg_agents}
 
 
+def iso(ago_s=0.0):
+    return datetime.datetime.fromtimestamp(
+        time.time() - ago_s, datetime.timezone.utc).isoformat()
+
+
+# The two halves of a background launch, exactly as the CLI writes them: the
+# tool_use, and a tool_result that RESOLVES it while the work carries on
+# elsewhere. `receipt` is the harness's own wording — the phrase is the signal.
+BG_RECEIPTS = {
+    "Bash": "Command running in background with ID: b3l1ahei. Output is being "
+            "written to: /tmp/tasks/b3l1ahei.output. You will be notified when "
+            "it completes.",
+    "BashTimeout": "Command did not complete within its 180s timeout and was "
+                   "moved to the background (ID: bx1dek5dm). You will be "
+                   "notified when it completes.",
+    # note where the phrase sits: nine lines below the headline, past the
+    # transcript dir, the script path and the resume instructions. Matching the
+    # first line of a receipt would miss this one.
+    "Workflow": "Workflow launched in background. Task ID: w8oz82r5k\n"
+                "Summary: verify the findings\n"
+                "Transcript dir: /tmp/subagents/workflows/wf_49ffc8f0\n"
+                "Run ID: wf_49ffc8f0\n\n"
+                "You will be notified when it completes. Use /workflows to "
+                "watch live progress.",
+    "Agent": "Async agent launched successfully.\nagentId: a9f3cc3f87252\n"
+             "The agent is working in the background. You will be notified "
+             "automatically when it completes.",
+    "Monitor": "Monitor started (task b1h0ax9vj, persistent — runs until "
+               "TaskStop or session end). You will be notified on each event.",
+}
+
+
+def bg_launch(tid="toolu_bg1", tool="Bash", receipt="Bash", ago_s=0.0, dated=True):
+    stamp = {"timestamp": iso(ago_s)} if dated else {}
+    return [
+        {"type": "assistant", **stamp, "message": {
+            "role": "assistant", "model": "claude-fable-5", "content": [
+                {"type": "tool_use", "id": tid, "name": tool,
+                 "input": {"command": "sleep 900", "run_in_background": True}}]}},
+        {"type": "user", **stamp, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid,
+             "content": BG_RECEIPTS[receipt] if receipt in BG_RECEIPTS else receipt}]}},
+    ]
+
+
+def notification(tid="toolu_bg1", status="completed", shape="user"):
+    body = ("<task-notification>\n<task-id>b3l1ahei</task-id>\n"
+            + (f"<tool-use-id>{tid}</tool-use-id>\n" if tid else "")
+            + (f"<status>{status}</status>\n" if status else "")
+            + "<summary>Background command \"sleep\" completed</summary>\n"
+              "</task-notification>")
+    if shape == "user":
+        return {"type": "user", "message": {"role": "user", "content": body}}
+    if shape == "queue-operation":
+        return {"type": "queue-operation", "operation": "enqueue", "content": body}
+    if shape == "attachment":
+        return {"type": "attachment", "attachment": {
+            "type": "queued_command", "prompt": body,
+            "commandMode": "task-notification"}}
+    raise ValueError(shape)
+
+
 class _Fleet(unittest.TestCase):
     """One real git worktree, one real Claude home, live inputs stubbed empty.
     No tests of its own — `setUp`/`tearDown` only."""
@@ -88,7 +151,7 @@ class _Fleet(unittest.TestCase):
         # point orchestra at the fixtures; neutralize live-system inputs
         self._save = {k: fb.CFG.get(k) for k in
                       ("roots", "homes", "pattern", "exclude_accounts",
-                       "reserve_percent", "quiet_s", "working_s")}
+                       "reserve_percent", "quiet_s", "working_s", "delegated_s")}
         self._demo, self._procs, self._cl = (fb.config.DEMO,
                                              fb.procs.claude_processes,
                                              fb.limits.cached_limits)
@@ -444,6 +507,218 @@ class TestTurnEndedIsPositional(_Fleet):
         self.assertTrue(s["turn_ended"])
         self.assertEqual(s["pending_bg_agents"], 1)
         self.assertEqual(s["status"], "working")
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestOutstandingBackgroundWorkIsDelegated(_Fleet):
+    """A tool_use that LAUNCHED background work counts as delegated until its
+    `<task-notification>` arrives.
+
+    The hole this closes, measured: of the 154 end-of-turn claims step 5
+    replayed, 23 saw the agent speak again with no human prompt in between, and
+    `pendingWorkflowCount`/`pendingBackgroundAgentCount` read 0 on every one of
+    them while a `<task-notification>` was what woke the session. Those two
+    counts are right when non-zero — they stay wired — but they do not see a
+    backgrounded Bash, and a backgrounded Bash resumes the session just the
+    same.
+
+    What makes it invisible without this is the shape of the receipt: a
+    background launch RESOLVES its tool_use immediately (the result is the
+    harness saying "you will be notified", not the work), so `pending_tools`
+    is empty again the instant the task starts. Every other signal in the
+    ladder reads idle.
+    """
+
+    def _proc(self):
+        fb.procs.claude_processes = lambda **_: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": "claude", "account": None,
+            "tmux_target": None, "shells": 0}]
+
+    def _tail(self, entries):
+        return fb.transcripts.parse_session_tail(
+            write_transcript(self.home, self.repo, "main", sid="s1", entries=entries))
+
+    def _session(self, entries):
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=entries)
+        self._proc()
+        fb._cache["state"] = None
+        return fb.collect_state()["worktrees"][0]["sessions"][0]
+
+    # ------------------------------------------------------------ the reading
+
+    def test_a_backgrounded_launch_is_outstanding_and_leaves_no_pending_tool(self):
+        tail = self._tail([user_msg("run the deploy"), *bg_launch(), turn_end()])
+        self.assertEqual(len(tail["bg_launched_at"]), 1)
+        # the half of the story that made this necessary
+        self.assertEqual(tail["pending_tools"], [])
+        self.assertTrue(tail["turn_ended"])
+
+    def test_every_launcher_the_harness_backgrounds_is_read_the_same_way(self):
+        # the phrase, not a list of tool names: a Bash moved to the background
+        # after its timeout carries no run_in_background at all, and Workflow /
+        # Agent / Monitor each word their receipt differently
+        for receipt in ("Bash", "BashTimeout", "Workflow", "Agent", "Monitor"):
+            with self.subTest(receipt=receipt):
+                tail = self._tail([user_msg("go"),
+                                   *bg_launch(receipt=receipt), turn_end()])
+                self.assertEqual(len(tail["bg_launched_at"]), 1)
+
+    def test_a_foreground_result_is_not_delegation(self):
+        tail = self._tail([user_msg("go"),
+                           *bg_launch(receipt="total 8\ndrwxr-xr-x  file"),
+                           turn_end()])
+        self.assertEqual(tail["bg_launched_at"], ())
+
+    def test_a_launch_that_errored_never_started(self):
+        tail = self._tail([user_msg("go"), *bg_launch(
+            receipt="<tool_use_error>Invalid workflow script. You will be "
+                    "notified when it completes.</tool_use_error>"), turn_end()])
+        self.assertEqual(tail["bg_launched_at"], ())
+
+    def test_an_undated_launch_is_not_counted(self):
+        """The guard is only ever as strong as its clock. An entry with no
+        timestamp cannot be aged, so it degrades to the behaviour this file had
+        before the outstanding set existed — never to an unbounded hold."""
+        tail = self._tail([user_msg("go"), *bg_launch(dated=False), turn_end()])
+        self.assertEqual(tail["bg_launched_at"], ())
+
+    # ------------------------------------------------------- what clears it
+
+    def test_the_notification_clears_it_in_all_three_shapes_on_disk(self):
+        # a `user` entry, a `queue-operation` with the text at top-level
+        # `content`, an `attachment` with it at `attachment.prompt` — 1,303 /
+        # 3,794 / 898 occurrences in the corpus. Reading only `message.content`
+        # sees a third of them.
+        for shape in ("user", "queue-operation", "attachment"):
+            with self.subTest(shape=shape):
+                tail = self._tail([user_msg("go"), *bg_launch(), turn_end(),
+                                   notification(shape=shape)])
+                self.assertEqual(tail["bg_launched_at"], ())
+                # …and the notification is machine text, so it does not read as
+                # a human prompt and does not withdraw the marker
+                self.assertTrue(tail["turn_ended"])
+
+    def test_a_notification_for_another_task_leaves_this_one_outstanding(self):
+        tail = self._tail([user_msg("go"), *bg_launch(tid="toolu_bg1"),
+                           turn_end(), notification(tid="toolu_other")])
+        self.assertEqual(len(tail["bg_launched_at"]), 1)
+
+    def test_an_interim_monitor_event_does_not_count_as_reporting_back(self):
+        """A Monitor streams `<event>` notifications under its task-id while it
+        is still running — 397 of them in the corpus, none carrying a
+        `<tool-use-id>`. Reading one as the report drops the guard mid-stream.
+        """
+        tail = self._tail([user_msg("go"), *bg_launch(receipt="Monitor"),
+                           turn_end(), notification(tid=None, status=None)])
+        self.assertEqual(len(tail["bg_launched_at"]), 1)
+
+    def test_a_notification_with_no_terminal_status_is_not_the_report(self):
+        """The second lock, pinned on its own. Today the id alone would do the
+        job — no id-bearing notification in the corpus lacks a status, so the
+        test above passes with or without the `<status>` check and proves
+        nothing about it (verified by mutation: dropping the check left it
+        green). This is the shape that check exists for, and the shape a future
+        CLI release would introduce by giving an interim event an id."""
+        tail = self._tail([user_msg("go"), *bg_launch(receipt="Monitor"),
+                           turn_end(), notification(status=None)])
+        self.assertEqual(len(tail["bg_launched_at"]), 1)
+
+    def test_the_agent_quoting_a_notification_cannot_clear_its_own_guard(self):
+        """A notification is something the harness writes INTO a session. An
+        agent reasoning out loud about one — reading a log, explaining what it
+        is waiting for — is not the task reporting back, and must not be able
+        to talk the board out of a guard that exists to describe it."""
+        quoted = notification()["message"]["content"]
+        tail = self._tail([user_msg("go"), *bg_launch(), turn_end(),
+                           assistant_msg(text="still waiting: " + quoted)])
+        self.assertEqual(len(tail["bg_launched_at"]), 1)
+
+    def test_a_failed_or_killed_task_still_reports_back(self):
+        for status in ("failed", "killed", "stopped"):
+            with self.subTest(status=status):
+                tail = self._tail([user_msg("go"), *bg_launch(), turn_end(),
+                                   notification(status=status)])
+                self.assertEqual(tail["bg_launched_at"], ())
+
+    def test_two_launches_are_counted_and_cleared_one_at_a_time(self):
+        entries = [user_msg("go"), *bg_launch(tid="toolu_a"),
+                   *bg_launch(tid="toolu_b"), turn_end()]
+        self.assertEqual(len(self._tail(entries)["bg_launched_at"]), 2)
+        self.assertEqual(len(self._tail(entries + [notification(tid="toolu_a")])
+                              ["bg_launched_at"]), 1)
+
+    # --------------------------------------------------------- end to end
+
+    def test_an_ended_turn_awaiting_a_background_task_stays_working(self):
+        s = self._session([user_msg("run the deploy"), *bg_launch(), turn_end()])
+        self.assertTrue(s["turn_ended"])
+        self.assertEqual(s["pending_bg_tools"], 1)
+        self.assertEqual(s["pending_workflows"], 0)   # the counts the CLI wrote
+        self.assertEqual(s["pending_bg_agents"], 0)   # …which are 0 here
+        self.assertEqual(s["status"], "working")
+
+    def test_the_notification_hands_the_turn_back(self):
+        s = self._session([user_msg("run the deploy"), *bg_launch(), turn_end(),
+                           notification()])
+        self.assertEqual(s["pending_bg_tools"], 0)
+        self.assertEqual(s["status"], "waiting")
+
+    def test_a_launch_past_its_shelf_life_stops_explaining_the_silence(self):
+        """3.8 % of background launches in the corpus never report back at all.
+        Unbounded, one of those pins a live session at ● WORKING for the whole
+        48 h window — an agent that never asks for you."""
+        s = self._session([user_msg("run the deploy"),
+                           *bg_launch(ago_s=fb.CFG["delegated_s"] + 60),
+                           turn_end()])
+        self.assertEqual(s["pending_bg_tools"], 0)
+        self.assertEqual(s["status"], "waiting")
+
+    def test_the_shelf_life_is_measured_against_now_not_against_the_file(self):
+        """`parse_session_tail` is memoised on the transcript's stat, so it must
+        hand out TIMESTAMPS and let the caller age them. If the count were
+        computed inside the parse it would be frozen at whatever it was when
+        the file last moved, and a launch would stay 'outstanding' for as long
+        as the session sat still — the stalest possible reading of the freshest
+        possible signal."""
+        entries = [user_msg("run the deploy"), *bg_launch(ago_s=120), turn_end()]
+        self.assertEqual(self._session(entries)["pending_bg_tools"], 1)
+        fb.CFG["delegated_s"] = 60          # the file has not changed; the rule has
+        fb._cache["state"] = None
+        s = fb.collect_state()["worktrees"][0]["sessions"][0]
+        self.assertEqual(s["pending_bg_tools"], 0)
+        self.assertEqual(s["status"], "waiting")
+
+    def test_a_session_that_went_quiet_does_not_keep_its_launch_fresh(self):
+        """The divergence that names the clock. A launch 2 minutes before the
+        transcript's LAST write, on a transcript that then sat still for half an
+        hour, is half an hour old — not two minutes. Aged against the file's own
+        clock it would read as inside the shelf life forever, which is the
+        unbounded hold the shelf life exists to prevent: quiet is exactly the
+        state in which a stuck task stops being an explanation."""
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("run the deploy"),
+            *bg_launch(ago_s=fb.CFG["delegated_s"] * 3 + 120), turn_end()])
+        quiet = time.time() - fb.CFG["delegated_s"] * 3    # last write, long ago
+        os.utime(fp, (quiet, quiet))
+        self._proc()
+        fb._cache["state"] = None
+        s = fb.collect_state()["worktrees"][0]["sessions"][0]
+        self.assertEqual(s["pending_bg_tools"], 0)
+
+    def test_the_launch_alone_never_resurrects_a_session_with_no_process(self):
+        # FLICKER IS WORSE THAN LAG, and ENDED feeds worktree-FREE feeds
+        # dispatch: delegated work must not out-vote "there is no agent here".
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("run the deploy"), *bg_launch(), turn_end()])
+        fb.procs.claude_processes = lambda **_: []
+        fp = self.home / "projects" / fb.munge(str(self.repo)) / "s1.jsonl"
+        old = time.time() - 3 * fb.CFG["working_s"]
+        os.utime(fp, (old, old))
+        fb._cache["state"] = None
+        card = fb.collect_state()["worktrees"][0]
+        self.assertEqual(card["sessions"][0]["status"], "ended")
+        self.assertEqual(card["availability"], "free")
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")

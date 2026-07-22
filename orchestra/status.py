@@ -17,8 +17,11 @@ def classify_session(age_s, alive, pending_tools, delegated,
                      evidence_age=None, procs_known=True, quiet_s=None,
                      block_grace_s=None, orphan_grace_s=None):
     """Base session status from observable signals (before limit/handoff
-    overrides). `delegated` counts pending workflows + background agents.
-    Returns (status, tool_running).
+    overrides). `delegated` counts every piece of work this session is waiting
+    on itself: the CLI's own pending workflows and background agents, plus the
+    background tool_uses it launched and has not been notified back about —
+    `transcripts.parse_session_tail` owns the last of those and says why the
+    first two are not enough on their own. Returns (status, tool_running).
 
     ORDER IS THE CONTRACT: nothing is decided by a clock before the evidence
     on disk has been read. The old ladder tested `age_s < working_s` first,
@@ -61,9 +64,12 @@ def classify_session(age_s, alive, pending_tools, delegated,
 
     if alive and "AskUserQuestion" in pend:  # the question is ON DISK
         return "needs_input", False
-    if alive and delegated:                  # awaiting its own workflows or
-        return "working", False              # background agents — not the
-                                             # user's turn
+    if alive and delegated:                  # awaiting work it launched itself
+        return "working", False              # — a workflow, a background agent,
+                                             # a backgrounded tool. The harness
+                                             # resumes the session when they
+                                             # report back, so it is not the
+                                             # user's turn.
     if alive and shells:                     # a Bash shell is still running —
         return "working", True               # backgrounded ones leave the
                                              # transcript idle until they exit

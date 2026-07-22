@@ -29,6 +29,7 @@ comment on it for why that is a property of the key and not a hope, and for the
 bound that keeps it from growing with the corpus.
 """
 
+import datetime
 import json
 import os
 import re
@@ -377,6 +378,129 @@ def find_last_user(fp, size=1024 * 1024):
     return None
 
 
+# ------------------------------------------------- delegated background work
+#
+# `pendingWorkflowCount` / `pendingBackgroundAgentCount` ride the CLI's own
+# end-of-turn record and are right when non-zero — but they are INCOMPLETE.
+# Measured over the 154 end-of-turn claims of step 5: 23 saw the agent speak
+# again with no human prompt in between, and on every one of those the two
+# counts read 0 while a `<task-notification>` — a background task reporting
+# back, which resumes the session — was what woke it. So the board's
+# "delegated" guard has to be able to see the delegation itself.
+#
+# WHAT A BACKGROUND LAUNCH LOOKS LIKE ON DISK. Not the tool_use `input`:
+# `run_in_background: true` is neither necessary nor sufficient. A foreground
+# Bash that outruns its timeout is MOVED to the background by the harness (16
+# of 485 notified Bash launches on this corpus arrived that way, with no
+# `run_in_background` in the input at all), and 337 `Agent` calls that look
+# identical in the input ran in the foreground and returned their report
+# inline. What is decisive is the tool_RESULT, which the harness writes and
+# which says so in words:
+#
+#   Bash      "Command running in background with ID: b3l1ahei … You will be
+#              notified when it completes."
+#   Bash      "Command did not complete within its 180s timeout and was moved
+#              to the background (ID: bx1dek5dm). … You will be notified…"
+#   Workflow  "Workflow launched in background. Task ID: w8oz82r5k"
+#   Agent     "The agent is working in the background. You will be notified
+#              automatically when it completes."
+#   Monitor   "Monitor started (task b1h0ax9vj, persistent…). You will be
+#              notified on each event."
+#   SendMsg   "…resumed from transcript in the background with your message.
+#              You'll be notified when it finishes."
+#
+# One phrase spans all six and is the actual contract — "you will be notified"
+# is the harness promising to resume this session — so that is what is matched,
+# rather than a list of tool names a future release would silently outgrow.
+# Measured over 49,115 tool_use records in ~/.claude*: 2,069 results carry it
+# (Bash 1,017, Workflow 541, Agent 442, Monitor 36, SendMessage 33), and no
+# foreground result does.
+#
+# WHAT COMES BACK. A `<task-notification>` carrying BOTH `<tool-use-id>` and a
+# terminal `<status>`. The pairing is exact, not heuristic: of 1,163 distinct
+# tool-use-ids seen in notifications, 1,163 resolved to a tool_use in the
+# corpus — 100 %.
+#
+# The `<status>` half is, on today's corpus, a SECOND LOCK ON THE SAME DOOR and
+# is kept deliberately. What it is guarding against is real — a Monitor emits
+# interim `<event>` notifications while it is still streaming, and reading one
+# as "reported back" would drop the guard mid-stream — but those interim
+# entries carry no `<tool-use-id>` either (397 of them, none with an id), so
+# the id alone already excludes them. Measured: of 5,494 notifications carrying
+# a tool-use-id, ZERO lack a terminal status (completed 5,065, failed 291,
+# killed 81, stopped 4). It stays because the day an interim event gains an id
+# is the day this guard fails silently, and the check costs one regex.
+#
+# The notification is written in three different shapes and all three must be
+# read, which is why `_notification_texts` exists rather than a look at
+# `message.content`: as a plain `user` entry (1,303), as a `queue-operation`
+# with the text at top-level `content` (2,626 enqueue + 1,168 remove), and as
+# an `attachment` whose text is at `attachment.prompt` (898).
+_BG_LAUNCHED = re.compile(r"(?:will|'ll) be notified", re.I)
+_NOTIFIED_ID = re.compile(r"<tool-use-id>\s*(toolu_[A-Za-z0-9_-]+)\s*</tool-use-id>")
+_NOTIFIED_DONE = re.compile(r"<status>\s*(?:completed|failed|killed|stopped)\s*</status>")
+
+
+def _entry_ts(e):
+    """An entry's epoch seconds, or None if it is not dated.
+
+    None is not an error and is not treated as one: the launch is simply not
+    counted, so an undated transcript degrades to the behaviour this file had
+    before the outstanding set existed. The alternative — dating it "now" —
+    would hold a session at WORKING off an entry nobody can place in time.
+    """
+    t = e.get("timestamp")
+    if not isinstance(t, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _notification_texts(e):
+    """Every place one entry can be carrying a `<task-notification>`.
+
+    Never an `assistant` entry, and that is a rule before it is an
+    optimisation: a notification is something the harness writes INTO a
+    session, so an agent that merely quotes the tag back in its own prose — 14
+    entries in the corpus do, none of them carrying a tool-use-id — must not be
+    able to talk its own guard away. It happens to be worth 1.5 of the 7.4
+    CPU-ms this whole signal adds to a cold parse of the fleet's 58 in-window
+    transcripts (49.0 -> 54.8, median of 7), because assistant entries are half
+    a tail and carry the long text blocks.
+
+    The remaining +5.9 ms is the search of every tool_result for the receipt,
+    and it is left alone: the stat memo means a sweep pays it only for
+    transcripts that actually moved (~0.1 ms each), and the 60 s cold reconcile
+    pays all of it for 0.01 % of a core.
+    """
+    if e.get("type") == "assistant":
+        return ()
+    out = []
+    c = (e.get("message") or {}).get("content")
+    if isinstance(c, str):
+        out.append(c)
+    elif isinstance(c, list):
+        out += [b.get("text", "") for b in c
+                if isinstance(b, dict) and b.get("type") == "text"]
+    if isinstance(e.get("content"), str):        # queue-operation
+        out.append(e["content"])
+    att = e.get("attachment")                    # attachment / queued_command
+    if isinstance(att, dict) and isinstance(att.get("prompt"), str):
+        out.append(att["prompt"])
+    return out
+
+
+def _result_text(b):
+    c = b.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+    return ""
+
+
 def parse_session_tail(fp):
     """Tail-parse a transcript: last activity, pending tools, last assistant text."""
     entries = []
@@ -389,11 +513,20 @@ def parse_session_tail(fp):
 
     out = {"cwd": None, "branch": None, "model": None, "pending_tools": [],
            "last_assistant": None, "last_user": None, "pending_workflows": 0,
-           "pending_bg_agents": 0, "turn_ended": False}
+           "pending_bg_agents": 0, "turn_ended": False, "bg_launched_at": ()}
     pending = {}  # tool_use id -> tool name
+    bg = {}       # tool_use id -> epoch of a background launch not yet reported
     for e in main:
         out["cwd"] = e.get("cwd") or out["cwd"]
         out["branch"] = e.get("gitBranch") or out["branch"]
+        # BEFORE the `message` gate below: two of the three shapes a
+        # notification arrives in (queue-operation, attachment) have no
+        # `message` at all and would never be read past it.
+        for text in _notification_texts(e):
+            if "<task-notification>" not in text or not _NOTIFIED_DONE.search(text):
+                continue
+            for tid in _NOTIFIED_ID.findall(text):
+                bg.pop(tid, None)
         if e.get("type") == "system" and e.get("subtype") == "turn_duration":
             # POSITIONAL, not "a turn_duration exists somewhere in the tail":
             # every completed turn in history leaves one, so the mere presence
@@ -447,9 +580,27 @@ def parse_session_tail(fp):
                         out["last_assistant"] = _clean(b["text"])
         elif e.get("type") == "user" and isinstance(content, list):
             for b in content:
-                if isinstance(b, dict) and b.get("type") == "tool_result":
-                    pending.pop(b.get("tool_use_id"), None)
+                if not isinstance(b, dict) or b.get("type") != "tool_result":
+                    continue
+                pending.pop(b.get("tool_use_id"), None)
+                # A background launch RESOLVES its tool_use immediately — the
+                # result is the harness's receipt, not the work — so it must be
+                # picked up here and not from `pending`, which is empty again
+                # the moment the task starts. That is precisely why a
+                # backgrounded agent looked idle.
+                text = _result_text(b)
+                if "<tool_use_error>" in text or not _BG_LAUNCHED.search(text):
+                    continue
+                launched = _entry_ts(e)
+                if launched is not None:
+                    bg[b.get("tool_use_id")] = launched
     out["pending_tools"] = sorted(set(pending.values()))
+    # Timestamps, not a count: the bound belongs to whoever holds the clock.
+    # This function is memoised on the transcript's stat (`_facts`) and must
+    # stay a pure function of the bytes — a count that decayed with wall time
+    # would be served frozen for as long as the file sat still. `scan_sessions`
+    # ages them against `now`.
+    out["bg_launched_at"] = tuple(sorted(bg.values()))
     return out
 
 
@@ -573,6 +724,7 @@ def _read_facts(fp):
             "pending_tools": tuple(tail["pending_tools"]),
             "pending_workflows": tail["pending_workflows"],
             "pending_bg_agents": tail["pending_bg_agents"],
+            "bg_launched_at": tail["bg_launched_at"],
             "turn_ended": tail["turn_ended"],
             "last_assistant": tail["last_assistant"],
             "last_user": tail["last_user"] or find_last_user(fp),
@@ -705,6 +857,18 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                     "pending_tools": list(tail["pending_tools"]),
                     "pending_workflows": tail["pending_workflows"],
                     "pending_bg_agents": tail["pending_bg_agents"],
+                    # The bound, applied here because here is where `now` is.
+                    # An outstanding launch is evidence with a shelf life: 3.8 %
+                    # of the 2,000 background launches on this corpus never
+                    # reported back at all (killed, or the server restarted),
+                    # and an unbounded set would hold those sessions at WORKING
+                    # for as long as they stayed in the 48 h window — a live
+                    # agent that never asks for you is the failure this project
+                    # keeps finding. `delegated_s` is the shelf life and
+                    # config.py carries the table it was chosen off.
+                    "pending_bg_tools": sum(
+                        1 for t in tail["bg_launched_at"]
+                        if now - t <= config.CFG["delegated_s"]),
                     "topic": tail["topic"],
                     "last_assistant": tail["last_assistant"],
                     "last_user": tail["last_user"],
@@ -751,7 +915,8 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
             # what classify_session now hangs off, and a local would shadow it.
             sess_status, tool_running = status.classify_session(
                 s["age_s"], alive, s["pending_tools"],
-                s["pending_workflows"] + s["pending_bg_agents"],
+                s["pending_workflows"] + s["pending_bg_agents"]
+                + s["pending_bg_tools"],
                 skip_perms, config.CFG["working_s"], shell_n,
                 turn_ended=s.get("turn_ended", False),
                 # the only clock left in the ladder, and the only one with a

@@ -5,7 +5,7 @@
 ## Context
 
 `ENGINE.md` is the design authority for the observer work. Implementing steps 0–2 and 5 against it
-has now produced **six** places where following it literally would have shipped a defect, each
+has now produced **seven** places where following it literally would have shipped a defect, each
 caught only because the number was measured rather than assumed:
 
 | § | the document says | measured reality |
@@ -18,7 +18,9 @@ caught only because the number was measured rather than assumed:
 | §6.2 | `QUIET_S = 25.0`, "25 s is generous for it" | Measured over **14,006** unexplained mid-turn gaps in the 79 in-window transcripts, 25 misfires on **5.80 %** of them — one genuine thinking pause in 17 mistaken for the end of a turn — and it sits *below* the p95 (27.7 s) of the very population it exists to tolerate. 95 % of those misfires recover inside two minutes, so the rate is not a late correction, it is the ● WORKING → ◆ YOUR TURN → ● WORKING oscillation §6.3 opens by forbidding. Shipped at **45** (2.71 %), between the p95 and the p99 (72.7 s). |
 | §6.3(a) | `settle()`'s final `return proposed, now` also runs when `proposed == prev` | That re-stamps `since` on every sweep that merely *agrees*, so under the hot cadence (`hot_s = 0.15`) the dwell becomes a 0–3 s sawtooth and how long a real de-escalation waits depends on where in the cycle it lands. `since` is now the clock of the last **adoption** and does not move while a status persists — which also means the dwell does not stack on `quiet_s`: the board says ◆ YOUR TURN at 45 s, not 48. Pinned by `test_the_dwell_does_not_stack_on_top_of_the_quiet_timer` and `test_an_unchanged_status_never_restamps_its_clock`. |
 
-A seventh, softer case, on cadence rather than status: §2.5 specifies `idle_s = 1.0`. At the measured 1.68 CPU-s per sweep that
+| §6.2 | `delegated` is "waiting on its own workflows or background agents" — i.e. the CLI's `pendingWorkflowCount` + `pendingBackgroundAgentCount` are the whole of it | Those two counts are right when non-zero and **blind** otherwise. Replaying 904 end-of-turn claims across ~/.claude*, the agent speaks again with no human prompt on 132 (14.6 %); on the residual that no other guard catches, both counts read **0** while a `<task-notification>` — a background task reporting back, which resumes the session — is what wakes it. `delegated` now also counts a tool_use that *launched* background work and has not been notified back, which is invisible to `pending_tools` because such a launch resolves its own tool_use immediately. Misfire 5.09 % → **4.42 %**, no measured cost. Bounded by `delegated_s = 600` because **3.8 %** of the 2,000 launches on this corpus never report at all. |
+
+An eighth, softer case, on cadence rather than status: §2.5 specifies `idle_s = 1.0`. At the measured 1.68 CPU-s per sweep that
 is **164 % of one core, continuously** — not aggressive, unreachable. It became affordable only
 after the sweep got cheap, and even then costs 43 %.
 
