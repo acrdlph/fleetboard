@@ -87,6 +87,59 @@ public actor OrchestraClient {
         return try await send(endpoint, to: target, as: PairResponse.self)
     }
 
+    // MARK: - The mutations
+    //
+    // Four routes that change the world, and one property they all share: **the
+    // server answers 200 for a refusal**, putting the outcome in the body. So
+    // none of these throws on a refusal — a refusal is a value, and its `message`
+    // is the thing the screen shows. They throw only when no answer came back at
+    // all, which is the case the UI must never render as "failed".
+
+    /// Type `text` into an agent's terminal, addressed by `(account, sid)`.
+    ///
+    /// The caller is responsible for holding the in-flight lock; this actor does
+    /// not, because a lock that lives here would be invisible to the view that
+    /// has to grey the button out.
+    public func send(account: String, sid: String, worktree: String,
+                     text: String) async throws -> SendReply {
+        try await send(Endpoint.send(account: account, sid: sid, worktree: worktree,
+                                     text: text),
+                       to: profile, as: SendReply.self)
+    }
+
+    /// Launch a mission. Returns as soon as the server has taken the job.
+    public func dispatch(mission: String, worktree: String?, account: String?,
+                         model: String, effort: String,
+                         forceModel: Bool) async throws -> DispatchStart {
+        try await send(Endpoint.dispatch(mission: mission, worktree: worktree,
+                                         account: account, model: model,
+                                         effort: effort, forceModel: forceModel),
+                       to: profile, as: DispatchStart.self)
+    }
+
+    public func dispatchStatus(job: String) async throws -> DispatchJob {
+        try await send(.dispatchStatus(job: job), to: profile, as: DispatchJob.self)
+    }
+
+    public func finish(worktree: String) async throws -> FinishReply {
+        try await send(Endpoint.finish(worktree: worktree), to: profile,
+                       as: FinishReply.self)
+    }
+
+    public func armResume(worktree: String, sid: String, account: String,
+                          delayS: Double?, resetsAt: Double?,
+                          dueAt: Double?) async throws -> ResumeReply {
+        try await send(Endpoint.resumeSchedule(worktree: worktree, sid: sid,
+                                               account: account, delayS: delayS,
+                                               resetsAt: resetsAt, dueAt: dueAt),
+                       to: profile, as: ResumeReply.self)
+    }
+
+    public func cancelResume(worktree: String, sid: String) async throws -> ResumeReply {
+        try await send(Endpoint.resumeCancel(worktree: worktree, sid: sid),
+                       to: profile, as: ResumeReply.self)
+    }
+
     // MARK: - The one place a request is made
 
     private func send<T: Decodable & Sendable>(_ endpoint: Endpoint,

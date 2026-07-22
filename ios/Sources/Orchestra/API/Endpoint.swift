@@ -83,6 +83,117 @@ public struct Endpoint: Sendable {
                         timeout: probeDeadline, requiresToken: false)
     }
 
+    // MARK: - The mutations
+    //
+    // Every one of them is a POST with a JSON body, and the body is not
+    // decoration: a mutation without `Content-Type: application/json` is refused
+    // **415 `content_type_required`** before it reaches a handler. That is the
+    // CSRF guard, verified by sending one without.
+    //
+    // None of them carries an idempotency key, because the server has nowhere to
+    // put one — see `Actuation`. A header this server ignores would look like a
+    // guarantee and be none.
+
+    /// `POST /api/send` — type into an agent's terminal.
+    ///
+    /// **Addressed by `sid` + `account`, and the pid is not sent at all.** Not
+    /// merely "not required": `identity.resolve` treats a pid as a hint and
+    /// cross-checks it against the session it names, so sending one can only ever
+    /// turn a working request into `identity_gone`. `worktree` rides along as a
+    /// second assertion the server checks for free.
+    ///
+    /// The deadline is 25 s because the osascript path has a 10 s subprocess
+    /// timeout inside a `claude_processes()` scan that can itself take seconds.
+    public static func send(account: String, sid: String, worktree: String,
+                            text: String) throws -> Endpoint {
+        let payload: [String: String] = ["account": account, "sid": sid,
+                                         "worktree": worktree, "text": text]
+        return Endpoint(method: .post, path: "/api/send",
+                        body: try JSONSerialization.data(withJSONObject: payload),
+                        timeout: 25, requiresToken: true)
+    }
+
+    /// `POST /api/dispatch` — launch a mission. **Spends real money.**
+    ///
+    /// `model` and `effort` are both required and the server says so rather than
+    /// guessing (*"pick a model and an effort first — routing is deterministic,
+    /// nothing is chosen for you"*). `worktree` and `account` are optional and
+    /// `nil` means "you pick" — the server's `_pick_defaults` is the only picker,
+    /// and the client does not mirror it.
+    ///
+    /// Returns fast — the work runs on a background thread — so the deadline is
+    /// short. It is the POLL that waits.
+    public static func dispatch(mission: String, worktree: String?, account: String?,
+                                model: String, effort: String,
+                                forceModel: Bool) throws -> Endpoint {
+        var payload: [String: Any] = ["mission": mission, "model": model,
+                                      "effort": effort, "force_model": forceModel]
+        if let worktree { payload["worktree"] = worktree }
+        if let account { payload["account"] = account }
+        return Endpoint(method: .post, path: "/api/dispatch",
+                        body: try JSONSerialization.data(withJSONObject: payload),
+                        timeout: 20, requiresToken: true)
+    }
+
+    /// `GET /api/dispatch/status?job=…`. A read, and safe to repeat.
+    ///
+    /// The server matches the job id with `re.search(r"job=([\w-]+)")`, so an
+    /// empty id silently becomes `{"ok": false, "error": "no job"}` rather than a
+    /// 400 — driven live.
+    public static func dispatchStatus(job: String) -> Endpoint {
+        Endpoint(method: .get, path: "/api/dispatch/status",
+                 query: [URLQueryItem(name: "job", value: job)],
+                 timeout: 10, requiresToken: true)
+    }
+
+    /// `POST /api/finish` — the closeout.
+    ///
+    /// **120 s**, and that is measured off the server's own worst case rather
+    /// than chosen: `start_finish` runs `git fetch origin` (30 s timeout), a
+    /// merge-base, a `git status`, a full `claude_processes()` scan and an
+    /// osascript send (10 s), all synchronously inside the request.
+    public static func finish(worktree: String) throws -> Endpoint {
+        let payload: [String: String] = ["worktree": worktree]
+        return Endpoint(method: .post, path: "/api/finish",
+                        body: try JSONSerialization.data(withJSONObject: payload),
+                        timeout: 120, requiresToken: true)
+    }
+
+    /// `POST /api/resume/schedule` — arm or re-arm an auto-resume.
+    ///
+    /// Keyed `"{worktree}|{sid}"` server-side, so this is the one mutation in the
+    /// app that is genuinely idempotent: arming twice replaces.
+    ///
+    /// Exactly one of `dueAt` (an absolute epoch the user picked) and
+    /// `resetsAt` + `delayS` should be meaningful. Sending `resetsAt: nil` with
+    /// no `dueAt` gets `{"ok": false, "need_time": true}`, which is a request for
+    /// a time, not a failure.
+    public static func resumeSchedule(worktree: String, sid: String, account: String,
+                                      delayS: Double?, resetsAt: Double?,
+                                      dueAt: Double?) throws -> Endpoint {
+        var payload: [String: Any] = ["worktree": worktree, "sid": sid,
+                                      "account": account]
+        if let delayS { payload["delay_s"] = delayS }
+        if let resetsAt { payload["resets_at"] = resetsAt }
+        if let dueAt { payload["due_at"] = dueAt }
+        return Endpoint(method: .post, path: "/api/resume/schedule",
+                        body: try JSONSerialization.data(withJSONObject: payload),
+                        timeout: 15, requiresToken: true)
+    }
+
+    /// `POST /api/resume/cancel`. Idempotent: a second cancel answers
+    /// `{"ok": false, "message": "nothing armed for this session"}`, which is a
+    /// statement about the world and not an error.
+    ///
+    /// **Cancel is not an abort.** If `fire_resume` is already executing, the pop
+    /// removes the key and the side effect still happens. The sheet says so.
+    public static func resumeCancel(worktree: String, sid: String) throws -> Endpoint {
+        let payload: [String: String] = ["worktree": worktree, "sid": sid]
+        return Endpoint(method: .post, path: "/api/resume/cancel",
+                        body: try JSONSerialization.data(withJSONObject: payload),
+                        timeout: 15, requiresToken: true)
+    }
+
     func urlRequest(base: URL, token: String?) throws -> URLRequest {
         guard var comps = URLComponents(url: base.appendingPathComponent(path),
                                         resolvingAgainstBaseURL: false) else {

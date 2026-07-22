@@ -11,9 +11,19 @@ import SwiftUI
 /// than a cosmetic one.
 public struct FleetView: View {
     @Bindable private var store: FleetStore
+    @Bindable private var actions: ActionsStore
+    @Bindable private var limits: LimitsStore
     private let client: OrchestraClient
     private let serverLabel: String
     private let onUnpair: () -> Void
+    /// Open the mission composer on appear. Same seam as `initialRoute`, and it
+    /// exists for the same reason: a simulator cannot be tapped from a script.
+    private let openComposer: Bool
+    /// A sheet for the initially-pushed worktree, and text to send from the
+    /// initially-pushed chat. Both nil in every shipping path.
+    private let initialSheet: WorktreeSheet?
+    private let initialSend: String?
+    @State private var composing = false
 
     /// Ticks the ages. Mutating a `Date` that only feeds `Text` is cheap; what
     /// would not be cheap is anything that changes a row's SIZE on this tick,
@@ -29,13 +39,20 @@ public struct FleetView: View {
 
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    public init(store: FleetStore, client: OrchestraClient, serverLabel: String,
-                initialRoute: FleetRoute? = nil,
+    public init(store: FleetStore, actions: ActionsStore, limits: LimitsStore,
+                client: OrchestraClient, serverLabel: String,
+                initialRoute: FleetRoute? = nil, openComposer: Bool = false,
+                initialSheet: WorktreeSheet? = nil, initialSend: String? = nil,
                 onUnpair: @escaping () -> Void) {
         self.store = store
+        self.actions = actions
+        self.limits = limits
         self.client = client
         self.serverLabel = serverLabel
         self.initialRoute = initialRoute
+        self.openComposer = openComposer
+        self.initialSheet = initialSheet
+        self.initialSend = initialSend
         self.onUnpair = onUnpair
     }
 
@@ -52,6 +69,14 @@ public struct FleetView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
+                    // The one control on the board that spends money, and it is
+                    // one tap from a confirmation, never from a launch.
+                    Button { composing = true } label: {
+                        Image(systemName: "plus.circle")
+                    }
+                    .accessibilityLabel("new mission")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button("Refresh") { Task { await store.refresh() } }
                         Button("Unpair this device", role: .destructive, action: onUnpair)
@@ -64,11 +89,15 @@ public struct FleetView: View {
             .navigationDestination(for: FleetRoute.self) { route in
                 switch route {
                 case .worktree(let name):
-                    WorktreeDetailView(name: name, store: store, client: client)
+                    WorktreeDetailView(name: name, store: store, actions: actions,
+                                       client: client, initialSheet: initialSheet)
                 case .chat(let worktree, let account, let sid):
                     ChatView(worktree: worktree, account: account, sid: sid,
-                             store: store, client: client)
+                             store: store, client: client, autoSend: initialSend)
                 }
+            }
+            .sheet(isPresented: $composing) {
+                MissionComposer(fleet: store, limits: limits, actions: actions)
             }
         }
         // One environment write, and every status pill on every screen below
@@ -78,6 +107,7 @@ public struct FleetView: View {
         .onReceive(ticker) { now = $0 }
         .task {
             if let initialRoute, path.isEmpty { path = [initialRoute] }
+            if openComposer { composing = true }
         }
     }
 

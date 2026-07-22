@@ -34,6 +34,14 @@ enum DebugRoute: Equatable {
     /// A `cclimits` slug — the key `/api/limits` uses, which is NOT always
     /// orchestra's own account label.
     case account(String)
+    /// The mission composer, opened on launch. Phase 3's most dangerous screen,
+    /// and a sheet — which `xcrun simctl` has no other way to reach.
+    case mission
+    /// A worktree with its finish sheet already presented. Same destination and
+    /// same sheet a tap presents; the only difference is what pressed it.
+    case finish(String)
+    /// A worktree with the auto-resume sheet presented for one session.
+    case resume(worktree: String, sid: String)
 
     static func fromEnvironment(
         _ environment: [String: String] = ProcessInfo.processInfo.environment
@@ -50,6 +58,15 @@ enum DebugRoute: Equatable {
             guard parts.count == 2, !parts[1].isEmpty else { return .limits }
             return .account(parts[1])
         case "server": return .server
+        case "mission": return .mission
+        case "finish":
+            guard parts.count == 2, !parts[1].isEmpty else { return nil }
+            return .finish(parts[1])
+        case "resume":
+            guard parts.count == 2 else { return nil }
+            let fields = parts[1].split(separator: "/", maxSplits: 1).map(String.init)
+            guard fields.count == 2 else { return nil }
+            return .resume(worktree: fields[0], sid: fields[1])
         case "wt", "worktree":
             guard parts.count == 2, !parts[1].isEmpty else { return nil }
             return .worktree(parts[1])
@@ -69,7 +86,7 @@ enum DebugRoute: Equatable {
     /// Which tab the route lives on.
     var tab: Int {
         switch self {
-        case .fleet, .worktree, .chat: 0
+        case .fleet, .worktree, .chat, .mission, .finish, .resume: 0
         case .limits, .account: 1
         case .server: 2
         }
@@ -81,12 +98,23 @@ enum DebugRoute: Equatable {
         return nil
     }
 
+    /// Which sheet the pushed worktree screen should present on appear.
+    var worktreeSheet: WorktreeSheet? {
+        switch self {
+        case .finish: .finish
+        case .resume(_, let sid): .resume(sid: sid)
+        default: nil
+        }
+    }
+
     /// What the Fleet tab should push, if anything.
     var fleetRoute: FleetRoute? {
         switch self {
         case .worktree(let name): .worktree(name)
         case .chat(let w, let a, let s): .chat(worktree: w, account: a, sid: s)
-        case .fleet, .limits, .server, .account: nil
+        case .finish(let name): .worktree(name)
+        case .resume(let w, _): .worktree(w)
+        case .fleet, .limits, .server, .account, .mission: nil
         }
     }
 }

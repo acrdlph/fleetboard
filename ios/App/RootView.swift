@@ -23,6 +23,38 @@ struct RootView: View {
         #endif
     }
 
+    /// `ORC_SCREEN=mission` opens the composer on launch — the only way a script
+    /// on a simulator can reach a sheet, and therefore the only way phase 3's
+    /// most dangerous screen can be looked at without a finger.
+    private var initialComposer: Bool {
+        #if DEBUG
+        return DebugRoute.fromEnvironment() == .mission
+        #else
+        return false
+        #endif
+    }
+
+    private var initialWorktreeSheet: WorktreeSheet? {
+        #if DEBUG
+        return DebugRoute.fromEnvironment()?.worktreeSheet
+        #else
+        return nil
+        #endif
+    }
+
+    /// `ORC_SEND=<text>` types one message at the session `ORC_SCREEN=chat:…`
+    /// names, through the same `ChatStore.send` the arrow button calls. It exists
+    /// because the gate for this phase is *something actually arrived at a real
+    /// agent*, and a simulator cannot be typed into from a script.
+    private var initialSend: String? {
+        #if DEBUG
+        let text = ProcessInfo.processInfo.environment["ORC_SEND"]
+        return (text?.isEmpty ?? true) ? nil : text
+        #else
+        return nil
+        #endif
+    }
+
     var body: some View {
         Group {
             if model.pairing.isPaired {
@@ -64,9 +96,14 @@ struct RootView: View {
         TabView(selection: $tab) {
             Tab("Fleet", systemImage: "square.grid.2x2", value: 0) {
                 FleetView(store: model.fleet,
+                          actions: model.actions,
+                          limits: model.limits,
                           client: model.client,
                           serverLabel: model.pairing.profile?.display ?? "—",
-                          initialRoute: initialFleetRoute) {
+                          initialRoute: initialFleetRoute,
+                          openComposer: initialComposer,
+                          initialSheet: initialWorktreeSheet,
+                          initialSend: initialSend) {
                     Task { await model.unpair() }
                 }
                 .connectionBar(model.fleet)
@@ -110,6 +147,10 @@ extension View {
 private struct ConnectionBarModifier: ViewModifier {
     @Bindable var store: FleetStore
     @State private var now = Date()
+    /// Measured, not assumed — see `EnvironmentValues.bottomAccessoryHeight`.
+    /// The bar grows a second line on a stale board, so a constant here would be
+    /// wrong exactly when the board is worth reading.
+    @State private var barHeight: CGFloat = 0
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     func body(content: Content) -> some View {
@@ -120,7 +161,11 @@ private struct ConnectionBarModifier: ViewModifier {
                               version: store.version) {
                     Task { await store.refresh() }
                 }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                    barHeight = $0
+                }
             }
+            .environment(\.bottomAccessoryHeight, barHeight)
             .onReceive(ticker) { now = $0 }
     }
 }

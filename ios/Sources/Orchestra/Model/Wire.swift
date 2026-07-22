@@ -119,20 +119,41 @@ public struct Worktree: Sendable, Equatable, Decodable, Identifiable {
     public let sessions: [Session]
     public let liveProcs: [LiveProc]
     public let availability: Availability
+    /// **The two-step finish, as the server publishes it** — the epoch at which a
+    /// closeout brief was typed at this card's live agent, and absent otherwise.
+    ///
+    /// `observer.py:228` copies it out of `finish._closeouts` onto the card, and
+    /// only while the card still has a live proc. Its presence is what turns the
+    /// button from `✓ finish` into `✕ close`, and it is the client's only view of
+    /// a state machine that lives entirely server-side.
+    ///
+    /// `ios/README.md` finding 3 said this field did not exist. It was checking
+    /// for the string `closeoutSentAt` from IOS-APP.md §3.3; the wire name is
+    /// `closeout_sent` and it has been there all along. The correction is in the
+    /// findings table.
+    ///
+    /// **It is in-memory only.** A server restart drops `_closeouts` and the card
+    /// silently reverts to `✓ finish` — pressing which re-types the whole brief at
+    /// an agent that may be mid-closeout. `FinishSheet` carries a local memory of
+    /// briefs sent in the last 30 minutes precisely to notice that.
+    public let closeoutSent: Double?
 
     public init(name: String, path: String, git: GitInfo, sessions: [Session],
-                liveProcs: [LiveProc], availability: Availability) {
+                liveProcs: [LiveProc], availability: Availability,
+                closeoutSent: Double? = nil) {
         self.name = name
         self.path = path
         self.git = git
         self.sessions = sessions
         self.liveProcs = liveProcs
         self.availability = availability
+        self.closeoutSent = closeoutSent
     }
 
     enum CodingKeys: String, CodingKey {
         case name, path, git, sessions, availability
         case liveProcs = "live_procs"
+        case closeoutSent = "closeout_sent"
     }
 
     /// Terminals in this worktree that no session claimed a pid for.
@@ -142,6 +163,21 @@ public struct Worktree: Sendable, Equatable, Decodable, Identifiable {
     }
 
     public var endedCount: Int { sessions.filter { $0.status == .ended }.count }
+
+    /// Step two of finish is armed: a brief is with this card's live agent and
+    /// the button is `✕ close`, not `✓ finish`.
+    public var isCloseoutPending: Bool { closeoutSent != nil }
+
+    public var closeoutSentAt: Date? { closeoutSent.map { Date(timeIntervalSince1970: $0) } }
+
+    /// Sessions with a live, scriptable terminal — the only ones `/api/send` can
+    /// reach. `reachable` is the server's own gate (`tmux_target`, or a
+    /// Terminal/iTerm2 tty); a Cursor or VS Code terminal cannot be scripted and
+    /// an ended session has no terminal at all.
+    public func isReachable(_ session: Session) -> Bool {
+        guard let pid = session.pid else { return false }
+        return liveProcs.contains { $0.pid == pid && $0.reachable }
+    }
 }
 
 public struct GitInfo: Sendable, Equatable, Decodable {

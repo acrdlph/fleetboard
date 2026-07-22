@@ -34,13 +34,18 @@ final class AppModel {
     let pairing: PairingStore
     let fleet: FleetStore
     let limits: LimitsStore
+    /// Everything the app can make the fleet DO. App-level and not per-screen,
+    /// because a dispatch outlives the sheet that started it — see `ActionsStore`.
+    let actions: ActionsStore
 
     init() {
         let client = OrchestraClient()
         self.client = client
         self.pairing = PairingStore(client: client)
-        self.fleet = FleetStore(client: client)
+        let fleet = FleetStore(client: client)
+        self.fleet = fleet
         self.limits = LimitsStore(client: client)
+        self.actions = ActionsStore(client: client, fleet: fleet)
     }
 
     func start() async {

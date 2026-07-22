@@ -1,4 +1,4 @@
-# orchestra for iOS — phases 1–2
+# orchestra for iOS — phases 1–3
 
 A native SwiftUI client for the orchestra board.
 
@@ -10,9 +10,15 @@ A native SwiftUI client for the orchestra board.
   drops the stream on background and resyncs on foreground, and the read-only
   screens the IA calls for — worktree detail, session chat, limits, account
   detail, server.
+* **Phase 3** made it **act**: reply to an agent (`/api/send`), launch a mission
+  (`/api/dispatch`), the two-step closeout (`/api/finish`), and arm / disarm /
+  manually fire an auto-resume (`/api/resume/*`). Every refusal is the server's
+  own sentence, verbatim. Proven end to end on 2026-07-22: a message typed in the
+  simulator reached a real agent on the Mac, the agent replied, and the app's
+  transcript carried `✓✓ sent from this phone` on that exact turn.
 
-Actuation and push are later phases. Nothing here is load-bearing on push: it
-lands as a registration call and a delegate.
+Push is a later phase. Nothing here is load-bearing on it: it lands as a
+registration call and a delegate.
 
 ## Build and run it — the only way this is verified
 
@@ -49,7 +55,22 @@ SIMCTL_CHILD_ORC_SCREEN=chat:ConfidAI2/account2/<sid>  xcrun simctl launch boote
 
 # 6. drive it: cause a real change and watch the board move
 touch ~/.claude-account2/projects/*/<sid>.jsonl     # → delta on the wire in ~1 s
+
+# 7. phase 3 — every sheet, and a real send, without a finger
+SIMCTL_CHILD_ORC_SCREEN=mission                     xcrun simctl launch booted sh.orchestra.app
+SIMCTL_CHILD_ORC_SCREEN=finish:ConfidAi7            xcrun simctl launch booted sh.orchestra.app
+SIMCTL_CHILD_ORC_SCREEN=resume:ConfidAi7/<sid>      xcrun simctl launch booted sh.orchestra.app
+SIMCTL_CHILD_ORC_SCREEN=chat:ConfidAi7/account4/<sid> \
+SIMCTL_CHILD_ORC_SEND='reply with exactly the words: the phone reached you' \
+     xcrun simctl launch booted sh.orchestra.app
 ```
+
+`ORC_SEND` is the third `#if DEBUG` seam and the sharpest one: it takes text
+through exactly `ChatStore.send` — the same call the arrow button makes — because
+the gate for phase 3 is *something actually arrived at a real agent* and a
+simulator cannot be typed into from a script. It is a way to press the button,
+not a second way to send. `ORC_SCREEN=finish:` and `resume:` are the same idea
+for sheets, which `xcrun simctl` has no other way to reach at all.
 
 `ORC_SCREEN` is the second `#if DEBUG` seam and it exists for the same reason as
 the first: **a phase ends with the app run and LOOKED at**, and `xcrun simctl`
@@ -156,6 +177,132 @@ Captured from a live `GET /api/events` on 2026-07-22 and decoded frame by frame.
 | 22 | `/api/chat` decodes its query string | `server.do_GET` pulls the account out of the RAW path with `re.search(r"account=([^&]+)")` and never percent-decodes it, so a label containing a space or a `+` could never match `config.account_label`. Latent on this fleet — no label needs escaping — and it is why the client shows the server's refusal verbatim |
 | 23 | UX.md §3.2 — `showing 4 of 6` comes from a server `session_count` | there is no such field, so a card truncated at `max_sessions` is indistinguishable from a complete one. The screen says nothing rather than a number it would have to guess |
 | 24 | UX.md §3.4 — Activity is a tab | `GET /api/dispatchlog` returns `{"entries": []}` and the intent frames its rows are built from do not exist. The tab is not shipped; the two things it could say today live on the worktree and server screens |
+
+### The mutations, added in phase 3 — where the documents are furthest from the wire
+
+Driven with curl against `100.113.110.31:4269` on 2026-07-22: every refusal below
+is a body a real server produced. `UX.md` §7 and `API.md` describe a mutation
+contract this server does not have, and the gaps are not cosmetic — two of them
+change what the app is allowed to do at all.
+
+| # | claim | what the server does |
+|---|---|---|
+| 25 | UX.md §7.1 principle 2 — `Idempotency-Key` is *"a precondition for shipping dispatch and finish"*, and both must be **disabled** when the server lacks it | **there is no idempotency anywhere.** `server.do_POST` reads a JSON body, pulls named fields out, calls the module. No header is inspected, no `client_op_id` is stored, `GET /api/intents/{key}` is a 404, and `dispatch._jobs` is an in-memory dict of the last 20 jobs erased by a restart. Two identical `POST /api/dispatch` bodies launch **two** agents — the tmux name embeds `%H%M%S`, so any retry ≥1 s later gets a fresh name. See "the idempotency decision" below |
+| 26 | a refusal is an HTTP status | **every mutation answers 200** and puts the outcome in the body as `{"ok": false, "message": …}`. `do_POST` writes `send_response(200)` unconditionally after the module returns. The ONE non-200 is **415 `content_type_required`** for a POST without `Content-Type: application/json`, which is the CSRF guard. A client that branches on the status line sees success for every refusal in the app |
+| 27 | UX.md §3.3.2 — `/api/send` takes `expect_sid` and `idempotency_key`, routes through `deliver_text()` + `_proven_in_transcript()`, and returns **202** followed by `{"intent_id", "phase": "typed"/"delivered"/"failed"}` frames on `/api/events` | none of it exists. `/api/send` takes `{account, sid, worktree, text}` (plus an optional `pid` *hint*), types synchronously, and returns `{"ok", "message"}`. `expect_sid` is not read — though its intent IS enforced, inside `identity.resolve`, which re-resolves the address at the instant it types. `_proven_in_transcript` lives in `resume.py` and is called only by the resume daemon. So **`✓✓ delivered` is not available on this wire**, and the app tops out at `✓ typed` |
+| 28 | **`ok: true` from `/api/send` means the message was submitted** | **on the Terminal/iTerm2 path it does not.** See "the send that types but does not submit" below — this is the sharpest thing phase 3 found |
+| 29 | `ok: false` from `/api/send` means nothing was typed | on the **tmux** path it does not: `ok = rc1 == 0 and rc2 == 0` over two calls, `send-keys -l <text>` then `send-keys Enter`. The second failing leaves the message **in the composer, unsent**, and a retry would duplicate it. `Actuation.outcome(ofSend:)` classifies that as `ambiguous`, never as a clean refusal, and the UI refuses to offer a retry from it |
+| 30 | `POST /api/dispatch` has one response shape | it has **two, with no shared field**: `{"job": "job-214849-1"}` on the accepted branch — no `ok` at all — or `{"ok": false, …}` refused. `DispatchStart` is a two-case enum for that reason |
+| 31 | UX.md §4.3 — progress is `event: intent` frames off the stream | it is `GET /api/dispatch/status?job=…`, polled. The `①②③④⑤` lines are real and are rendered verbatim. An id the server has forgotten answers `{"ok": false, "error": "unknown job"}`, and it forgets on every restart |
+| 32 | `effort_confirmed` is a boolean | **tri-state.** `_run_dispatch` leaves it `None` when no effort was asked for, `False` when `/effort` did not echo `set effort level` into the pane. A `?? false` renders "UNCONFIRMED ⚠" for a case where nothing was attempted |
+| 33 | UX.md §4.3 / §7.2 — **Kill** (`POST /api/kill {session}`) is the way to stop an agent dispatched by accident | **`/api/kill` does not exist.** Neither does `/api/pasteboard`. `do_POST`'s whole chain is `reserve · resume/schedule · resume/cancel · send · finish · dispatch` plus the `/api/v1` pairing and device routes. So the app has no undo for a launch, and does not pretend to |
+| 34 | ios/README finding 3 — *"`closeoutSentAt` … neither string appears anywhere in the server"* | **wrong, and it was the field phase 3 needed most.** The wire name is `closeout_sent`, written onto the card by `observer.py:228` from `finish._closeouts`, and present only while the card still has a live proc. Its presence IS the two-step state machine: present → `✕ close`, absent → `✓ finish`. Phase 2 checked for the camelCase name from IOS-APP.md and concluded the concept was missing. (`card_rev` genuinely does not exist) |
+| 35 | UX.md §4.4 — Finish returns an `intent_id` immediately and phases stream (`fetching → checking → typing → brief_sent`) | it is **one synchronous call** that can exceed 60 s: `git fetch origin` (30 s timeout) + merge-base + `git status` + a full `claude_processes()` scan + osascript (10 s), all inside the request. There is no job id. The app gives it 120 s and shows an honest indeterminate elapsed counter, because a staged label on a call with no phases is a timed fiction |
+| 36 | UX.md §4.4's outcome table lists six modes | `start_finish` returns **eight**: the six plus `nudge` (a stalled closeout gets the specifics typed at it) and `chat` (the agent is stuck on a question, so a typed nudge would collide with its open dialog and the user must be routed to chat instead). `mode` is also **absent entirely** on the early refusals — unknown worktree, no trunk ref, demo, and "a live process exists but its terminal can't be scripted" |
+| 37 | UX.md §4.4 — `pending` carries an elapsed string | it carries `sent`, an **absolute epoch**, deliberately: an elapsed string computed on the Mac and read on a phone minutes later is dead on arrival. It also carries `left` (a short reason) and `files` (≤5 raw porcelain lines) |
+| 38 | `finish._closeouts` survives | in-memory only. A restart drops it, the card stops reporting `closeout_sent`, and the button silently reverts to `✓ finish` — pressing which re-types the whole ~600-character brief at an agent that may be mid-closeout. `ActionsStore` remembers briefs **this phone** sent for 30 minutes and warns when the board stops reporting one while an agent is still live. It cannot see a brief sent from the desktop |
+| 39 | resume arming needs an idempotency key | it is idempotent **by construction**: `_resumes` is a dict keyed `"{worktree}\|{sid}"`, so arming twice replaces. Driven twice; one schedule. This is the only mutation in the app with no disable-on-tap, and the only one where a retry is safe |
+| 40 | `need_time` is an error | it is a **request for a time** — `{"ok": false, "need_time": true}` means no reset timestamp is known for this limit. The sheet expands its exact-time picker rather than showing a failure |
+| 41 | a schedule on `/api/state` matches `ResumeSchedule` as modelled in phase 2 | it also carries `resets_at` and `created_at`, which nothing models yet. Harmless — but note that **schedules ride `/api/state` only**: `resume.py` is not watched by the observer, so arming moves no version and no frame can ever carry it. The app force-refreshes `/api/state` after every arm/disarm, or the sheet says "armed" and the board does not agree for up to 20 s |
+| 42 | `GET /api/dispatch/status` validates its query | it matches with `re.search(r"job=([\w-]+)")`, so an empty id silently becomes `{"ok": false, "error": "no job"}` rather than a 400 |
+| 43 | `_run_dispatch` cannot strand a job | it has **no `try`/`except`**, so a raise inside it leaves the job at `done: false, result: null` forever. The client's 90 s deadline is the only thing that ends that wait, and it ends it as "did it launch?", never as "failed" |
+
+### The send that types but does not submit — the sharpest defect phase 3 found
+
+`POST /api/send` to a Terminal.app-hosted agent answered:
+
+```json
+{"ok": true, "message": "typed into Terminal (ttys008)"}
+```
+
+The transcript never grew. Reading the Terminal tab back with AppleScript showed
+why:
+
+```
+──────────────────────────────────────────────────────────── ultracode ─
+❯ (orchestra connectivity probe — please ignore, no action needed)
+────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+```
+
+**The text was in the composer, unsubmitted.** `_SEND_TERMINAL` uses
+`do script "<text>" in t`, which writes the text plus a newline in one burst —
+and Claude Code's paste heuristic swallows that newline, exactly the
+`[Pasted text #N]` failure that `dispatch.deliver_text` was written to defeat on
+the tmux path. The osascript path does not use `deliver_text`. Falsified in both
+directions: a subsequent bare `do script "" in t` — a Return with no text —
+submitted it immediately.
+
+So on the Terminal path, `ok: true` means *"AppleScript found the tab and wrote
+to it"*, not *"the agent received your message"*. Reported, not fixed: it is a
+server change (`terminal.send_to_process` needs a second `do script ""`, or the
+osascript path needs its own proof-of-submission the way `deliver_text` has one),
+and this directory does not touch the Python package.
+
+**It also validates the client's receipt design rather than breaking it.** The app
+never claims delivery it cannot see: `✓ typed` is the server's `ok`, and the
+second tick is only ever earned by finding the message in the next `/api/chat`
+poll. That look is **positive-only** — every one of the five known mismatch paths
+(`UX.md` §3.3.2) is a false negative, so a message that is not found is never
+reported as missing. On the Terminal probe the app would correctly have stopped
+at `✓ typed`.
+
+### The idempotency decision, stated rather than buried
+
+`UX.md` §7.1 principle 2 says dispatch and finish must be **disabled** when the
+server has no idempotency key. This server has none, and shipping a phase 3 that
+cannot act is not a useful reading of that rule. So this build ships them with the
+guard a client can actually enforce, and `Rules/Actuation.swift` names both holes
+it cannot close:
+
+| risk | covered? |
+|---|---|
+| the user taps Launch twice | **yes** — `InFlight` refuses the second, and the action button never re-enables (§7.4) |
+| the app auto-retries a POST | **yes** — nothing in this app retries a mutation, ever. `Actuation.mayOfferRetry` returns true for exactly one outcome: a clean server refusal, which proves nothing happened |
+| a timeout rendered as failure, and the user re-taps | **yes** — a timeout is `.indeterminate` and reads *"no answer in 90 seconds. A mission may already be running… a retry can start a SECOND agent in the same worktree."* A test asserts no indeterminate copy in the app contains the word "fail" |
+| **URLSession retransmits under us** | **no.** Not app-configurable |
+| **a second phone, or the desktop board** | **no.** A client-side lock is defeated by two clients — the exact case §7.1 principle 3 warns about |
+
+The two open rows are the server's to close. **No `Idempotency-Key` header is
+sent**, deliberately: a header this server ignores would look like a guarantee and
+be none.
+
+### Phase 3: the defect a screenshot found
+
+**The composer sat underneath the connection bar.** Exactly the shape phase 2 hit
+with the chat screen's read-only notice — a bottom-pinned control inside a
+*pushed* navigation destination does not receive the `safeAreaInset` the tab
+applied outside the `NavigationStack`, so it lays itself out against the screen.
+Phase 2 dodged it by moving the notice to the top, which works for a caption and
+is impossible for a text field. Everything compiled, the transcript rendered
+perfectly, and the send button and its "newlines become spaces" footnote were
+half-hidden behind `live v78`.
+
+Fixed by **measuring** rather than assuming: `ConnectionBarModifier` reads the
+bar's real height with `onGeometryChange` and publishes it as
+`EnvironmentValues.bottomAccessoryHeight`; the composer and the worktree screen's
+finish footer pad by it. A constant would have been wrong the first time the bar
+grew its second line — which it does on every stale board.
+
+### What phase 3 did NOT verify against a live server
+
+Stated rather than implied, because an untested path that looks tested is the
+failure this project keeps finding:
+
+- **A real dispatch was never launched.** The refusal paths were driven for real
+  (missing model/effort; `needs_decision` with its `can_opus` block), and the
+  whole job → poll → terminal-result path was driven end to end using a worktree
+  name that does not exist, so `_run_dispatch` ran and failed inside the thread at
+  no cost. The success branch is modelled from `_run_dispatch`'s own `finish({…})`
+  literal and is decode-tested, not launched.
+- **`/api/finish` was driven only to its refusals.** A real closeout types a
+  600-character brief at a live agent and can merge and push; step two's UI
+  (`✕ close`, the self-clearing `pending` row) is built against `closeout_sent`
+  and the `pending`/`chat`/`nudge` bodies, and has not been seen with a brief
+  actually outstanding.
+- **Arm / disarm was driven by curl, not by a tap.** The sheet renders and its
+  fire semantics are stated; the round trip (`armed for 22:49` → visible in
+  `/api/state.resumes` → `auto-resume disarmed`) was proven at the HTTP layer.
 
 ### ATS, measured rather than assumed
 
@@ -275,12 +422,21 @@ in the UI is now `Text(verbatim:)`.
 
 ## Open, and deliberately not done in this phase
 
-- **Actuation.** Read-only throughout: no `/api/send`, no dispatch, no finish, no
-  resume arming. The chat screen has no composer at all rather than a disabled
-  one — a greyed-out field says "you can nearly reply", and reply is the one path
-  where a wrong target means an unattended instruction typed at the wrong agent
-  under `--dangerously-skip-permissions`.
-- **The Activity tab.** See wire finding 24: no data source exists.
+- **The Activity tab.** See wire finding 24: no data source exists. Phase 3 makes
+  this more visible rather than less — a dispatch is now startable from the phone
+  and its history lives only in `ActionsStore` for as long as the app is alive.
+  `GET /api/dispatchlog` returns `{"entries": []}` on this fleet.
+- **Kill.** There is no endpoint (finding 33), so there is no way to stop a
+  mission from the phone. The launch confirmation says so rather than promising an
+  undo that does not exist.
+- **`force_model` was never exercised against a real reserve.** The sheet exists
+  and is wired; the only `needs_decision` reachable without spending was a
+  nonexistent account, whose `can_opus` was false.
+- **Draft persistence.** `UX.md` §3.5 wants the mission draft in the App Group on
+  a 500 ms debounce, surviving app kill. It lives in `@State` today, so a
+  dismissed composer loses its text.
+- **Share extension, `orchestra://mission?text=`, Live Activities.** All of §3.5
+  and §8.3's surfaces are additive and none is load-bearing.
 - **The branch map** (`UX.md` §5) and `/api/topology`.
 - **Clock skew.** Every relative label is `device now` minus a server instant, and
   nothing corrects for skew. `IOS-APP.md` §5.4 samples it from

@@ -14,3 +14,16 @@ public enum FleetRoute: Hashable, Sendable {
     /// later.
     case chat(worktree: String, account: String, sid: String)
 }
+
+/// Which sheet a pushed worktree screen should present on appear.
+///
+/// A value for the same reason `FleetRoute` is one: **phase 3's whole surface is
+/// sheets, and `xcrun simctl` cannot tap.** A sheet that compiles and renders
+/// blank is precisely the silent failure this project keeps finding, and the only
+/// way to look at one from a script is to have something other than a finger
+/// press the button. This presents the SAME sheet, from the same state, that the
+/// tap presents — it is a way to press the button, not a second way to act.
+public enum WorktreeSheet: Hashable, Sendable {
+    case finish
+    case resume(sid: String)
+}
