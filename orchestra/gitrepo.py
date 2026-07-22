@@ -15,7 +15,9 @@ git-side knowledge. The longest-prefix rule in `match_worktree` is the reason
 'myapp' never swallows 'myapp-audit'.
 
 Everything reads; nothing here writes to a repo. The only git write commands
-the board ever runs live in the finish path.
+the board ever runs live in the finish path — and every `git status` here
+carries `--no-optional-locks`, because the plain form rewrites `.git/index`,
+which is a write however read-only the intent (see `git_info`).
 """
 
 import concurrent.futures
@@ -75,6 +77,16 @@ def git_info(git_root):
     `rev-list --left-right --count`. `log -1` stays separate — v2 reports the
     commit oid but not its timestamp or subject.
 
+    `--no-optional-locks` is not a micro-optimisation, it is the difference
+    between reading a repo and writing one. Plain `git status` rewrites
+    `.git/index` with the refreshed stat cache — measured here, the inode
+    changes on every call — which means taking `index.lock`. Lazily that was a
+    write per worktree per look; under the perpetual sweep it is a write per
+    worktree every few seconds, forever, and the agent living in that worktree
+    is the one whose `git commit` fails with "Unable to create index.lock" when
+    the two collide. The flag also costs nothing: measured 16.5 ms against
+    17.6 ms for the plain form, because not writing is faster than writing.
+
     Three things about that format bite silently, all reproduced before this
     was written:
 
@@ -91,7 +103,8 @@ def git_info(git_root):
     """
     info = {"branch": None, "commit": None, "dirty": 0, "ahead": None, "behind": None}
     branch = None
-    rc, out = shell.run(["git", "status", "--porcelain=v2", "--branch"], cwd=git_root)
+    rc, out = shell.run(["git", "--no-optional-locks", "status",
+                         "--porcelain=v2", "--branch"], cwd=git_root)
     if rc == 0:
         dirty = 0
         for line in out.splitlines():
@@ -198,7 +211,10 @@ def branch_topology():
         _, last = shell.run(["git", "log", "-1", "--format=%h%x00%s"], cwd=g)
         h, subj = (last.split("\x00") + ["", ""])[:2]
         _, br = shell.run(["git", "branch", "--show-current"], cwd=g)
-        _, dirty = shell.run(["git", "status", "--porcelain"], cwd=g)
+        # --no-optional-locks for the same reason as git_info: a read must not
+        # rewrite the index out from under the agent working in that worktree
+        _, dirty = shell.run(["git", "--no-optional-locks", "status",
+                              "--porcelain"], cwd=g)
         grp = groups.setdefault(key, {
             "repo": re.sub(r"\.git$", "", key.rsplit("/", 1)[-1]),
             "base": base, "trunk_ts": 0, "trunk_commits": [], "_root": g,

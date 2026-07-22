@@ -352,6 +352,28 @@ class TestGitInfoPorcelainV2(unittest.TestCase):
     def test_clean_repo_is_zero_dirty(self):
         self.assertEqual(fb.git_info(self.repo())["dirty"], 0)
 
+    def test_reading_a_worktree_does_not_rewrite_its_index(self):
+        """Plain `git status` refreshes .git/index and takes index.lock — a
+        WRITE, on the path the sweep now runs forever. The agent working in
+        that worktree is who pays: a colliding `git commit` fails outright."""
+        d = self.repo()
+        (d / "a").write_text("changed\n")
+        idx = d / ".git" / "index"
+        # make the stat cache look stale, which is what provokes the refresh
+        old = time.time() - 5
+        os.utime(d / "a", (old, old))
+        before = idx.stat()
+        fb.git_info(d)
+        after = idx.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns),
+                         (after.st_ino, after.st_mtime_ns))
+        # and the fixture is honest: the plain form DOES rewrite it
+        os.utime(d / "a", (old, old))
+        subprocess.run(["git", "-C", str(d), "status", "--porcelain=v2",
+                        "--branch"], capture_output=True)
+        self.assertNotEqual((before.st_ino, before.st_mtime_ns),
+                            (idx.stat().st_ino, idx.stat().st_mtime_ns))
+
 
 class TestTopologyPipeline(unittest.TestCase):
     """branch_topology against a real repo with a real origin/main ref."""
