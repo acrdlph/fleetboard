@@ -310,6 +310,64 @@ class TestQuietTimerCoversOnlyTheUnexplained(unittest.TestCase):
                                  procs_known=False)[0], "unknown")
 
 
+class TestTheThreeClocksAreIndependent(unittest.TestCase):
+    """`block_grace_s`, `orphan_grace_s` and `quiet_s` answer three different
+    questions, and until now two of them were `working_s` wearing a name.
+
+    Every test here gives the three DIFFERENT values and an age that lands
+    between them, so a call site that collapsed any two — or that let
+    `working_s` back in — fails on exactly the pair it collapsed. The values
+    are deliberately not the shipped ones: what is pinned is that each branch
+    reads its own argument, not what today's config happens to say.
+    """
+    W, B, O, Q = 90, 60, 30, 45
+
+    def _c(self, *a, **kw):
+        kw.setdefault("block_grace_s", self.B)
+        kw.setdefault("orphan_grace_s", self.O)
+        kw.setdefault("quiet_s", self.Q)
+        return fb.classify_session(*a, **kw)
+
+    def test_the_block_grace_decides_blocked_and_nothing_else_does(self):
+        # an unresolved tool_use, no --dangerously-skip-permissions
+        self.assertEqual(self._c(59, True, ["Read"], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(60, True, ["Read"], 0, False, self.W)[0], "blocked")
+        # not quiet_s (45) and not orphan_grace_s (30) — both already passed
+        self.assertEqual(self._c(46, True, ["Read"], 0, False, self.W)[0], "working")
+        # and not working_s: the control is the old collapsed number
+        self.assertEqual(fb.classify_session(60, True, ["Read"], 0, False,
+                                             self.W)[0], "working")
+
+    def test_a_running_bash_never_reaches_the_block_grace(self):
+        # the Bash tool wraps every command in a live child shell, so `shells`
+        # answers a RUNNING one an entire branch earlier. A Bash awaiting
+        # APPROVAL has no wrapper shell — that is the case block_grace_s is
+        # measured against, and the pair below is the whole asymmetry.
+        st, tool = self._c(3600, True, ["Bash"], 0, False, self.W, shells=1)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+        self.assertEqual(self._c(3600, True, ["Bash"], 0, False, self.W,
+                                 shells=0)[0], "blocked")
+
+    def test_the_orphan_grace_decides_ended_and_nothing_else_does(self):
+        self.assertEqual(self._c(29, False, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(30, False, [], 0, False, self.W)[0], "ended")
+        # the control: collapsed onto working_s it would still be WORKING here
+        self.assertEqual(fb.classify_session(30, False, [], 0, False,
+                                             self.W)[0], "working")
+
+    def test_the_orphan_grace_outranks_every_other_clock_for_a_dead_session(self):
+        # `alive` is False, so neither the block grace nor the quiet timer may
+        # speak — a session with no process is over, or not yet seen, and
+        # nothing else. Pending tools must not turn it into ■ BLOCKED.
+        self.assertEqual(self._c(3600, False, ["Read"], 0, False, self.W)[0], "ended")
+        self.assertEqual(self._c(3600, False, [], 3, False, self.W)[0], "ended")
+
+    def test_the_quiet_timer_still_owns_the_unexplained_silence_alone(self):
+        self.assertEqual(self._c(44, True, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(45, True, [], 0, False, self.W)[0], "waiting")
+
+
 class TestSettleIsAsymmetric(unittest.TestCase):
     """Anti-flicker (ENGINE.md §6.3(a)). Escalation toward more attention is
     published on the sweep that sees it; de-escalation must dwell. The rule can

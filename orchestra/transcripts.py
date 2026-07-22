@@ -919,10 +919,15 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                 + s["pending_bg_tools"],
                 skip_perms, config.CFG["working_s"], shell_n,
                 turn_ended=s.get("turn_ended", False),
-                # the only clock left in the ladder, and the only one with a
-                # measured cost behind it (config.py). `working_s` still backs
-                # the approval grace and the orphan grace, which are different
-                # questions and are not this step's to move.
+                # All three clocks now come from config, each with its own
+                # measurement and its own misfire rate beside it there. They
+                # are separate arguments because they answer separate
+                # questions: how long a tool may run unheard (block), how long
+                # an unseen process may still be there (orphan), how long an
+                # unexplained silence is still thought (quiet). `working_s`
+                # keeps only the jobs nothing else claims.
+                block_grace_s=config.CFG["block_grace_s"],
+                orphan_grace_s=config.CFG["orphan_grace_s"],
                 quiet_s=config.CFG["quiet_s"])
             s["status"] = sess_status
             if tool_running:

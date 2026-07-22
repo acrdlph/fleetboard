@@ -101,6 +101,93 @@ CFG = {
     # Measured: of the 908 claims, no misfire had an outstanding launch older
     # than 450 s (p50 16 s, p90 692 s, p95 2,069 s).
     "delegated_s": 600,        # …and how long an unanswered launch explains it
+    # `block_grace_s` — how long an unresolved tool_use is "a tool still
+    # running" (● WORKING) before it becomes ■ BLOCKED, i.e. "the thing it is
+    # waiting for is YOU". It inherited working_s because Layer 0 kept it
+    # conservative; this is the first time it has been measured.
+    #
+    # Very little reaches it. `AskUserQuestion` is answered one branch above
+    # (needs_input) and delegated work one above that — and, the big one, a
+    # RUNNING Bash is answered by the `shells` branch, because the Bash tool
+    # wraps every command in a live zsh child. A Bash awaiting APPROVAL has no
+    # wrapper shell yet, and that asymmetry is what makes this branch worth
+    # having at all. Under --dangerously-skip-permissions it is dead code:
+    # 416 of 737 transcripts (56.4 %) never ran in a mode that can ask, and on
+    # the board's own working set it is 78 of 96 (81.2 %).
+    #
+    # Measured by replaying every transcript and taking the SILENCE BETWEEN
+    # CONSECUTIVE WRITES while a tool_use was unresolved — which is what `age`
+    # actually is; a parallel tool call or a sidechain write resets it, so the
+    # raw tool_use→tool_result span would have been the wrong distribution.
+    # Split into the two populations this number trades:
+    #
+    #   flicker — the silence ended because the TOOL finished, so ■ BLOCKED
+    #             is a false summons: 18,741 silences, p95 6.6 s, p99 63.0 s
+    #             (in the sessions that CAN be asked: p95 10.6 s, p99 117.3 s)
+    #   catch   — the silence ended because a HUMAN did: the tool_use resolves
+    #             with "The user doesn't want to proceed…" / "User has
+    #             approved your plan", or the tool is ExitPlanMode. 293 of
+    #             them, and they are the entire reason ■ BLOCKED exists.
+    #
+    #      V     flicker   caught   lateness removed vs 90 s
+    #     10 s   3.031 %   23.9 %   3,333 s — over 414 extra false alarms
+    #     20 s   1.942 %   18.4 %   2,726 s — over 210
+    #     30 s   1.574 %   15.7 %   2,225 s — over 141
+    #     45 s   1.254 %   13.3 %   1,596 s — over  81
+    #     60 s   1.030 %   11.9 %   1,025 s — over  39   <- shipped
+    #     90 s   0.822 %   10.9 %       0 s — over   0   <- inherited
+    #    120 s   0.619 %    9.6 %
+    #
+    # 60 is where quiet_s's rule puts it: between the p95 and the p99 of the
+    # genuine tool-run silence it must tolerate, in the population where the
+    # branch is live. It takes 29 s off every real approval prompt for 39
+    # extra false alarms in 18,741 opportunities (+0.21 pp), and on the
+    # board's own working set it is FREE — 5 false silences at 60 and 5 at 90
+    # (0.216 %), 90 s of lateness removed. Below 60 the trade only gets worse:
+    # 26 s of promptness bought per extra false summons at 60, 20 s at 45,
+    # 13 s at 20. A false ■ BLOCKED is flicker, never danger — BLOCKED makes a
+    # card "attention", never "free", so it cannot reach dispatch.
+    "block_grace_s": 60,       # unresolved tool_use: running, then it is you
+    # `orphan_grace_s` — how long a FRESH transcript write with NO observed
+    # process still reads ● WORKING before it becomes ○ ENDED. It STAYS at 90,
+    # and what follows is the measurement that says so rather than the
+    # inheritance that used to.
+    #
+    # What it claims to cover is the lag between a process EXISTING and
+    # orchestra SEEING it. Driven at 40 ms resolution, 9 launches: the process
+    # is in `procs.claude_processes()` with a resolved cwd 0.14–0.32 s after
+    # exec, and the transcript's first byte does not land until 2.25–3.33 s.
+    # A just-exec'd agent is therefore visible 2.1–3.0 s BEFORE it can appear
+    # on the board at all, and needs no grace whatsoever. The probe does not
+    # miss either: 0 unresolved cwds in 3,000 lsof calls, 0 short reads in 200
+    # whole-table `claude_processes()` calls, and over 816 live board ticks
+    # (27.2 min) 7,966 process observations without a single missing cwd and
+    # 0 pairing flaps.
+    #
+    # So the measurable half of the question wants ~0, and the number's real
+    # job is the half with no observed events: a probe that comes back empty.
+    # Counterfactual over those same 816 ticks — 4,663 observations of a
+    # session that WAS paired with a live pid, asking what ONE blind probe
+    # would have published (a live session's transcript is 51 s old at a
+    # random moment, p50; p75 405 s):
+    #
+    #      V      live sessions published ○ ENDED   worktrees gone FREE
+    #     10 s               73.4 %             1,317 of 2,448  (5.5x)
+    #     30 s               57.7 %               750 of 2,448  (3.1x)
+    #     45 s               52.0 %               540 of 2,448  (2.3x)
+    #     90 s               42.3 %               239 of 2,448  (today)
+    #
+    # ENDED feeds card availability feeds worktree-FREE feeds dispatch, so
+    # that last column is "how many worktrees one dropped `ps` offers to a
+    # second agent". There is no distribution to place a percentile in — the
+    # event has an observed rate of ZERO — so there is no MEASURED number
+    # below 90, and a guess in this direction is the one that puts two agents
+    # on one worktree. It stays until evidence replaces the timer:
+    # `classify_session` already takes `procs_known` for exactly this failure
+    # and nothing passes it. The price of leaving it is known too — 89.2 s of
+    # ● WORKING after an agent is gone (driven, 6 runs: the transcript is
+    # 0.82–0.87 s old at the moment the process disappears from `ps`).
+    "orphan_grace_s": 90,      # a fresh write with no process: seen yet, or over
     # De-escalation dwell (ENGINE.md §6.3(a)): a status must stand this long
     # before it may quieten. Escalation toward more attention never waits. It
     # does NOT stack on `quiet_s` — see `status.settle`.

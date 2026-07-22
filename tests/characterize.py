@@ -101,6 +101,31 @@ def _quiet_inputs():
                    skip_perms=skip, working_s=90, shells=shells, quiet_s=quiet)
 
 
+def _grace_inputs():
+    """`block_grace_s` and `orphan_grace_s` — the last two clocks to stop being
+    `working_s` under another name.
+
+    Both defaulted to `working_s`, so for two releases the ladder could not
+    tell the three apart and neither could this harness. They get their own
+    product for the same reason `quiet_s` did: what needs pinning is narrow —
+    that each branch reads ITS OWN argument — and folding two more axes into
+    the 2,880-case product above would multiply it by nine to say it.
+
+    `working_s` is pinned at 90 and the two graces move independently below
+    it, with `None` in both lists so the fall-back to `working_s` is pinned
+    too. The ages straddle every boundary any of the three can sit on, and
+    `pending_tools` carries `Read` rather than `Bash` because a Bash is
+    answered by the `shells` branch an entire level above the block grace.
+    """
+    ages = [0, 29, 30, 44, 45, 59, 60, 89, 90, 91]
+    for age, block, orphan, alive, pend, shells, skip in itertools.product(
+            ages, [None, 30, 60], [None, 30, 90], [True, False],
+            [[], ["Read"]], [0, 1], [False, True]):
+        yield dict(age_s=age, alive=alive, pending_tools=pend, delegated=0,
+                   skip_perms=skip, working_s=90, shells=shells,
+                   block_grace_s=block, orphan_grace_s=orphan)
+
+
 def _settle_inputs():
     """Anti-flicker: escalate now, de-escalate after a dwell. `since` is the
     clock of the last ADOPTION, so the elapsed values straddle the boundary
@@ -166,6 +191,9 @@ def build(mod):
     ]
     snap["classify_quiet"] = [
         {"in": kw, "out": _safe(mod, "classify_session", **kw)} for kw in _quiet_inputs()
+    ]
+    snap["classify_grace"] = [
+        {"in": kw, "out": _safe(mod, "classify_session", **kw)} for kw in _grace_inputs()
     ]
     snap["settle"] = [
         {"in": kw, "out": _safe(mod, "settle", **kw)} for kw in _settle_inputs()

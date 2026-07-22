@@ -5,8 +5,9 @@
 ## Context
 
 `ENGINE.md` is the design authority for the observer work. Implementing steps 0–2 and 5 against it
-has now produced **seven** places where following it literally would have shipped a defect, each
-caught only because the number was measured rather than assumed:
+has now produced **nine** places where following it literally would have shipped a defect, each
+caught only because the number was measured rather than assumed. The last two are against
+`FRESHNESS.md`, the Layer-0 note, and are listed here because the rule is the same one:
 
 | § | the document says | measured reality |
 |---|---|---|
@@ -19,6 +20,9 @@ caught only because the number was measured rather than assumed:
 | §6.3(a) | `settle()`'s final `return proposed, now` also runs when `proposed == prev` | That re-stamps `since` on every sweep that merely *agrees*, so under the hot cadence (`hot_s = 0.15`) the dwell becomes a 0–3 s sawtooth and how long a real de-escalation waits depends on where in the cycle it lands. `since` is now the clock of the last **adoption** and does not move while a status persists — which also means the dwell does not stack on `quiet_s`: the board says ◆ YOUR TURN at 45 s, not 48. Pinned by `test_the_dwell_does_not_stack_on_top_of_the_quiet_timer` and `test_an_unchanged_status_never_restamps_its_clock`. |
 
 | §6.2 | `delegated` is "waiting on its own workflows or background agents" — i.e. the CLI's `pendingWorkflowCount` + `pendingBackgroundAgentCount` are the whole of it | Those two counts are right when non-zero and **blind** otherwise. Replaying 904 end-of-turn claims across ~/.claude*, the agent speaks again with no human prompt on 132 (14.6 %); on the residual that no other guard catches, both counts read **0** while a `<task-notification>` — a background task reporting back, which resumes the session — is what wakes it. `delegated` now also counts a tool_use that *launched* background work and has not been notified back, which is invisible to `pending_tools` because such a launch resolves its own tool_use immediately. Misfire 5.09 % → **4.42 %**, no measured cost. Bounded by `delegated_s = 600` because **3.8 %** of the 2,000 launches on this corpus never report at all. |
+
+| FRESHNESS.md | `block_grace_s = 60`, "the measured p99 of mid-turn gaps (61.2 s)" | The value survives; the derivation does not. What the branch actually reads is not a mid-turn gap but the silence between writes **while a tool_use is unresolved**, and three branches above it take most of that population away first — including every RUNNING Bash, which the `shells` branch answers because the Bash tool wraps each command in a live child shell. Re-measured on what is left: p95 6.6 s / p99 63.0 s over 18,741 silences (p95 10.6 s / p99 117.3 s in the sessions that can actually be asked). 60 lands in the same place for a different reason, and now carries the cost of being there: 1.030 % false ■ BLOCKED against 0.822 % at 90, buying 1,025 s of promptness across the 293 silences a human really ended. |
+| FRESHNESS.md | `orphan_grace_s = 10` | **Rejected.** The case it is written for does not exist: driven at 40 ms resolution over 9 launches, a just-exec'd agent is in `claude_processes()` with a resolved cwd 0.14–0.32 s after exec and its transcript's first byte does not land for 2.25–3.33 s — the process is visible **before** the session can appear on the board at all. Nor does the probe miss: 0 unresolved cwds in 3,000 `lsof` calls, 0 short reads in 200 whole-table probes, and across 816 live board ticks (27.2 min) 7,966 process observations with no missing cwd and 0 pairing flaps. So the measurable half of the question wants ≈0 and the number is really covering a probe that comes back empty — an event with an observed rate of **zero**, i.e. no distribution to put a percentile in. Counterfactually, over 4,663 observations of a session that *was* paired with a live pid, one blind probe at 10 s publishes ○ ENDED for **73 %** of them and offers **54 %** of busy worktrees to a second agent, against 42 % and 10 % at 90. Stays at **90** until `procs_known` is actually passed. |
 
 An eighth, softer case, on cadence rather than status: §2.5 specifies `idle_s = 1.0`. At the measured 1.68 CPU-s per sweep that
 is **164 % of one core, continuously** — not aggressive, unreachable. It became affordable only

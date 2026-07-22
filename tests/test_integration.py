@@ -151,7 +151,8 @@ class _Fleet(unittest.TestCase):
         # point orchestra at the fixtures; neutralize live-system inputs
         self._save = {k: fb.CFG.get(k) for k in
                       ("roots", "homes", "pattern", "exclude_accounts",
-                       "reserve_percent", "quiet_s", "working_s", "delegated_s")}
+                       "reserve_percent", "quiet_s", "working_s", "delegated_s",
+                       "block_grace_s", "orphan_grace_s")}
         self._demo, self._procs, self._cl = (fb.config.DEMO,
                                              fb.procs.claude_processes,
                                              fb.limits.cached_limits)
@@ -800,6 +801,89 @@ class TestTheQuietTimerIsWired(_Fleet):
         self.assertEqual(s["status"], "working")
         fb._cache["state"] = None
         self.assertEqual(fb.collect_state()["free_worktrees"], [])
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestTheGraceKeysAreWired(_Fleet):
+    """`CFG["block_grace_s"]` and `CFG["orphan_grace_s"]` against real bytes.
+
+    Both defaulted to `working_s` for two releases, so every call site could
+    have gone on passing `working_s` for all three clocks and no test above
+    would have noticed. These move each key on its own, to a value nothing
+    else in CFG shares, and read the answer off `collect_state` — the same
+    proof `TestTheQuietTimerIsWired` gives for the third clock.
+    """
+
+    def _proc(self, cmd="claude"):
+        fb.procs.claude_processes = lambda **_: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": cmd, "account": None,
+            "tmux_target": None, "shells": 0}]
+
+    def _aged(self, fp, secs):
+        t = time.time() - secs
+        os.utime(fp, (t, t))
+        fb.memo_clear()
+        fb._cache["state"] = None
+        return fb.collect_state()["worktrees"][0]["sessions"][0]
+
+    def _tool_left_open(self):
+        # an assistant tool_use with no matching tool_result: on disk this is
+        # "a tool is running" and "the user has been asked to approve it" at
+        # exactly the same bytes. Read, not Bash — a Bash would be answered by
+        # the `shells` branch one level up and never reach the grace.
+        return write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("look at the file"), assistant_msg(tool="Read")])
+
+    def test_a_stalled_tool_is_blocked_at_the_block_grace(self):
+        fp = self._tool_left_open()
+        self._proc()                       # no --dangerously-skip-permissions
+        b = fb.CFG["block_grace_s"]
+        self.assertEqual(self._aged(fp, b - 5)["status"], "working")
+        self.assertEqual(self._aged(fp, b + 5)["status"], "blocked")
+        # …and it is the CONFIGURED number, not working_s wearing its name
+        self.assertLess(b, fb.CFG["working_s"])
+        self.assertEqual(self._aged(fp, fb.CFG["working_s"] - 5)["status"], "blocked")
+
+    def test_lowering_the_block_key_lowers_the_threshold(self):
+        fp = self._tool_left_open()
+        self._proc()
+        fb.CFG["block_grace_s"] = 10
+        self.assertEqual(self._aged(fp, 5)["status"], "working")
+        self.assertEqual(self._aged(fp, 15)["status"], "blocked")
+
+    def test_skip_permissions_still_means_there_is_nothing_to_approve(self):
+        # the grace only ever decides sessions that CAN be asked; 81 % of the
+        # board's working set cannot, and must stay ● WORKING however long the
+        # tool runs.
+        fp = self._tool_left_open()
+        self._proc(cmd="claude --dangerously-skip-permissions")
+        s = self._aged(fp, fb.CFG["block_grace_s"] * 10)
+        self.assertEqual(s["status"], "working")
+        self.assertTrue(s["tool_running"])
+
+    def test_a_fresh_write_with_no_process_ends_at_the_orphan_grace(self):
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("do a thing"), assistant_msg(text="on it")])
+        fb.procs.claude_processes = lambda **_: []
+        o = fb.CFG["orphan_grace_s"]
+        self.assertEqual(self._aged(fp, o - 5)["status"], "working")
+        self.assertEqual(self._aged(fp, o + 5)["status"], "ended")
+
+    def test_lowering_the_orphan_key_frees_the_worktree_sooner(self):
+        # THE DANGEROUS DIRECTION, pinned end to end: ENDED is what makes a
+        # card free, and `free_worktrees` is what /api/dispatch picks from. A
+        # change to this key must be visible HERE, not just in a status string.
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("do a thing"), assistant_msg(text="on it")])
+        fb.procs.claude_processes = lambda **_: []
+        fb.CFG["orphan_grace_s"] = 10
+        self.assertEqual(self._aged(fp, 5)["status"], "working")
+        fb._cache["state"] = None
+        self.assertEqual(fb.collect_state()["free_worktrees"], [])
+        self.assertEqual(self._aged(fp, 15)["status"], "ended")
+        fb._cache["state"] = None
+        self.assertEqual(fb.collect_state()["free_worktrees"], ["myapp"])
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")

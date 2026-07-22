@@ -37,26 +37,30 @@ def classify_session(age_s, alive, pending_tools, delegated,
     deliberately weaker than every positive sign of work above it — see the
     branch itself.
 
-    `quiet_s` is the LAST branch and the only clock this function still owes
-    the user: unexplained silence before a live agent stops being WORKING. It
-    is reached only when every explanation above it has been ruled out — no
-    pending tool, no delegated workflow or background agent, no live shell, no
-    observed turn end — so it covers exactly "it has gone quiet and nothing
-    says why". Left None it is `working_s`, which is what every caller but
-    `scan_sessions` wants; the measured value and its misfire cost live beside
-    `quiet_s` in config.py. (It was called `thinking_s` while it was still a
-    placeholder defaulting to 90; the branch is unchanged, the name now says
-    what the number means.)
+    THREE clocks remain, and they answer three different questions with three
+    different costs. Each is None here and falls back to `working_s`, which is
+    what every caller but `scan_sessions` wants; each carries its measured
+    value, its distribution and its misfire rate beside its key in config.py,
+    and none of them is `working_s` wearing a new name any more:
+
+      `block_grace_s` — an unresolved tool_use is a tool still RUNNING for
+        this long, then it is you it is waiting for (■ BLOCKED). Reached only
+        when the branches above have not already explained the silence, and
+        dead code entirely under --dangerously-skip-permissions.
+      `orphan_grace_s` — a fresh write with NO observed process is "we have
+        not seen it yet" for this long, then the session is over. The
+        dangerous one: ENDED feeds worktree-FREE feeds dispatch targeting.
+      `quiet_s` — the LAST branch: unexplained silence before a live agent
+        stops being WORKING. Reached only when every explanation above it has
+        been ruled out — no pending tool, no delegated workflow or background
+        agent, no live shell, no observed turn end — so it covers exactly "it
+        has gone quiet and nothing says why". (It was called `thinking_s`
+        while it was still a placeholder defaulting to 90.)
     """
     pend = pending_tools or []
     age = age_s if evidence_age is None else evidence_age
     quiet_s = working_s if quiet_s is None else quiet_s
     block_grace_s = working_s if block_grace_s is None else block_grace_s
-    # Defaults to working_s so this layer is provably behaviour-identical
-    # apart from the two intended fixes. Tightening it (10 s is the target)
-    # flips a live-but-unpaired session to ENDED, which feeds worktree-FREE
-    # and therefore dispatch targeting — it needs reliable process detection
-    # behind it, so it lands as its own step, not smuggled in here.
     orphan_grace_s = working_s if orphan_grace_s is None else orphan_grace_s
 
     if not procs_known:                      # ps/lsof failed wholesale: never
@@ -77,7 +81,10 @@ def classify_session(age_s, alive, pending_tools, delegated,
         # "awaiting approval" and "tool still running" are the same bytes on
         # disk. Under --dangerously-skip-permissions there is nothing to
         # approve; otherwise hold WORKING until the silence outlasts genuine
-        # tool-run silence before calling it BLOCKED.
+        # tool-run silence before calling it BLOCKED. A RUNNING Bash never
+        # gets here — the `shells` branch above answers it, because the Bash
+        # tool wraps every command in a live child shell. One awaiting
+        # APPROVAL has no such shell, which is what this branch is really for.
         if skip_perms or age < block_grace_s:
             return "working", True
         return "blocked", False
@@ -93,9 +100,11 @@ def classify_session(age_s, alive, pending_tools, delegated,
         return "waiting", False
     if not alive:
         # A fresh write with no observed process is "we have not seen the
-        # process yet" (a just-exec'd agent, or a lagging proc-table read) —
-        # not "ended". This rule was implicit in the old first branch; it is
-        # now named, bounded, and testable.
+        # process yet" (a lagging proc-table read) — not "ended". Measured, a
+        # just-exec'd agent is NOT this case: `ps` and lsof have it 2.1–3.0 s
+        # before its transcript's first byte exists. What the grace really
+        # covers is a probe that came back empty, and config.py says why that
+        # keeps it at 90 rather than at the ~0 the lag itself would buy.
         return ("working", False) if age < orphan_grace_s else ("ended", False)
     if age < quiet_s:
         return "working", False              # decay, LAST
