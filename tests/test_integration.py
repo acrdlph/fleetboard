@@ -614,20 +614,32 @@ class TestGitInfoPorcelainV2(unittest.TestCase):
         WRITE, on the path the sweep now runs forever. The agent working in
         that worktree is who pays: a colliding `git commit` fails outright."""
         d = self.repo()
+        (d / "clean").write_text("keep\n"); git(d, "add", "-A")
+        git(d, "commit", "-q", "-m", "c1")
         (d / "a").write_text("changed\n")
         idx = d / ".git" / "index"
-        # make the stat cache look stale, which is what provokes the refresh
+        # Provoke the refresh with a CLEAN tracked file whose stat no longer
+        # matches the cache. Staleness on a MODIFIED file is not enough: git
+        # sees the size differ, calls it modified and has no new stat worth
+        # caching, so whether it rewrites the index comes down to racy-index
+        # timing — measured 11 of 120 runs where the plain form did NOT write,
+        # which is exactly how this control failed under a loaded full suite.
+        # A clean file forces the write: refresh hashes it, finds the content
+        # matches, and must store the refreshed stat. 0 of 120 flakes.
         old = time.time() - 5
-        os.utime(d / "a", (old, old))
+        stale = lambda: (os.utime(d / "clean", (old, old)),
+                         os.utime(d / "a", (old, old)))
+        stale()
         before = idx.stat()
         fb.git_info(d)
         after = idx.stat()
         self.assertEqual((before.st_ino, before.st_mtime_ns),
                          (after.st_ino, after.st_mtime_ns))
         # and the fixture is honest: the plain form DOES rewrite it
-        os.utime(d / "a", (old, old))
-        subprocess.run(["git", "-C", str(d), "status", "--porcelain=v2",
-                        "--branch"], capture_output=True)
+        stale()
+        rc = subprocess.run(["git", "-C", str(d), "status", "--porcelain=v2",
+                             "--branch"], capture_output=True)
+        self.assertEqual(rc.returncode, 0, "control git failed to run at all")
         self.assertNotEqual((before.st_ino, before.st_mtime_ns),
                             (idx.stat().st_ino, idx.stat().st_mtime_ns))
 

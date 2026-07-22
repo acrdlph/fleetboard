@@ -14,8 +14,10 @@ query or a bounded tail of a transcript. Nothing is written, nothing is typed,
 and no state another module owns is reaped — under a perpetual sweep any such
 write becomes a scheduled background action nobody asked for.
 
-`_cache` holds the last snapshot for `STATE_TTL_S` seconds, so a board polling
-every couple of seconds doesn't re-shell `git` twice a second. It is mutated
+`_cache` holds the last snapshot for `STATE_TTL_S` seconds when nothing is
+sweeping, and for as long as a running sweep promises to refresh it
+(`Observer.republish_s`) when something is, so a board polling every couple of
+seconds doesn't re-shell `git` twice a second. It is mutated
 in place and never rebound: the act layer parks a `_cache["t"] = 0.0` in it so
 a button reverts on the very next poll instead of four seconds later, and the
 tests poke `_cache["state"]` through the facade — same object either way.
@@ -702,6 +704,19 @@ class Observer:
         they do not, and capped again by `max_stale_s` in the wait itself."""
         return self.idle_s if self.watching else min(self.idle_s, self.idle_blind_s)
 
+    @property
+    def republish_s(self):
+        """How long the request path may trust `_cache` while this thread runs.
+
+        The cache is refreshed at the END of a sweep, so the interval between
+        refreshes is the cadence PLUS a sweep — not the cadence. Both terms are
+        measured rather than assumed: `effective_idle_s` already accounts for a
+        dead watcher, and `_sweep_ms` is the last sweep's own duration, which on
+        a loaded box is seconds and not milliseconds.
+        """
+        return (min(self.effective_idle_s, self.max_stale_s)
+                + self._sweep_ms / 1000.0 + STATE_TTL_S)
+
     def _live_pids(self):
         """The claude pids of the last snapshot, for `EVFILT_PROC`/`NOTE_EXIT`.
 
@@ -1058,10 +1073,11 @@ def demo_state():
 def cached_state():
     """The one entry point the server calls.
 
-    With the sweep thread running this is O(1): the sweep refreshes `_cache`
-    faster than STATE_TTL_S expires, so N tabs no longer trigger N concurrent
-    collections. With no sweep thread — the rollback, and every test run — the
-    branch below is the whole function, byte for byte what it was before.
+    With the sweep thread running this is O(1): the request path trusts what
+    the sweep published for as long as the sweep promises to publish again
+    (`republish_s`), so N tabs no longer trigger N concurrent collections. With
+    no sweep thread — the rollback, and every test run — the branch below is
+    STATE_TTL_S and the whole function, byte for byte what it was before.
 
     The branch is also the freshness guarantee after a mutation: the act layer
     parks `_cache["t"] = 0.0`, and that still forces one synchronous collect on
@@ -1074,7 +1090,26 @@ def cached_state():
     if config.DEMO:
         return demo_state()
     now = time.time()
-    if _cache["state"] is None or now - _cache["t"] > STATE_TTL_S:
+    # STATE_TTL_S is the NO-THREAD bound and nothing else. It was also the
+    # right bound for the thread while `idle_s` was 3.0 — the sweep refreshed
+    # `_cache` faster than 4.0 s expired, which is what the docstring above
+    # claims. `idle_s` 3.0 -> 30.0 (ADR 0012) silently ended that: the cache
+    # then expired 4 s into every 30 s cycle and every request in the remaining
+    # 26 s ran a full synchronous collect on the request thread. Measured with
+    # the shipped config: 13 of 30 one-second polls collected, and /api/state
+    # on the nine-worktree fleet took 8-17 s per request instead of 0.7 ms.
+    # Same shape as the `max_stale_s` 8.0 -> 45.0 correction in that ADR — a
+    # ceiling left below a raised cadence quietly becomes the cadence — but on
+    # the request path rather than in the loop.
+    #
+    # So while the thread is running, the bound is the thread's own promise
+    # (`republish_s`). Fall past it and the sweep is late or wedged, and a
+    # synchronous collect is exactly the right answer; the parked
+    # `_cache["t"] = 0.0` still lands miles outside it, so a mutation still
+    # forces a collect on the very next request.
+    obs = _observer
+    ttl = obs.republish_s if (obs is not None and obs.running) else STATE_TTL_S
+    if _cache["state"] is None or now - _cache["t"] > ttl:
         fresh = {}
         state = collect_state(fresh=fresh)
         _cache["state"], _cache["t"] = state, now

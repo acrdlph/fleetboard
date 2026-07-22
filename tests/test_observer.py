@@ -297,6 +297,53 @@ class TestSweepThread(CacheGuard):
         fb.cached_state()                    # served from the warm cache…
         self.assertEqual(len(self.calls), before)   # …with no collect at all
 
+    def test_a_request_between_sweeps_does_not_collect_on_the_request_thread(self):
+        """`idle_s` 30 with a 4 s cache means 26 s of every 30 collect on the
+        request thread — the exact cost the sweep exists to remove.
+
+        Measured before this was fixed: 13 of 30 one-second polls ran a full
+        collect_state, and /api/state on the nine-worktree fleet answered in
+        8-17 s instead of 0.7 ms. The cache is refreshed at the END of a sweep,
+        so what the request path may trust is the cadence PLUS a sweep, not
+        STATE_TTL_S — which was only ever right while `idle_s` was 3.0.
+        """
+        self._stub()
+        o = fb.Observer(idle_s=30.0, hot_s=0.0, watch=False, idle_blind_s=30.0)
+        self.addCleanup(o.stop)
+        fb.observer._observer = o
+        o.start()
+        self.assertIsNotNone(o.wait_for(0, timeout=5))
+        # a poll landing well past STATE_TTL_S but well inside the cadence
+        self.assertGreater(o.republish_s, 3 * fb.observer.STATE_TTL_S)
+        fb._cache["t"] = time.time() - (fb.observer.STATE_TTL_S + 2.0)
+        before = len(self.calls)
+        fb.cached_state()
+        self.assertEqual(len(self.calls), before,
+                         "a poll between sweeps collected on the request thread")
+        # …and the safety net is intact: past the thread's own promise, and for
+        # a mutation that parks the cache, the request still collects
+        fb._cache["t"] = time.time() - (o.republish_s + 1.0)
+        fb.cached_state()
+        self.assertEqual(len(self.calls), before + 1)
+        fb._cache["t"] = 0.0                          # what finish() parks
+        fb.cached_state()
+        self.assertEqual(len(self.calls), before + 2)
+
+    def test_a_stopped_thread_hands_the_request_path_back_to_state_ttl(self):
+        """`running` is read per request, never latched: an Observer that died
+        must not leave the request path trusting a cache nobody refreshes."""
+        self._stub()
+        o = fb.Observer(idle_s=30.0, hot_s=0.0, watch=False, idle_blind_s=30.0)
+        fb.observer._observer = o
+        o.start()
+        self.assertIsNotNone(o.wait_for(0, timeout=5))
+        o.stop()
+        before = len(self.calls)
+        fb._cache["t"] = time.time() - (fb.observer.STATE_TTL_S + 2.0)
+        fb.cached_state()
+        self.assertEqual(len(self.calls), before + 1,
+                         "a dead sweep left the request path trusting its cache")
+
     def test_a_parked_invalidation_survives_an_in_flight_sweep(self):
         """finish() parks _cache["t"] = 0.0 mid-sweep. A sweep that started
         BEFORE the mutation must not paper over it with pre-mutation data."""
