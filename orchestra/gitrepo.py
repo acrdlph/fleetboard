@@ -18,6 +18,7 @@ Everything reads; nothing here writes to a repo. The only git write commands
 the board ever runs live in the finish path.
 """
 
+import concurrent.futures
 import re
 import time
 from pathlib import Path
@@ -86,6 +87,37 @@ def git_info(git_root):
         if len(parts) == 2:
             info["behind"], info["ahead"] = int(parts[0]), int(parts[1])
     return info
+
+
+GIT_WORKERS = 16      # fan-out for git_info_many; see the note there
+
+
+def git_info_many(roots):
+    """`git_info` for every worktree at once — {root: info}.
+
+    A board with nine worktrees spends ~880 ms here, and almost none of it is
+    ours: each call is a handful of short-lived `git` processes, so the cost is
+    spawn plus disk, and the interpreter is blocked on `wait()` for nearly all
+    of it. That makes concurrency the single biggest win available on this
+    path — bigger than cutting the number of spawns, which only helps once the
+    waiting is already overlapped.
+
+    Fanning out per worktree (not per git command) keeps `git_info` itself an
+    ordinary serial function: readable, unit-testable, and still the thing the
+    tests monkeypatch. Duplicate roots are collapsed so a `<dir>/repo` layout
+    pointing several worktrees at one git dir does not pay twice.
+    """
+    uniq = list(dict.fromkeys(roots))
+    if not uniq:
+        return {}
+    if len(uniq) == 1:
+        return {uniq[0]: git_info(uniq[0])}
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(GIT_WORKERS, len(uniq)),
+            thread_name_prefix="gitinfo") as ex:
+        # git_info is resolved from module globals per call, so a test that
+        # patches gitrepo.git_info still takes effect through this path
+        return dict(zip(uniq, ex.map(lambda r: git_info(r), uniq)))
 
 
 # ----------------------------------------------------------- branch topology

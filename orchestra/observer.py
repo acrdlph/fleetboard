@@ -93,6 +93,10 @@ def collect_state():
         return [s["status"] for s in ss
                 if not (s["status"] == "limit" and s.get("handed_to"))]
 
+    # one fan-out for every worktree's git state, rather than one blocking call
+    # per card — this path is dominated by waiting on `git`, not by our own work
+    git_by_root = gitrepo.git_info_many([w["git"] for w in worktrees])
+
     cards = []
     for w in worktrees:
         ss = sessions.get(w["path"], [])
@@ -100,7 +104,7 @@ def collect_state():
                 (p["cwd"] == w["path"] or p["cwd"].startswith(w["path"] + "/"))]
         cards.append({
             **w,
-            "git": gitrepo.git_info(w["git"]),
+            "git": git_by_root.get(w["git"]) or gitrepo.git_info(w["git"]),
             "sessions": ss,
             "live_procs": [{"pid": p["pid"], "cpu": p["cpu"], "etime": p["etime"],
                             "tty": p["tty"], "host": p["host"],
