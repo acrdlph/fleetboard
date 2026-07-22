@@ -17,9 +17,9 @@ are.
 | | |
 |---|---|
 | **Phase** | B — backend, in flight |
-| **Shipped** | steps 0–3 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core |
-| **Next** | step 5 (the status model) then step 4 (SSE) — see *Development path* |
-| **Tests** | 349 · characterization 1,592 cases |
+| **Shipped** | steps 0–3 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core. Step 5 in flight: an ended turn is now read off the transcript, not waited out |
+| **Next** | finish step 5 (the residual timer) then step 4 (SSE) — see *Development path* |
+| **Tests** | 370 · characterization 3,032 cases |
 | **Last updated** | 2026-07-22 |
 
 Design documents are being generated and reconciled. Until each is listed as **settled** below,
@@ -121,7 +121,7 @@ even if the phone client were cancelled.
 | **—** ✅ | make the sweep affordable: git on a 15 s cadence, transcript memo, `(pid,start)` cwd memo | 55% → 15% of a core |
 | **3** ✅ | kqueue watcher — react to writes instead of sweeping | idle **5.3%** of a core; write→board ~1 s (was a 30 s cadence); 220 fds |
 | **—** ✅ | identity-addressed mutations (ADR 0008) | a recycled pid is refused, not delivered to the wrong agent |
-| **5** ⬜ | **status model — `working_s = 90`** | `WORKING` stops lying. **Next.** |
+| **5** ◧ | **status model — `working_s = 90`** | phase 1 landed: the CLI's own end-of-turn marker is read positionally and wired into `classify_session`, so **84 %** of in-window sessions resolve by observation and stop waiting out the window (median lateness removed: the full 90 s). The timer now covers only the 16 % with no marker. |
 | **4** ⬜ | SSE + delta protocol; retire the 5 s browser poll | the browser finally sees the ~1 s the server already knows |
 | **6** ⬜ | Claude Code hooks; reconcile signal sources by rank | `BLOCKED`/`YOUR TURN` become observed, not inferred |
 | **7** ⬜ | auth, device pairing, tailnet bind | safe to reach from a phone |
@@ -139,11 +139,11 @@ could only ask "is the mtime within 90 s?" — precise write timestamps now exis
 | item | why it is parked | where |
 |---|---|---|
 | `age_s` still ships beside `last_write_at` | one release of overlap so nothing breaks; remove with step 6 | `transcripts.py` |
-| `working_s = 90`, and `thinking_s`/`block_grace_s`/`orphan_grace_s` default to it | Layer 0 kept them conservative so it was provably behaviour-identical; tightening is step 5 and needs the anti-flicker rule | `status.py`, `config.py` |
+| `working_s = 90`, and `thinking_s`/`block_grace_s`/`orphan_grace_s` default to it | Layer 0 kept them conservative so it was provably behaviour-identical. Step 5 phase 1 took 84 % of sessions off the timer entirely (observed end-of-turn); what is left is the 16 % with no marker, where tightening still needs the anti-flicker rule and the measured misfire table | `status.py`, `config.py` |
 | transcript memo can be defeated by a size+mtime_ns+inode-identical rewrite | adversarial only — transcripts are append-only; the 60 s cold reconcile bounds it | ADR 0011 |
 | `dirty` cannot be memoised | it is the working tree; no cheap stat sees an edit. Bounded by `GIT_S` and dated by `freshness["git"]` | ADR 0011 |
 | a dispatch's new branch is not nudged | the branch is cut by the launched agent minutes later, with no signal back; bounded by `GIT_S` | `dispatch.py` |
-| `ENGINE.md` is stale in three places | measurement supersedes it; the doc is a design record, not rewritten | ADR 0011 |
+| `ENGINE.md` is stale in four places | measurement supersedes it; the doc is a design record, not rewritten | ADR 0011 |
 | the transcript corpus is ~5 GB / 18,773 files, +1,000/day | orchestra's own inputs are a slow disk leak; wants a retention policy | — |
 
 **The load-bearing interface is the delta/event format introduced at step 4.** The browser

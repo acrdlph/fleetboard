@@ -4,8 +4,8 @@
 
 ## Context
 
-`ENGINE.md` is the design authority for the observer work. Implementing steps 0–2 against it has
-now produced **three** places where following it literally would have shipped a defect, each
+`ENGINE.md` is the design authority for the observer work. Implementing steps 0–2 and 5 against it
+has now produced **four** places where following it literally would have shipped a defect, each
 caught only because the number was measured rather than assumed:
 
 | § | the document says | measured reality |
@@ -13,8 +13,9 @@ caught only because the number was measured rather than assumed:
 | §9 step 1 | rebuild a detached label as `detached@<branch.oid[:9]>` | git's abbreviation length is **per-repository** — 8 chars in `ConfidAi5/repo`, 9 in the other eight worktrees. The slice renders `detached@6dcc53338` where git renders `detached@6dcc5333`. Detached heads now spend one extra `rev-parse`. |
 | §9 step 1 | move the subagent `rglob` **after** the window check | That walk is exactly what rescues a session whose main transcript is idle while a Workflow writes under `<session-id>/` — the advertised ⚙ feature. Skipping it makes such sessions **vanish from the board**, silently. The walk stayed complete and got cheap instead (`os.scandir`, 146 ms → 84 ms). |
 | §2.5 | `git_s = 5.0`, a re-probe cadence **within** a sweep (i.e. a memo) | There cannot be a memo. `dirty` is the working tree and no cheap stat detects an edit there — `.git/index` mtime does not, because it moves when *git* writes the index, which `--no-optional-locks` exists to prevent. Implemented as a **between-sweep cadence** at 15.0. |
+| §6.3 | the `working_s` work lands **after** hooks (§7 ranks hooks above every other signal) | The CLI already writes its own end-of-turn marker, and it is present after the agent's last word in **66 of 79** in-window sessions (**84 %**). Hooks would improve the residual 16 %, not the majority path — so the majority path shipped first, off `system`/`turn_duration`, with `working_s` untouched at 90. Note this is *not* the threshold change §6.3 sequences: no timer moved. What lands is §7's rank 3 (precise file writes) displacing rank 4 (mtime heuristics) for 84 % of sessions, which §7 itself says is the right order. |
 
-A fourth, softer case: §2.5 specifies `idle_s = 1.0`. At the measured 1.68 CPU-s per sweep that
+A fifth, softer case, on cadence rather than status: §2.5 specifies `idle_s = 1.0`. At the measured 1.68 CPU-s per sweep that
 is **164 % of one core, continuously** — not aggressive, unreachable. It became affordable only
 after the sweep got cheap, and even then costs 43 %.
 

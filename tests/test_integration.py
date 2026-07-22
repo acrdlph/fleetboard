@@ -280,6 +280,172 @@ class TestCollectPipeline(_Fleet):
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")
+class TestTurnEndedIsPositional(_Fleet):
+    """`turn_ended` off real bytes: a `system`/`turn_duration` entry AFTER the
+    last assistant message, not one anywhere in the tail.
+
+    Why the distinction is the whole test class: every completed turn in a
+    session's history leaves a `turn_duration` behind, so "one exists in the
+    128 KB tail" is true of 85 % of in-window transcripts on this machine and
+    says nothing about NOW. Replaying all 79 in-window transcripts entry by
+    entry — each prefix a moment the board could have read the file — the naive
+    rule declares the user's turn while the agent is mid-turn at **912 of 2,244
+    observable moments (40.6 %), in 54 of 79 sessions (68 %)**. That failure is
+    the worst this project has: a working agent reported as needing you.
+    """
+
+    def _proc(self, cmd="claude"):
+        fb.procs.claude_processes = lambda **_: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": cmd, "account": None,
+            "tmux_target": None, "shells": 0}]
+
+    def _tail(self, entries):
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=entries)
+        return fb.transcripts.parse_session_tail(fp)
+
+    def _session(self):
+        fb._cache["state"] = None
+        return fb.collect_state()["worktrees"][0]["sessions"][0]
+
+    def test_a_marker_after_the_last_word_ends_the_turn(self):
+        self.assertTrue(self._tail([
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end()])["turn_ended"])
+
+    def test_a_marker_from_an_EARLIER_turn_does_not(self):
+        """THE WRONG VERSION, pinned. Turn 1 closed; turn 2 is in flight. A
+        rule that only asks 'is there a turn_duration in the tail' says yes
+        here and reports a busy agent as idle."""
+        tail = self._tail([
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            user_msg("now do another"), assistant_msg(text="on it")])
+        self.assertFalse(tail["turn_ended"])
+
+    def test_the_agent_speaking_again_withdraws_the_marker_on_its_own(self):
+        """The one shape that isolates the positional rule. Everything else
+        that follows a closed turn (a human prompt) is withdrawn by a second
+        rule as well, so a naive 'is there a turn_duration in the tail' passes
+        those tests by accident — verified by mutation. Here the agent simply
+        speaks again with no new prompt in between: a background agent
+        reporting back, a hook resuming it, a turn continued after machine text
+        the board refuses to read as a prompt. Only position tells the truth.
+        """
+        tail = self._tail([
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            assistant_msg(text="actually, one more thing")])
+        self.assertFalse(tail["turn_ended"])
+
+    def test_a_marker_before_a_tool_call_does_not(self):
+        # the same shape with the agent's second turn spent in a tool
+        tail = self._tail([
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            user_msg("now do another"), assistant_msg(tool="Bash")])
+        self.assertFalse(tail["turn_ended"])
+
+    def test_a_human_prompt_after_the_marker_withdraws_it(self):
+        # the user has typed and the agent has not spoken yet: the marker is
+        # already stale. Telling them "◆ YOUR TURN" would summon them to the
+        # session they are typing in (FRESHNESS.md §4.2).
+        tail = self._tail([
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            user_msg("now do another")])
+        self.assertFalse(tail["turn_ended"])
+
+    def test_a_slash_stub_after_the_marker_does_not_withdraw_it(self):
+        # "/model opus" is not a prompt and starts no turn — same rule that
+        # keeps it out of `topic`
+        tail = self._tail([
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            user_msg("/model opus")])
+        self.assertTrue(tail["turn_ended"])
+
+    def test_the_bookkeeping_written_after_a_turn_does_not_withdraw_it(self):
+        """Why 'AFTER THE LAST ASSISTANT MESSAGE' and not 'the last entry'.
+
+        The CLI appends its own housekeeping once a turn closes — `last-prompt`,
+        `file-history-snapshot`, `ai-title`, `mode`. Measured on this machine's
+        79 in-window transcripts, `turn_duration` is the LITERAL last entry in
+        2 of them (2.5 %) but the last thing after the agent's final word in 66
+        (84 %). Reading the last line is the analysis error that made this whole
+        signal look useless; a rule that only wins in 2.5 % of sessions is not
+        worth wiring.
+        """
+        tail = self._tail([
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            {"type": "last-prompt", "prompt": "do a thing"},
+            {"type": "file-history-snapshot", "snapshot": {}},
+            {"type": "ai-title", "title": "a thing"}])
+        self.assertTrue(tail["turn_ended"])
+
+    def test_no_marker_at_all_leaves_it_false(self):
+        self.assertFalse(self._tail([
+            user_msg("do a thing"), assistant_msg(text="thinking")])["turn_ended"])
+
+    def test_a_tail_that_says_nothing_claims_nothing(self):
+        # 16 % of in-window sessions carry no marker at all, and a tail can be
+        # bookkeeping end to end (a 128 KB paste, a snapshot flood). The
+        # ABSENCE of evidence must fall through to the clock, never assert the
+        # turn is over — the default is the one place a mistake is invisible.
+        self.assertFalse(self._tail([
+            {"type": "file-history-snapshot", "snapshot": {}},
+            {"type": "system", "subtype": "hook_result"}])["turn_ended"])
+
+    def test_the_counts_on_the_wire_come_from_the_turn_that_ended(self):
+        tail = self._tail([
+            user_msg("delegate"), assistant_msg(text="delegated"),
+            turn_end(pending_bg_agents=2)])
+        self.assertTrue(tail["turn_ended"])
+        self.assertEqual(tail["pending_bg_agents"], 2)
+
+    # ---------------------------------------------------------- end to end
+
+    def test_a_stopped_agent_is_the_users_turn_without_waiting_out_the_window(self):
+        """The user's original complaint, on real bytes: a session that stopped
+        one second ago. The 90 s window used to hold it at ● WORKING."""
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end()])
+        self._proc()
+        s = self._session()
+        self.assertLess(s["age_s"], fb.CFG["working_s"])   # inside the window
+        self.assertEqual(s["status"], "waiting")
+        self.assertTrue(s["turn_ended"])                   # observed, on the wire
+        self.assertEqual(fb.collect_state()["worktrees"][0]["availability"], "attention")
+
+    def test_a_mid_turn_agent_with_an_older_marker_stays_working(self):
+        """The same fresh transcript, one assistant line later. If this ever
+        goes red the board is calling working agents idle."""
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            user_msg("now do another"), assistant_msg(text="on it")])
+        self._proc()
+        s = self._session()
+        self.assertEqual(s["status"], "working")
+        self.assertNotIn("turn_ended", s)      # conditional key: absent = unknown
+        self.assertEqual(fb.collect_state()["worktrees"][0]["availability"], "busy")
+
+    def test_an_agent_that_resumed_after_the_marker_stays_working(self):
+        # same claim, in the shape only POSITION can catch (see
+        # test_the_agent_speaking_again_withdraws_the_marker_on_its_own)
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("do a thing"), assistant_msg(text="done"), turn_end(),
+            assistant_msg(text="one more thing")])
+        self._proc()
+        s = self._session()
+        self.assertEqual(s["status"], "working")
+        self.assertNotIn("turn_ended", s)
+
+    def test_an_ended_turn_awaiting_a_background_agent_stays_working(self):
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("build the lesson"), assistant_msg(text="L88 is building"),
+            turn_end(pending_bg_agents=1)])
+        self._proc()
+        s = self._session()
+        self.assertTrue(s["turn_ended"])
+        self.assertEqual(s["pending_bg_agents"], 1)
+        self.assertEqual(s["status"], "working")
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
 class TestTranscriptMemo(_Fleet):
     """The stat memo underneath scan_sessions, against real files.
 

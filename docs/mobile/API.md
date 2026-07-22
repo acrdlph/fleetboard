@@ -3148,6 +3148,13 @@ excluded from this computation.
 Always an array; absence means the flag is false. Any of these set means the agent is
 genuinely busy even when the transcript has gone quiet — treat it as a veto on "your turn".
 
+`turn_ended` is the one flag that argues the other way, and it is strictly weaker than all of
+them: it means the CLI wrote its own end-of-turn marker after the agent's last word, so this
+session's `waiting` was **observed** rather than decayed out of a timer (84 % of in-window
+sessions carry it). It is already vetoed server-side by every flag above — the server never
+emits `waiting` alongside them — so a client must not re-derive status from it. Its only client
+use is presentation: "◆ YOUR TURN" on evidence versus on a guess.
+
 ### 10.4 `agent.kind`
 
 `tmux`, `terminal`, `iterm`, `editor`, `other`. Only `tmux`, `terminal` and `iterm` can be

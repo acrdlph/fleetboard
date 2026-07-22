@@ -25,6 +25,14 @@ def classify_session(age_s, alive, pending_tools, delegated,
     so a question already written to the transcript was reported as WORKING
     until the 90 s window expired — and if it was answered inside that window,
     NEEDS ANSWER was never shown at all.
+
+    `turn_ended` is the CLI's own end-of-turn marker (`system`/`turn_duration`)
+    seen AFTER the agent's last word — see `transcripts.parse_session_tail`.
+    Measured on the real corpus, 66 of 79 in-window sessions (84 %) carry it,
+    so for five sessions in six this function no longer waits out `working_s`
+    to admit the agent stopped — median lateness removed, the full 90 s. It is
+    deliberately weaker than every positive sign of work above it — see the
+    branch itself.
     """
     pend = pending_tools or []
     age = age_s if evidence_age is None else evidence_age
@@ -42,8 +50,6 @@ def classify_session(age_s, alive, pending_tools, delegated,
 
     if alive and "AskUserQuestion" in pend:  # the question is ON DISK
         return "needs_input", False
-    if alive and turn_ended and not delegated and not pend:
-        return "waiting", False              # provably not mid-turn
     if alive and delegated:                  # awaiting its own workflows or
         return "working", False              # background agents — not the
                                              # user's turn
@@ -58,6 +64,16 @@ def classify_session(age_s, alive, pending_tools, delegated,
         if skip_perms or age < block_grace_s:
             return "working", True
         return "blocked", False
+    if alive and turn_ended:
+        # The CLI wrote its own end-of-turn marker after the agent's last word.
+        # OBSERVED, so no clock is consulted: today this session reads WORKING
+        # for the rest of the 90 s window and the user is told to come back
+        # late. It sits BELOW every positive sign of work above — delegated
+        # workflows/background agents, a live background shell, an unresolved
+        # tool_use — because a turn can end while any of those keep running,
+        # and "the agent is still busy" beats "the turn closed". Above the
+        # clock, below the evidence.
+        return "waiting", False
     if not alive:
         # A fresh write with no observed process is "we have not seen the
         # process yet" (a just-exec'd agent, or a lagging proc-table read) —

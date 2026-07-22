@@ -195,6 +195,62 @@ class TestClassifySession(unittest.TestCase):
         self.assertEqual(st, "needs_input")
 
 
+class TestTurnEndedBeatsTheClock(unittest.TestCase):
+    """The CLI's own end-of-turn marker, wired at last. Until now `turn_ended`
+    defaulted to False and NOTHING passed it, so this branch had never once
+    executed — and a session that stopped kept reporting ● WORKING for the rest
+    of the 90 s window. Measured on the real corpus: 66 of 79 in-window
+    sessions (84 %) carry the marker, so this is the majority path, not an
+    edge case.
+
+    Every test below fixes age_s at 5 s — deep inside `working_s`, where the
+    clock alone would say WORKING — so each one is only ever about the marker.
+    """
+    W = 90
+
+    def test_an_ended_turn_is_the_users_turn_immediately(self):
+        st, tool = fb.classify_session(5, True, [], 0, False, self.W, turn_ended=True)
+        self.assertEqual(st, "waiting")      # would be "working" for 85 s more
+        self.assertFalse(tool)
+
+    def test_without_the_marker_the_clock_still_rules(self):
+        # the control: same inputs, no marker → the old 90 s hysteresis
+        self.assertEqual(fb.classify_session(5, True, [], 0, False, self.W)[0], "working")
+
+    def test_an_ended_turn_awaiting_a_background_agent_is_still_working(self):
+        # the ConfidAi8 case a previous commit fixed: the turn DID end, and the
+        # marker says so, but the harness resumes the session when the agent
+        # reports back. Calling that "needs you" is the regression this pins.
+        st, _ = fb.classify_session(5, True, [], 1, False, self.W, turn_ended=True)
+        self.assertEqual(st, "working")
+
+    def test_an_ended_turn_with_a_live_background_shell_is_still_working(self):
+        # the ConfidAI-ci-cleanup case: "1 shell still running" IS a turn that
+        # ended, so this is the pairing that actually occurs on disk.
+        st, tool = fb.classify_session(5, True, [], 0, False, self.W,
+                                       shells=1, turn_ended=True)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+
+    def test_an_ended_turn_with_an_unresolved_tool_is_not_the_users_turn(self):
+        # an interrupted turn leaves a tool_use with no tool_result and then a
+        # turn_duration. Positive evidence of work outranks the marker.
+        st, tool = fb.classify_session(5, True, ["Bash"], 0, True, self.W, turn_ended=True)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+        st, _ = fb.classify_session(200, True, ["Bash"], 0, False, self.W, turn_ended=True)
+        self.assertEqual(st, "blocked")
+
+    def test_a_pending_question_outranks_an_ended_turn(self):
+        st, _ = fb.classify_session(5, True, ["AskUserQuestion"], 0, False, self.W,
+                                    turn_ended=True)
+        self.assertEqual(st, "needs_input")
+
+    def test_an_ended_turn_never_revives_a_dead_session(self):
+        st, _ = fb.classify_session(200, False, [], 0, False, self.W, turn_ended=True)
+        self.assertEqual(st, "ended")
+
+
 class TestCloseoutStep(unittest.TestCase):
     """Step two (✕ close) when the landing won't verify — the pure decision
     that breaks the idle-agent / refusing-forever deadlock. One assertion per

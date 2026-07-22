@@ -98,6 +98,17 @@ it — and never records **that it was last**. Sampled across the 71 in-window t
 machine, `system/turn_duration` is the terminal non-sidechain entry in **40 of them (56 %)**.
 Those sessions are provably not mid-turn, and the classifier guesses from mtime for every one.
 
+> **Correction (step 5 phase 1, re-measured on 79 in-window transcripts).** The 56 % above is
+> wrong, and so is the question it answers. `turn_duration` is the **literal last entry** in
+> **2 of 79 (2.5 %)** — the CLI appends `last-prompt`, `file-history-snapshot`, `ai-title`,
+> `mode` and friends *after* a turn closes. The question that matters is whether the marker
+> appears **after the last assistant message**, which is **66 of 79 (84 %)**. A rule written to
+> the 56 % figure would have been built on a number that was neither of these. `turn_ended` is
+> implemented positionally against the assistant stream — never "the last line", never "a
+> `turn_duration` somewhere in the tail" (that one is true of 85 % of tails and says nothing
+> about now: replayed entry by entry it declares the user's turn while the agent is mid-turn at
+> **912 of 2,244 observable moments, 40.6 %**).
+
 ### 1.3 The framing: latency, hysteresis, ambiguity
 
 This is the most important paragraph in the document. "Status is laggy" is three different

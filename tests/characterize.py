@@ -66,12 +66,18 @@ def load_orchestra():
 # ------------------------------------------------------------------ input space
 
 def _classify_inputs():
+    # `turn_ended` joined the product when it stopped being dead code (the CLI's
+    # own end-of-turn marker, read positionally). It doubles the space to 2,880
+    # because it interacts with EVERY other axis: it must lose to delegated
+    # work, to a live shell and to an unresolved tool_use, and it must never
+    # revive a session with no process. Those are exactly the compositions a
+    # later refactor can break silently.
     ages = [0, 1, 5, 19, 20, 59, 60, 89, 90, 91, 200, 3600]
     pends = [[], ["AskUserQuestion"], ["Bash"], ["Read", "Bash"], ["AskUserQuestion", "Bash"]]
-    for age, alive, pend, deleg, skip, shells in itertools.product(
-            ages, [True, False], pends, [0, 1, 3], [True, False], [0, 1]):
+    for age, alive, pend, deleg, skip, shells, ended in itertools.product(
+            ages, [True, False], pends, [0, 1, 3], [True, False], [0, 1], [False, True]):
         yield dict(age_s=age, alive=alive, pending_tools=pend, delegated=deleg,
-                   skip_perms=skip, working_s=90, shells=shells)
+                   skip_perms=skip, working_s=90, shells=shells, turn_ended=ended)
 
 
 def _closeout_inputs():
@@ -275,6 +281,10 @@ def _fixture_fleet(mod, tmp):
     home = tmp / ".claude"
     # gamma's transcript is backdated: in-window but long idle, so it lands on a
     # different status to alpha/beta and the severity sort has something to sort.
+    # beta's turn is CLOSED (a `turn_duration` after its last word) and alpha's
+    # is not, so the payload pins the `turn_ended` wire key both ways — present
+    # only when observed — and pins that the marker alone never resurrects a
+    # session with no live process.
     for name in ("alpha", "beta", "gamma"):
         cwd = root / name
         proj = home / "projects" / mod.munge(str(cwd))
@@ -285,7 +295,9 @@ def _fixture_fleet(mod, tmp):
             {"type": "assistant", "cwd": str(cwd),
              "message": {"model": "claude-opus-4-8",
                          "content": [{"type": "text", "text": f"working on {name}"}]}},
-        ]) + "\n")
+        ] + ([{"type": "system", "subtype": "turn_duration", "cwd": str(cwd),
+               "durationMs": 1000, "pendingWorkflowCount": 0,
+               "pendingBackgroundAgentCount": 0}] if name == "beta" else [])) + "\n")
         if name == "gamma":
             old = 1784600000.0          # fixed, well inside the 48h window
             os.utime(proj / f"sess-{name}.jsonl", (old, old))

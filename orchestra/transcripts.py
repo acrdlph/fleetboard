@@ -389,17 +389,29 @@ def parse_session_tail(fp):
 
     out = {"cwd": None, "branch": None, "model": None, "pending_tools": [],
            "last_assistant": None, "last_user": None, "pending_workflows": 0,
-           "pending_bg_agents": 0}
+           "pending_bg_agents": 0, "turn_ended": False}
     pending = {}  # tool_use id -> tool name
     for e in main:
         out["cwd"] = e.get("cwd") or out["cwd"]
         out["branch"] = e.get("gitBranch") or out["branch"]
         if e.get("type") == "system" and e.get("subtype") == "turn_duration":
+            # POSITIONAL, not "a turn_duration exists somewhere in the tail":
+            # every completed turn in history leaves one, so the mere presence
+            # of the record is true almost always and would report a busy agent
+            # as idle — the worst failure this board can have. `turn_ended` is
+            # about the LATEST turn only, so a later `assistant` entry (the
+            # agent speaking again) clears it below.
+            out["turn_ended"] = True
             # a turn that ended still awaiting workflows or background agents
             # ("✻ Waiting for 1 background agent to finish") is NOT the user's
-            # turn — the harness resumes the session when they report back
+            # turn — the harness resumes the session when they report back.
+            # These ride the same entry, so whenever `turn_ended` survives to
+            # the end of the loop these two counts describe THAT turn, not a
+            # stale one.
             out["pending_workflows"] = e.get("pendingWorkflowCount") or 0
             out["pending_bg_agents"] = e.get("pendingBackgroundAgentCount") or 0
+        elif e.get("type") == "assistant":
+            out["turn_ended"] = False    # the agent is talking again
         msg = e.get("message")
         if not isinstance(msg, dict):
             continue
@@ -412,6 +424,15 @@ def parse_session_tail(fp):
                 prompt = _real_prompt(t)
                 if prompt:
                     out["last_user"] = prompt
+                    # …and a human who has just typed is NOT waiting on
+                    # themselves. The marker is stale from the moment the next
+                    # prompt lands, seconds before the agent's first token —
+                    # calling that "◆ YOUR TURN" would summon the user to the
+                    # session they are typing in. FRESHNESS.md §4.2 resets the
+                    # turn marker on "any later assistant / tool_result / human
+                    # prompt"; this is the third of those. It can only ever
+                    # WITHDRAW a claim of idleness, never make one.
+                    out["turn_ended"] = False
         if e.get("type") == "assistant":
             model = msg.get("model")
             if model and model != "<synthetic>":
@@ -552,6 +573,7 @@ def _read_facts(fp):
             "pending_tools": tuple(tail["pending_tools"]),
             "pending_workflows": tail["pending_workflows"],
             "pending_bg_agents": tail["pending_bg_agents"],
+            "turn_ended": tail["turn_ended"],
             "last_assistant": tail["last_assistant"],
             "last_user": tail["last_user"] or find_last_user(fp),
             "topic": session_topic(fp)}
@@ -689,6 +711,12 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                     "subagent_said": subagent_said,
                     "subagents_active": bool(sub_mtime and now - sub_mtime < config.CFG["working_s"]),
                 })
+                if tail["turn_ended"]:
+                    # conditional, like tool_running/bg_shell: present means
+                    # "the CLI wrote an end-of-turn marker after the agent's
+                    # last word", i.e. this status was OBSERVED and not decayed
+                    # out of the 90 s window. Absent says nothing either way.
+                    by_wt[wt][-1]["turn_ended"] = True
 
     # §4.7. The LRU cap is the hard bound; this is the one that matters in
     # practice, because the corpus grows ~982 .jsonl/day and a file that has
@@ -724,7 +752,8 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
             sess_status, tool_running = status.classify_session(
                 s["age_s"], alive, s["pending_tools"],
                 s["pending_workflows"] + s["pending_bg_agents"],
-                skip_perms, config.CFG["working_s"], shell_n)
+                skip_perms, config.CFG["working_s"], shell_n,
+                turn_ended=s.get("turn_ended", False))
             s["status"] = sess_status
             if tool_running:
                 s["tool_running"] = True
