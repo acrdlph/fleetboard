@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>orchestra — devices</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2224%22 fill=%22%230d0d0d%22/><text x=%2250%22 y=%2272%22 font-size=%2260%22 text-anchor=%22middle%22 fill=%22%23d97757%22 font-family=%22monospace%22>⌁</text></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+/* Same tokens as the rest of the board — one system, four pages. */
+:root {
+  --bg:#0d0d0d; --bg-2:#111111; --surface:#161616; --surface-2:#1c1c1c;
+  --border:#2a2a2a; --border-2:#3a3a3a;
+  --fg:#e8e6e3; --muted:#8a8784; --muted-2:#6a6764;
+  --accent:#d97757; --accent-2:#e8a87c; --green:#87b386; --cyan:#7fb3c8;
+  --yellow:#d4b06a; --red:#c9756a;
+  --mono:"IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --fs-2xs:10px; --fs-xs:11px; --fs-sm:12px; --fs-md:13px; --fs-lg:14px;
+  --fs-xl:18px; --fs-2xl:26px;
+  --track:.08em; --ease:cubic-bezier(0.22,1,0.36,1);
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html { background:var(--bg); }
+body {
+  font-family:var(--mono); font-size:var(--fs-md); line-height:1.5; color:var(--fg);
+  background:
+    radial-gradient(1100px 480px at 80% -10%, rgba(217,119,87,.05), transparent 60%),
+    var(--bg);
+  min-height:100vh; padding-bottom:60px; -webkit-font-smoothing:antialiased;
+}
+.wrap { max-width:1500px; margin-inline:auto; padding-inline:22px; }
+header {
+  position:sticky; top:0; z-index:10;
+  background:color-mix(in oklab, var(--bg) 86%, transparent);
+  backdrop-filter:blur(8px); border-bottom:1px solid var(--border);
+}
+.nav { display:flex; align-items:center; justify-content:space-between; height:52px; gap:16px; }
+.brand { font-weight:600; white-space:nowrap; }
+.brand .prompt { color:var(--accent); }
+.brand .path { color:var(--cyan); }
+.side { position:fixed; left:0; top:52px; bottom:0; width:118px; z-index:9;
+  padding:16px 10px; display:flex; flex-direction:column; gap:5px;
+  border-right:1px solid var(--border); background:var(--bg-2); }
+.side a { color:var(--muted); text-decoration:none; font-size:var(--fs-sm); font-weight:500;
+  padding:8px 12px; border-radius:7px; display:flex; gap:9px; align-items:baseline;
+  transition:color .2s var(--ease), background .2s var(--ease); }
+.side a .g { color:var(--muted-2); }
+.side a:hover { color:var(--fg); background:var(--surface); }
+.side a.active { color:var(--fg); background:var(--surface); box-shadow:inset 2px 0 0 var(--accent); }
+.side a.active .g { color:var(--accent); }
+.content { margin-left:118px; }
+@media (max-width:860px) {
+  .side { position:static; width:auto; flex-direction:row; border-right:none;
+    border-bottom:1px solid var(--border); padding:8px 22px; }
+  .content { margin-left:0; }
+}
+
+h1 { font-size:var(--fs-xl); font-weight:600; margin:26px 0 4px; }
+h2 { font-size:var(--fs-lg); font-weight:600; margin:0 0 12px; }
+.sub { color:var(--muted); font-size:var(--fs-sm); margin-bottom:22px; max-width:66ch; }
+.cols { display:grid; grid-template-columns:340px 1fr; gap:22px; align-items:start; }
+@media (max-width:920px) { .cols { grid-template-columns:1fr; } }
+
+.card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:18px; }
+
+button, .btn {
+  font:inherit; font-size:var(--fs-sm); font-weight:600; color:var(--accent);
+  background:var(--bg-2); border:1px solid var(--accent); border-radius:7px;
+  padding:7px 14px; cursor:pointer; transition:all .15s var(--ease);
+}
+button:hover:not(:disabled) { background:var(--accent); color:var(--bg); }
+button:disabled { opacity:.45; cursor:default; border-color:var(--border-2); color:var(--muted); }
+button.ghost { color:var(--muted); border-color:var(--border-2); }
+button.ghost:hover { background:var(--surface-2); color:var(--fg); }
+button.danger { color:var(--red); border-color:var(--red); }
+button.danger:hover { background:var(--red); color:var(--bg); }
+
+/* ---- the QR ---- */
+#qrbox { display:none; text-align:center; }
+#qrbox.on { display:block; }
+#qr svg { width:100%; max-width:280px; height:auto; border-radius:8px; display:block; margin:0 auto; }
+.code { font-size:var(--fs-2xl); font-weight:700; letter-spacing:.10em;
+  color:var(--accent-2); margin:14px 0 2px; }
+.codehint { color:var(--muted); font-size:var(--fs-xs); }
+.ttl { margin-top:12px; height:4px; border-radius:2px; background:var(--surface-2); overflow:hidden; }
+.ttl i { display:block; height:100%; background:var(--accent); transition:width 1s linear; }
+.ttlt { color:var(--muted); font-size:var(--fs-xs); margin-top:6px; }
+.manual { margin-top:14px; text-align:left; font-size:var(--fs-xs); color:var(--muted);
+  border-top:1px solid var(--border); padding-top:12px; }
+.manual b { color:var(--fg); font-weight:600; }
+.manual div { margin-top:3px; }
+
+/* ---- devices ---- */
+table { width:100%; border-collapse:collapse; font-size:var(--fs-sm); }
+th { text-align:left; color:var(--muted-2); font-weight:500; font-size:var(--fs-2xs);
+  text-transform:uppercase; letter-spacing:var(--track); padding:0 10px 8px 0; }
+td { padding:10px 10px 10px 0; border-top:1px solid var(--border); vertical-align:middle; }
+td.id { color:var(--cyan); }
+.pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:var(--fs-2xs);
+  font-weight:600; letter-spacing:var(--track); text-transform:uppercase; }
+.pill.active { color:var(--green); background:rgba(135,179,134,.12); }
+.pill.revoked { color:var(--red); background:rgba(201,117,106,.12); }
+.empty { color:var(--muted); font-size:var(--fs-sm); padding:18px 0; }
+
+.note { color:var(--muted); font-size:var(--fs-xs); margin-top:16px; max-width:74ch; line-height:1.7; }
+.note b { color:var(--fg); }
+.err { color:var(--red); font-size:var(--fs-sm); margin-top:12px; min-height:1.5em; }
+.ok { color:var(--green); }
+</style>
+</head>
+<body>
+<header><div class="wrap nav">
+  <div class="brand"><span class="prompt">fleet</span><span class="path">:~</span><span class="prompt">$</span> ./orchestra --devices</div>
+</div></header>
+
+<nav class="side">
+  <a href="/"><span class="g">⌗</span>board</a>
+  <a href="/map"><span class="g">⌁</span>map</a>
+  <a href="/limits"><span class="g">◔</span>limits</a>
+  <a href="/pair" class="active"><span class="g">⚿</span>devices</a>
+  <a href="/guide"><span class="g">?</span>guide</a>
+</nav>
+
+<div class="wrap content">
+  <h1>⚿ devices</h1>
+  <p class="sub">Every device that can reach this fleet from off this Mac, and how to add
+  one. The code below is <b>not</b> the token — it is a 120-second, single-use ticket that
+  a phone exchanges for one. That is why it is safe to have on screen.</p>
+
+  <div class="cols">
+    <div class="card">
+      <h2>pair a device</h2>
+      <div id="qrbox">
+        <div id="qr"></div>
+        <div class="code" id="code"></div>
+        <div class="codehint">point a camera at the code, or type this</div>
+        <div class="ttl"><i id="ttlbar"></i></div>
+        <div class="ttlt" id="ttlt"></div>
+        <div class="manual" id="manual"></div>
+      </div>
+      <div id="idle">
+        <p class="sub" style="margin:0 0 14px">No pairing window is open.</p>
+      </div>
+      <div style="margin-top:14px; display:flex; gap:8px;">
+        <button id="openBtn" onclick="openWindow()">＋ pair a device</button>
+        <button class="ghost" id="closeBtn" onclick="closeWindow()" style="display:none">cancel</button>
+      </div>
+      <div class="err" id="err"></div>
+    </div>
+
+    <div class="card">
+      <h2>paired devices</h2>
+      <div id="devices"><div class="empty">loading…</div></div>
+      <p class="note">
+        <b>Revoking is immediate and permanent.</b> The token stops working on the next
+        request — including one already in flight on a stream — and cannot be un-revoked;
+        pairing again mints a new one. That is deliberately what a lost phone costs.
+        <br><br>
+        This page answers to <b>this Mac only</b>. A paired device presenting a perfectly
+        valid token gets <code>403</code> here, because a device that could revoke devices
+        could revoke the one that would have revoked it.
+      </p>
+    </div>
+  </div>
+</div>
+
+<script>
+// Every request is same-origin from the Mac, so it carries no token and needs
+// none — loopback is trusted (ADR 0014). It DOES need the JSON content type:
+// that is the CSRF guard, and a POST without it is refused with 415.
+const POST = (path, body) => fetch(path, {
+  method: "POST",
+  headers: {"Content-Type": "application/json"},
+  body: JSON.stringify(body || {})
+}).then(async r => ({status: r.status, data: await r.json().catch(() => ({}))}));
+
+const $ = id => document.getElementById(id);
+let ticking = null, expiresAt = 0, windowLen = 120;
+
+function say(message, good) {
+  $("err").textContent = message || "";
+  $("err").className = "err" + (good ? " ok" : "");
+}
+
+async function openWindow() {
+  say("");
+  $("openBtn").disabled = true;
+  const {status, data} = await POST("/api/v1/devices/pair/open");
+  $("openBtn").disabled = false;
+  if (status !== 200 || !data.ok) {
+    say(data.message || ("could not open a pairing window (" + status + ")"));
+    return;
+  }
+  // The SVG is built on the server from the SAME string that is encoded into
+  // the QR, so the picture and the manual fields below it cannot disagree.
+  $("qr").innerHTML = data.svg;
+  $("code").textContent = data.code;
+  $("manual").innerHTML =
+    "<b>if the camera will not focus, type these</b>" +
+    "<div>host &nbsp;" + esc(data.manual.host) + "</div>" +
+    "<div>port &nbsp;" + esc(String(data.manual.port)) + "</div>" +
+    "<div>code &nbsp;" + esc(data.manual.code) + "</div>";
+  windowLen = data.expires_in || 120;
+  expiresAt = Date.now() + windowLen * 1000;
+  $("qrbox").classList.add("on");
+  $("idle").style.display = "none";
+  $("closeBtn").style.display = "";
+  $("openBtn").textContent = "↻ new code";
+  tick();
+  poll();
+}
+
+async function closeWindow() {
+  await POST("/api/v1/devices/pair/close");
+  stop("cancelled.");
+}
+
+function stop(message) {
+  clearInterval(ticking); ticking = null; expiresAt = 0;
+  $("qrbox").classList.remove("on");
+  $("idle").style.display = "";
+  $("closeBtn").style.display = "none";
+  $("openBtn").textContent = "＋ pair a device";
+  if (message) say(message, message.indexOf("paired") === 0);
+  load();
+}
+
+function tick() {
+  clearInterval(ticking);
+  const render = () => {
+    const left = Math.max(0, (expiresAt - Date.now()) / 1000);
+    $("ttlbar").style.width = (left / windowLen * 100) + "%";
+    $("ttlt").textContent = left > 0
+      ? "expires in " + Math.ceil(left) + "s · single use"
+      : "expired";
+    if (left <= 0) stop("that code expired. Open another.");
+  };
+  render();
+  ticking = setInterval(render, 1000);
+}
+
+// While a window is open, watch for it being claimed so the page can say so
+// rather than leaving a dead QR on screen. Two seconds is a human's patience,
+// not a machine's: nothing else on this page moves.
+async function poll() {
+  while (expiresAt) {
+    await new Promise(r => setTimeout(r, 2000));
+    if (!expiresAt) return;
+    const r = await fetch("/api/v1/devices").then(x => x.json()).catch(() => null);
+    if (!r || !r.ok) continue;
+    render(r.devices);
+    if (r.pairing && r.pairing.claimed) { stop("paired. The device is listed."); return; }
+  }
+}
+
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const ago = t => {
+  if (!t) return "never";
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  if (s < 172800) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+};
+
+function render(devices) {
+  if (!devices || !devices.length) {
+    $("devices").innerHTML =
+      '<div class="empty">No device is paired, so nothing off this Mac can reach the ' +
+      'fleet — and the server will refuse to bind the tailnet at all.</div>';
+    return;
+  }
+  const rows = devices.map(d => {
+    const revoked = !!d.revoked;
+    return "<tr>" +
+      '<td class="id">' + esc(d.id) + "</td>" +
+      "<td>" + esc(d.label) + "</td>" +
+      '<td><span class="pill ' + (revoked ? "revoked" : "active") + '">' +
+        (revoked ? "revoked" : "active") + "</span></td>" +
+      "<td>" + ago(d.last_seen) + "</td>" +
+      "<td>" + ago(d.created) + "</td>" +
+      "<td>" + (revoked ? "" :
+        '<button class="danger" onclick="revoke(\'' + esc(d.id) + "','" +
+        esc(d.label).replace(/'/g, "\\'") + '\')">revoke</button>') + "</td>" +
+      "</tr>";
+  }).join("");
+  $("devices").innerHTML =
+    "<table><thead><tr><th>id</th><th>label</th><th>state</th>" +
+    "<th>last seen</th><th>paired</th><th></th></tr></thead><tbody>" +
+    rows + "</tbody></table>";
+}
+
+async function revoke(id, label) {
+  if (!confirm("Revoke " + label + " (" + id + ")?\n\n" +
+               "Its token stops working immediately and cannot be restored.")) return;
+  const {status, data} = await POST("/api/v1/devices/" + encodeURIComponent(id) + "/revoke");
+  if (status !== 200 || !data.ok) { say(data.message || ("revoke failed (" + status + ")")); return; }
+  say("revoked " + label + ".", true);
+  load();
+}
+
+async function load() {
+  const r = await fetch("/api/v1/devices").then(x => x.json()).catch(() => null);
+  if (!r || !r.ok) {
+    $("devices").innerHTML =
+      '<div class="empty">This page answers to the Mac itself. If you are seeing this ' +
+      'from another device, that is the point.</div>';
+    return;
+  }
+  render(r.devices);
+}
+
+load();
+</script>
+</body>
+</html>

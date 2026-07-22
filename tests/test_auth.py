@@ -321,8 +321,16 @@ class TestTheRule(AuthCase):
 
     # --- exempt routes
 
-    def test_health_is_the_only_exempt_route(self):
-        self.assertEqual(fb.auth.EXEMPT, frozenset({("GET", "/api/health")}))
+    def test_exactly_two_routes_are_exempt_and_these_are_they(self):
+        """The list is pinned whole, so growing it is a deliberate edit here.
+
+        `GET /api/health` is the route you need BEFORE you have a token.
+        `POST /api/v1/pair` is the route that GIVES you one. There is no third,
+        and the two candidates that keep looking reasonable — the static pages
+        and `/api/state` — are refused in `TestTheRule` below.
+        """
+        self.assertEqual(fb.auth.EXEMPT, frozenset({
+            ("GET", "/api/health"), ("POST", "/api/v1/pair")}))
 
     def test_health_answers_a_stranger(self):
         self.assertTrue(self.check(TAILNET, None, "GET", "/api/health").ok)
@@ -336,11 +344,44 @@ class TestTheRule(AuthCase):
     def test_exemption_is_per_method(self):
         self.assertFalse(self.check(TAILNET, None, "POST", "/api/health").ok)
 
-    def test_nothing_that_reads_transcripts_or_acts_is_exempt(self):
+    def test_nothing_that_reads_transcripts_is_exempt(self):
         for method, path in fb.auth.EXEMPT:
             self.assertNotIn(path, ("/api/state", "/api/chat", "/api/events"))
-            self.assertEqual(method, "GET")
-            self.assertFalse(fb.auth.audited(method, path))
+
+    def test_the_one_exempt_mutation_is_pairing_and_it_is_audited(self):
+        """An unauthenticated POST is allowed to exist exactly once.
+
+        `/api/v1/pair` hands out a credential, which is the most consequential
+        thing on this server — so the rule is not "exempt routes do not act"
+        (that stopped being true) but "the one that does is written down every
+        time it is asked". `audited` is what guarantees the log line.
+        """
+        mutations = [(m, p) for m, p in fb.auth.EXEMPT if m != "GET"]
+        self.assertEqual(mutations, [("POST", "/api/v1/pair")])
+        for method, path in fb.auth.EXEMPT:
+            if method == "GET":
+                self.assertFalse(fb.auth.audited(method, path), path)
+            else:
+                self.assertTrue(fb.auth.audited(method, path), path)
+
+    def test_an_exempt_mutation_still_faces_the_cross_site_guards(self):
+        """Exempt means NO TOKEN REQUIRED, not NO CHECKS.
+
+        This is the hole that opened for ten minutes when pairing was added:
+        the exempt branch returned before `browser_guards` ran, so a page you
+        were merely visiting could have posted a `text/plain` pairing claim
+        from your browser with no preflight to stop it.
+        """
+        self.assertFalse(self.check(TAILNET, None, "POST", "/api/v1/pair",
+                                    content_type="text/plain").ok)
+        self.assertEqual(self.check(TAILNET, None, "POST", "/api/v1/pair",
+                                    content_type="text/plain").code,
+                         fb.auth.NOT_JSON)
+        self.assertFalse(self.check("127.0.0.1", None, "POST", "/api/v1/pair",
+                                    origin="http://evil.example",
+                                    host="127.0.0.1:4242").ok)
+        # …and with the header a real client sends, it is allowed through.
+        self.assertTrue(self.check(TAILNET, None, "POST", "/api/v1/pair").ok)
 
 
 # ------------------------------------------- a page you are visiting is not you
@@ -796,11 +837,31 @@ class TestEveryRouteIsGuarded(WireCase):
             self.assertIn(landmark, routes)
 
     def test_every_route_is_exempt_by_list_or_refuses_a_stranger(self):
+        """The claim, per route: refused, or exempt and answering on its merits.
+
+        An exempt route is not asserted to return 200 — `POST /api/v1/pair`
+        legitimately answers `409 pairing_not_open` when no window is open,
+        which is it working. What is asserted is that the answer is not an
+        AUTHENTICATION refusal: no 401, no `WWW-Authenticate`, and no code from
+        `auth`'s own refusal vocabulary. That keeps the test strong while
+        letting the route say something true.
+        """
+        refusals = {fb.auth.NO_TOKEN, fb.auth.MALFORMED, fb.auth.UNKNOWN,
+                    fb.auth.REVOKED, fb.auth.RATE_LIMITED, fb.auth.UNAVAILABLE,
+                    fb.auth.CROSS_ORIGIN, fb.auth.NOT_JSON,
+                    fb.auth.ADMIN_ONLY}
         for method, path in sorted(routes_from_handler()):
             fb.auth._reset_buckets()       # the budget is not what is on trial
-            status, _, _ = self.request(method, path)
+            body = "{}" if method != "GET" else None
+            status, blob, headers = self.request(method, path, body=body)
             if fb.auth.exempt(method, path):
-                self.assertEqual(status, 200, f"{method} {path}")
+                self.assertNotEqual(status, 401, f"{method} {path}")
+                self.assertNotIn("WWW-Authenticate", headers, f"{method} {path}")
+                try:
+                    code = json.loads(blob).get("error")
+                except ValueError:
+                    code = None
+                self.assertNotIn(code, refusals, f"{method} {path}")
             else:
                 self.assertEqual(status, 401, f"{method} {path}")
 
@@ -888,6 +949,13 @@ class TestTheSourceRules(unittest.TestCase):
                         "compare_digest is called, but not on the token hash")
 
     def test_nothing_here_reaches_for_random(self):
+        """Imports AND the call site.
+
+        An import check alone is defeated by `__import__('random')`, which is
+        not a hypothetical: the same test on `pairing.py` was written that way
+        first and a mutation walked straight past it. So every call that draws
+        a random value is required to be an attribute of the NAME `secrets`.
+        """
         names = set()
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Import):
@@ -896,6 +964,17 @@ class TestTheSourceRules(unittest.TestCase):
                 names.add(node.module.split(".")[0])
         self.assertIn("secrets", names)
         self.assertNotIn("random", names)
+
+        draws = [n for n in ast.walk(self.tree)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "attr", "") in
+                 ("token_hex", "token_urlsafe", "token_bytes", "choice",
+                  "randint", "random", "randrange", "shuffle", "sample")]
+        self.assertTrue(draws, "nothing in auth.py draws a random value")
+        for call in draws:
+            self.assertIsInstance(call.func.value, ast.Name)
+            self.assertEqual(call.func.value.id, "secrets",
+                             f"{call.func.attr} is not drawn from `secrets`")
 
 
 # -------------------------------------------------------------------- the bind

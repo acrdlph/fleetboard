@@ -184,9 +184,23 @@ is guaranteed to 429.
 > audit log of every mutation and every refusal.
 >
 > **Not built:** scopes (§2.2 — one token grants everything, and a `read` token that cannot act
-> is not the product yet), pairing (§3 — tokens are minted at a shell), the `Host` allowlist
-> (§2.3 step 2), tailnet whois (step 8), lockdown (step 7), idempotency (step 10), per-device
-> buckets. Each is listed with its reason in ADR 0014; none of them was the missing one.
+> is not the product yet), the `Host` allowlist (§2.3 step 2), tailnet whois (step 8), lockdown
+> (step 7), idempotency (step 10), per-device buckets. Each is listed with its reason in ADR
+> 0014; none of them was the missing one.
+
+> **Updated 2026-07-22 — pairing and the device routes SHIP** ([ADR 0015](adr/0015-pairing-and-the-tailnet-bind.md),
+> `orchestra/pairing.py`, `orchestra/qr.py`, `orchestra/tailnet.py`). `/api/v1` now exists, and
+> these five routes are what is on it. §3 below is rewritten to match what was built; §3.5 and
+> §3.6 (certificate pinning, ATS) are struck through, because ADR 0013 removed TLS from this
+> server and there is no certificate to pin.
+>
+> The exempt list is now **two** routes — `GET /api/health` and `POST /api/v1/pair` — and
+> "exempt" means *no token required*, not *no checks*: the `Origin` and `Content-Type` guards
+> still run on both.
+>
+> `admin` in §2.5's scope map is implemented **without scopes**, as a stronger rule that needs
+> none: **device management answers to this machine holding no token.** A valid device token
+> presented to any route under `/api/v1/devices` is `403 admin_local_only` — see §2.5a.
 
 ### 2.1 Token format
 
@@ -261,6 +275,13 @@ Every `/api/v1/` request passes these checks in this exact order. The first fail
 
 Everything else requires a token, including `GET /api/v1/meta`.
 
+**Exempt means no TOKEN is required. It does not mean no checks.** Both of these still face the
+`Origin` rule and, for the mutation, the `Content-Type: application/json` requirement of §2.3
+step 3 — without which a page you are merely visiting could post a pairing claim from your
+browser with no preflight to stop it. As built the list is exactly
+`{("GET", "/api/health"), ("POST", "/api/v1/pair")}` and it is pinned whole by a test, so
+growing it is a deliberate edit rather than a drift.
+
 ### 2.5 Scope map (complete)
 
 | Method + path | Scope |
@@ -300,6 +321,48 @@ Everything else requires a token, including `GET /api/v1/meta`.
 | `POST /api/v1/devices/{id}/approve-act` | **admin** |
 | `POST /api/v1/devices/lockdown`, `/unlock` | **admin** |
 
+### 2.5a `admin` without scopes — the local-only rule
+
+Scopes (§2.2) are still not built. Rather than invent half of the ladder for one route, the
+`admin` rows of §2.5 are implemented as a rule that needs no ladder at all and is strictly
+stronger than the one they describe:
+
+> **Device management answers to this machine, holding no token.**
+
+| caller | `/api/v1/devices…` |
+|---|---|
+| loopback, no `Authorization` header (the board) | allowed |
+| tailnet, no token | `401 unauthorized` — authentication is decided first, so a stranger learns nothing about which routes are special |
+| tailnet, **valid** token | `403 admin_local_only` |
+| loopback, **valid** token | `403 admin_local_only` — the rule is the absence of a token, not the address, so a proxy that makes every peer loopback (§2.7) does not open it |
+
+A `403 admin_local_only` does **not** spend from the per-IP failure budget: the caller is a
+known device making a legitimate mistake, and charging it would let a buggy app lock its own
+phone out of the API it is entitled to.
+
+Matched by **prefix** on `/api/v1/devices`, at a path-segment boundary — `/api/v1/devices`,
+`/api/v1/devices/…`, but not `/api/v1/devices-of-others`. The asymmetry against §2.4's exact
+matching is one-directional and in the safe direction: a path this list matches too eagerly is
+a refusal, never a hole. `POST /api/v1/pair` is deliberately **not** under this prefix.
+
+When scopes do arrive, this becomes `scope == admin` and nothing else about the surface changes.
+
+### 2.5b The bind, and the two listeners
+
+`--tailnet` detects this machine's Tailscale address rather than asking for it, and **refuses to
+start** if Tailscale is not up, saying which of the three situations it is (not installed / not
+up / will not bind). `--host <addr>` still takes an explicit address. `0.0.0.0` is refused
+through `--host` whatever the registry says; the escape hatch is the differently-named
+`--bind-every-interface`, which cannot be set from the config file. **No bind beyond loopback
+succeeds with no device registered**, including the wide one.
+
+A non-loopback bind starts a **second listener on `127.0.0.1`**, and this is load-bearing rather
+than convenient. A server bound only to `100.113.110.31` is not listening on loopback, so the
+board's own pages are refused — and a request the Mac sends to its own tailnet address arrives
+with a source address of `100.113.110.31`, which is not loopback and never can be, so §2.5a
+would lock the person at the keyboard out of device management entirely. The tailnet listener
+carries the phone; the loopback listener carries the board.
+
 ### 2.6 What the tailnet does and does not protect
 
 Stated plainly so nobody over-trusts it:
@@ -329,172 +392,215 @@ tailnet node. Do not do half of it.
 
 ## 3. Pairing
 
+> **Built, 2026-07-22** — `orchestra/pairing.py`, `orchestra/qr.py`. This section was written
+> against the TLS design that [ADR 0013](adr/0013-plain-http-over-the-tailnet.md) replaced, and
+> has been rewritten to describe what ships. The differences from the original draft, so that
+> anyone holding the old version knows what moved:
+>
+> | was | is | why |
+> |---|---|---|
+> | `f=<spki pin>` in the QR | **gone** | there is no TLS and therefore no certificate to pin (ADR 0013). A pin field would be a field the client must ignore |
+> | two tokens per device (`read`, `act`) | **one** `token` | scopes are deferred whole (§2.2, ADR 0014). Returning the same string twice under two names would be a lie about what exists |
+> | `server.spki`, `server.cert_not_after` | **absent**, plus `server.tls: false` | sending them as nulls invites a client to pin against nothing |
+> | §3.5 certificate pinning, §3.6 ATS | **struck through** below | same reason |
+
 ### 3.1 Flow
 
 ```
-Mac (board /pair, or `python3 -m orchestra --pair`)      iPhone
-──────────────────────────────────────────────────      ──────
-1. admin taps "＋ pair a device"
+Mac — the board at http://127.0.0.1:4242/pair            iPhone
+──────────────────────────────────────────────           ──────
+1. open /pair (loopback only — §2.5a)
 2. POST /api/v1/devices/pair/open
-   → 8-char Crockford code, 120 s TTL, single use
-3. QR + manual fields rendered on screen
-                                                        4. app opens camera, scans QR
-                                                        5. TLS connect to h:p, pin from `f`
-                                                        6. POST /api/v1/pair {code,label,platform}
-7. validates window / peer range / per-IP attempts
-8. mints read+act tokens, writes the registry,
-   pins tailnet_allow_logins if unset
-                                                        9. stores both tokens in Keychain
-10. pairing closes                                      11. verifies the pin, shows it for
-                                                            visual comparison
+   → 8-char Crockford code, 120 s, single use
+   → QR as SVG, rendered from the same string
+3. the QR is on screen                                   4. camera scans it
+                                                         5. POST /api/v1/pair {code,label,platform}
+6. peer range → window → attempts → code
+7. mints ONE token, writes the registry,
+   closes the window
+                                                         8. stores the token in the Keychain
+9. the page sees `pairing.claimed` and says so           10. the token authenticates every route
 ```
+
+**Bootstrapping the first device is different**, and the docs should not pretend otherwise. The
+tailnet bind refuses to start with no device registered (§2.5b), and pairing needs the phone to
+be able to reach the server — so the *first* device is minted at a shell with
+`python3 -m orchestra --add-device <label>` and its token carried by hand. Every device after
+that pairs with the QR. Closing that gap needs a bootstrap mode that binds the tailnet with
+nobody registered, which is exactly the silent wide exposure ADR 0013 forbids; it is listed as
+an open item rather than done badly.
 
 ### 3.2 `POST /api/v1/devices/pair/open`
 
-**Auth:** `admin`. **Idempotency:** not required; each call replaces any open window.
+**Auth:** local-only (§2.5a). **Idempotency:** not required; each call replaces any open window,
+so a user who clicks twice has exactly one live code and it is the one on the screen.
 
-Request body: `{}` or omitted.
+Request body: `{}` or omitted. `Content-Type: application/json` is **required** (§2.3 step 3).
 
 Response `200`:
 
 ```json
 {
-  "code": "7K3M-9QP2",
-  "url": "orc://p?h=achills-macbook-pro.tail1205d9.ts.net&c=7K3M9QP2&f=jnK0svnXpNeIqfgF5CQuaQ",
-  "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 41 41\" …>",
+  "ok": true,
+  "code": "N1T3-8XY5",
+  "url": "orc://p?h=100.113.110.31&p=4299&c=N1T38XY5",
+  "svg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 37 37\" …></svg>",
+  "qr_version": 3,
+  "expires_at": 1784741006.05,
   "expires_in": 120.0,
-  "expires_at": 1784636820.4,
-  "manual": {
-    "host": "achills-macbook-pro.tail1205d9.ts.net",
-    "port": 4242,
-    "code": "7K3M-9QP2",
-    "spki": "jnK0svnXpNeIqfgF5CQuaQ"
-  }
+  "manual": { "host": "100.113.110.31", "port": 4299, "code": "N1T3-8XY5" }
 }
 ```
 
-QR payload grammar (83 bytes in the example; the 46-byte fixed overhead leaves an 88-char
-host budget at QR version 6-L):
+- `svg` is generated from **the same string** as `url`, by one function, so the picture and the
+  manual fields cannot disagree.
+- `h` is where the **phone** should connect, which is not necessarily what the server bound: a
+  loopback-bound board advertises the detected tailnet address, because a QR saying `127.0.0.1`
+  sends the phone to its own web server.
+- `p` is omitted from `url` when the port is 4242.
+- The pairing **window lives in memory** and dies with the process. A restart closes every open
+  window, which is correct: a door that reopens by itself is a door nobody closed.
+
+QR payload grammar:
 
 ```
-orc://p?h=<host>[&p=<port>]&c=<8-char code>&f=<22-char spki pin>
+orc://p?h=<host>[&p=<port>]&c=<8-char code>
 ```
 
-`p` is omitted when the port is 4242. `h` falls back to the raw tailnet IPv4 when the
-MagicDNS name would overflow the QR. Register `orc://` in `CFBundleURLTypes` so the system
-camera can launch the app directly.
+Register `orc://` in `CFBundleURLTypes` so the system camera can launch the app directly.
+
+The encoder is `orchestra/qr.py` — stdlib only, byte mode, EC level **M**, versions 1–10, and it
+**raises** rather than truncating a payload that will not fit. It is verified against Apple's
+`CIQRCodeGenerator` module for module and decoded back by Vision (`tests/qr_ref.py`).
 
 ### 3.3 `POST /api/v1/pair`
 
-**Auth:** none (this is the bootstrap). **Idempotency:** not applicable — the code is
-single-use, so a replay yields `409 pairing_not_open`.
+**Auth:** none — this is the bootstrap, and it is the second and last entry in §2.4's exempt
+list. Exempt means *no token required*; the `Origin` and `Content-Type` guards still apply.
+**Idempotency:** not applicable — the code is single-use, so a replay is `409 pairing_not_open`.
 
 Request:
 
 ```json
 {
-  "code": "7k3m-9qp2",
+  "code": "n1t3-8xy5",
   "label": "Achill's iPhone",
   "platform": "ios",
   "app_version": "1.0 (14)"
 }
 ```
 
-- `code` is normalised on both sides before comparison: strip whitespace and `-`,
-  uppercase, then Crockford-fold `I`→`1`, `L`→`1`, `O`→`0`, `U`→`V`. `7k3m-9qp2`,
-  `7K3M9QP2` and `7K3M9QP2` all match. Comparison uses `hmac.compare_digest` over SHA-256.
-- `label` is truncated to 40 chars, `platform` to 16.
+- `code` is normalised on both sides before comparison: strip whitespace, `-` and `_`,
+  uppercase, then Crockford-fold `I`→`1`, `L`→`1`, `O`→`0`, `U`→`V`. `n1t3-8xy5`, `N1T3 8XY5`
+  and `N1T38XY5` all match, and so does a `1` a user read off the screen and typed as `I`.
+  Comparison is `hmac.compare_digest` over SHA-256, never `==`.
+- `label` is truncated to 40 characters, `platform` to 16. A device that sends no label still
+  gets one (`"ios (100.64.0.9)"`), because an empty row in the device list is a row you cannot
+  act on.
+- `app_version` is accepted and currently ignored.
 
 Response `200` — **the only time a token is ever returned**:
 
 ```json
 {
-  "device_id": "9f3ab21c",
-  "tokens": {
-    "read": "orc1_9f3ab21c_kQ7bN2xR4vLpZ8mT1wY6cH0jF5sA3dG9eU2iO7qK1nM",
-    "act":  "orc1_9f3ab21c_pW4hJ8zC2vB6nX1qL5tR9yE3uI7oA0sD4fG8kM2jN6b"
-  },
+  "ok": true,
+  "device_id": "33ba5d99",
+  "label": "Achill's iPhone",
+  "token": "orc1_33ba5d99_vpV-s_r-_THb68qjJbDrj6b5i_VK4rSUwDRC2ScMEas",
   "server": {
-    "host": "achills-macbook-pro.tail1205d9.ts.net",
-    "port": 4242,
-    "spki": "jnK0svnXpNeIqfgF5CQuaQ",
-    "cert_not_after": 1855123200,
-    "hostname": "achills-macbook-pro",
-    "user": "achill",
-    "version": "1.0.0",
-    "api": "1.0",
-    "epoch": "9f2c1a04"
+    "host": "100.113.110.31",
+    "port": 4299,
+    "hostname": "MacBookPro",
+    "api": "1",
+    "tls": false
   }
 }
 ```
 
+Note the secret half of the token contains `_`. Split it with **maxsplit=2** or roughly half of
+all valid tokens will be rejected by your client.
+
 Errors:
 
-| Status | `error.code` | Cause |
+| Status | `error` | Cause |
 |---|---|---|
-| 409 | `pairing_not_open` | no window open, or it expired, or the code was already claimed |
-| 409 | `pairing_code_wrong` | code mismatch; the per-IP attempt counter was incremented |
-| 429 | `pairing_attempts` | > 5 attempts from this source IP within the window |
-| 429 | `pairing_locked` | > 25 attempts in aggregate; the window closed and is locked for 600 s |
-| 403 | `peer_not_permitted` | the claimant is not on the tailnet or loopback |
+| 403 | `peer_not_permitted` | the claimant is neither on loopback nor in `100.64.0.0/10`. Checked **before** the code, so a stranger cannot tell a wrong code from a closed window and cannot spend the real phone's attempts |
+| 409 | `pairing_not_open` | no window open, or it expired, or the code was already claimed — **one answer for all three**, because they are the same fact from the claimant's side and distinguishing them would say whether somebody else just paired |
+| 409 | `pairing_code_wrong` | code mismatch; the per-IP attempt counter and the server-wide failure budget were both incremented |
+| 429 | `pairing_attempts` | more than 5 attempts from this source IP within the window |
+| 429 | `pairing_locked` | 25 attempts in aggregate; the window is closed and locked for 600 s |
+| 400 | `pairing_bad_request` | the body was not a JSON object |
+| 415 | `content_type_required` | the mutation did not announce `application/json` (§2.3) |
 
-Attempt counting is **per source IP**, so one hostile peer cannot lock the legitimate
-device out.
+Attempt counting is **per source IP**, so one hostile peer cannot lock the legitimate device out.
+The aggregate cap is what closes the window against many peers at once.
 
 ### 3.4 Manual fallback — compare, do not type
 
-If the camera fails, the user types **host + port + the 8-char code only**. All three are
-short and case-insensitive. The app then connects, computes the SPKI pin from the presented
-certificate, and **displays it next to the pin shown on the Mac** for visual comparison.
-`POST /api/v1/pair`'s response also carries `server.spki` so the app can confirm agreement.
+If the camera fails, the user types **host + port + the 8-char code**. All three are short, the
+code is case-insensitive, and the alphabet is Crockford base32 — `I`, `L`, `O` and `U` do not
+occur, which is the whole reason this path is usable.
 
-Be honest in the UI: the QR path is out-of-band pinning; the manual path is
-compare-on-first-use.
+There is no pin to compare (ADR 0013). Be honest in the UI: on this transport, both the QR and
+the manual path rest on **being inside the tailnet**, and the token is what identifies the
+device afterwards.
 
-### 3.5 Certificate pinning (client)
+### 3.5 ~~Certificate pinning (client)~~ — **does not apply**
 
-```swift
-// SecKeyCopyExternalRepresentation returns the RAW X9.63 point (0x04||X||Y), not the
-// SPKI, so prepend the canonical named-curve prefix to match what the server hashed.
-// The server MUST generate its key with `openssl ecparam -param_enc named_curve`;
-// an explicit-parameters cert has a different SPKI and fails this check 100% of the time.
-static let p256SPKIPrefix = Data([
-    0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,
-    0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00])
+~~SPKI pinning, `p256SPKIPrefix`, `SecTrustEvaluateWithError`.~~ ADR 0013 removed TLS from this
+server: there is no certificate, no SPKI, and nothing to pin. The original text is kept in git
+history rather than here, because a client written from a struck-through section is a client
+that fails closed against a certificate that will never be presented.
 
-let digest = Data(SHA256.hash(data: p256SPKIPrefix + rawPoint).prefix(16))
-let got = digest.base64EncodedString()
-    .replacingOccurrences(of: "+", with: "-")
-    .replacingOccurrences(of: "/", with: "_")
-    .replacingOccurrences(of: "=", with: "")
-// constant-time compare against the pin from the QR
-```
+### 3.6 ~~ATS~~ — **plain HTTP, scoped exception**
 
-- Never call `SecTrustEvaluateWithError` — a self-signed certificate always fails it, and
-  the pin is a strictly stronger statement.
-- Consequently the certificate's SANs and its 825-day validity are irrelevant to the iOS
-  client. **Read expiry from `GET /api/v1/health` `cert_not_after`**, not from the
-  certificate: `SecCertificateCopyValues` is macOS-only.
-- A pin mismatch gets its own error path and its own copy: *"This Mac is presenting a
-  different certificate than the one you paired with. Expected `jnK0…`, received `9xQa…`."*
-  The most likely causes are a regenerated key or a different Mac, not an attack.
-- Certificate renewal reuses the key, so the pin survives renewal. `--regen-key` does not,
-  and warns loudly.
-
-### 3.6 ATS
-
-Ship with **no `NSAppTransportSecurity` key**. The server negotiates TLS 1.3 with ECDHE and
-a P-256 / SHA-256 certificate, which satisfies ATS; the self-signed trust chain is answered
-by the `URLSessionDelegate`, which is an app's prerogative and not an ATS exception.
-
-Do **not** plan on plaintext: ATS domain exceptions do not apply to IP-address URLs, and the
-client must be able to fall back to the raw tailnet IP when MagicDNS is slow or off, so
-plain HTTP would require `NSAllowsArbitraryLoads`. `NSAllowsLocalNetworking` does not help
-either — Tailscale's `100.64.0.0/10` is RFC 6598 CGNAT, not RFC 1918.
+ADR 0013: the app carries an `NSExceptionDomains` entry for the tailnet address, and is personal
+(TestFlight / sideload), never App Store. `NSAllowsLocalNetworking` does **not** help —
+Tailscale's `100.64.0.0/10` is RFC 6598 CGNAT, not RFC 1918.
 
 `NSLocalNetworkUsageDescription`: **verify on device before adding it.** Traffic over the
-Tailscale `utun` interface is generally not subject to the local-network gate, and adding
-the key spends a scary permission prompt for nothing.
+Tailscale `utun` interface is generally not subject to the local-network gate, and adding the
+key spends a scary permission prompt for nothing.
+
+### 3.7 Device management
+
+All three are local-only (§2.5a) and all three are written to the audit log — including the
+`GET`, because it is the inventory of every credential to this machine and, unlike `/api/state`,
+nothing polls it.
+
+#### `GET /api/v1/devices`
+
+```json
+{
+  "ok": true,
+  "devices": [
+    { "id": "33ba5d99", "label": "Achill's iPhone",
+      "created": 1784741006.05, "last_seen": 1784741014.63, "revoked": null }
+  ],
+  "pairing": { "open": false, "claimed": "33ba5d99", "claimed_at": 1784741006.05 }
+}
+```
+
+Newest first. The token hash is never included. `pairing` is one of
+`{"open": false}` · `{"open": true, "expires_at", "expires_in", "attempts"}` ·
+`{"open": false, "expired": true}` · `{"open": false, "claimed", "claimed_at"}` — and **never
+carries the code or its hash in any of those shapes**, since the page polls it.
+
+`last_seen` is written at most once a minute per device, so it is accurate to the minute and
+costs one write a minute per active device rather than one per request.
+
+#### `POST /api/v1/devices/{id}/revoke`
+
+`200 {"ok": true, "device": {…, "revoked": 1784741023.86}}`, or `404 device_unknown`.
+
+The path is **parsed exactly**: `/api/v1/devices/<id>` with no verb, or with any other verb, is
+a `404` that changes nothing. Revocation is immediate — a running server sees a revocation made
+in another process within one `stat`, because the registry memo is keyed on the file's
+`(mtime_ns, size, ino)` — and it is irreversible. Pairing again mints a new token.
+
+#### `POST /api/v1/devices/pair/close`
+
+`200 {"ok": true, "pairing": {"open": false}}`. Shuts an open window early; idempotent.
 
 ---
 

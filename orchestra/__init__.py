@@ -29,7 +29,7 @@ import time                    # unused here, but tests reach time.sleep as
 
 from . import (config, shell, status, gitrepo, procs, transcripts, limits,
                watcher, observer, identity, auth, terminal, chat, finish,
-               dispatch, resume, server)
+               dispatch, resume, qr, tailnet, pairing, server)
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO,
@@ -75,7 +75,12 @@ from .identity import GONE, UNADDRESSED, ADDRESSES
 # `orchestra.auth.check`. REGISTRY and AUDIT_LOG are rebound at runtime (tests
 # point them at a temp dir), so they are absent for the RESUME_STATE reason.
 from .auth import (Verdict, add_device, revoke_device, devices, bind_refusal,
-                   EXEMPT, FAIL_BURST, FAIL_WINDOW_S, LAST_SEEN_S)
+                   EXEMPT, ADMIN, FAIL_BURST, FAIL_WINDOW_S, LAST_SEEN_S)
+# `_window` is rebound on every `open_window`, so it is absent for the
+# RESUME_STATE reason — reach it as `orchestra.pairing._window`.
+from .pairing import (open_window, claim, normalise, peer_permitted,
+                      payload_url, grouped, ALPHABET, CODE_LEN, WINDOW_S,
+                      ATTEMPTS_PER_PEER, ATTEMPTS_TOTAL)
 from .terminal import focus_process, send_to_process, _osa_escape
 from .chat import read_chat
 from .finish import (start_finish, _park_on_trunk, _reachable, _closeouts,

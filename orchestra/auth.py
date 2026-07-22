@@ -165,7 +165,49 @@ JSON_TYPE = "application/json"
 # routes by `startswith`. That asymmetry is deliberate and one-directional: a
 # path this list does not recognise is refused even if the router would have
 # served it, so `/api/healthcheck-for-free` is a 401 and not a hole.
-EXEMPT = frozenset({("GET", "/api/health")})
+EXEMPT = frozenset({("GET", "/api/health"), ("POST", "/api/v1/pair")})
+
+# The second exempt route, added with pairing, and it is the one that deserves
+# the most suspicion — an unauthenticated POST that hands out a credential.
+# What guards it is not authentication (there is none to have; that is the
+# point) but four things that are all in `pairing.claim`, in this order:
+#
+#   * the claimant must be on loopback or the tailnet, checked BEFORE the code;
+#   * a window must be open, unclaimed and unexpired — 120 s, single use;
+#   * attempts are budgeted per source IP, and spend from THIS module's failure
+#     budget as well, which is what ADR 0014 promised when it deferred pairing;
+#   * the code is compared with `compare_digest` over sha256.
+#
+# It is exempt from the TOKEN check only. Everything else in `check` still runs
+# — the cross-site guards included, so a page you are visiting cannot post a
+# pairing claim through your browser.
+
+# Routes that answer to THIS MACHINE ONLY, and to nobody holding a token.
+#
+# API.md §2.5 puts device management behind an `admin` scope and says phones are
+# never issued it. ADR 0014 deferred scopes whole, so `admin` cannot be a scope
+# today — and inventing a half-scope for one route is exactly what that ADR
+# refused to do. What it can be, and what is strictly stronger, is a rule with
+# no ladder in it at all:
+#
+#     DEVICE MANAGEMENT IS THE ABSENCE OF A TOKEN, FROM THIS MACHINE.
+#
+# So no token grants it. A phone cannot list devices, cannot open a pairing
+# window, and — the one that matters — cannot revoke a device, including the
+# device that would have revoked IT. A stolen phone holding a valid token gets
+# 403 on all three, which is the same answer it would get if scopes existed and
+# it held `act`. When scopes do arrive this rule becomes `scope == admin` and
+# nothing else about the surface changes.
+#
+# Matched by PREFIX, unlike `EXEMPT`, because `/api/v1/devices/<id>/revoke`
+# carries an identity in the path. The asymmetry is one-directional in the safe
+# direction: a path this list matches too eagerly is a refusal, never a hole.
+ADMIN = ("/api/v1/devices",)
+
+# The refusal code for that rule. Distinguishable from `unauthorized` on
+# purpose: the holder of a good token learns that the token is fine and the
+# ROUTE is not theirs, which is what stops an app retrying pairing forever.
+ADMIN_ONLY = "admin_local_only"
 
 # Requests that are written to the audit log when they are ALLOWED. Refusals
 # are always logged, whatever the route.
@@ -533,6 +575,23 @@ def loopback(peer):
     return bool((mapped or ip).is_loopback)
 
 
+def loopback_bind(host):
+    """Would binding `host` already put us on 127.0.0.1?
+
+    Not the same question as `loopback(peer)`, which is about a source ADDRESS
+    and therefore always an address. A bind target can also be a NAME
+    (`localhost`) or empty (which `socket.bind` reads as every interface but
+    which this project has always meant as "the default, loopback").
+
+    It exists because the two callers got out of step: `bind_refusal` spelled
+    it `loopback(host) or host in ("localhost", "")` and `__main__`'s companion
+    listener spelled it without the `localhost` arm — so `--host localhost`
+    tried to bind 127.0.0.1 twice and died with EADDRINUSE at startup. One
+    function, one answer.
+    """
+    return bool(loopback(host)) or host in ("localhost", "")
+
+
 def exempt(method, path):
     """Does this route need no token at all? Exact match on `(method, path)`
     with the query stripped — see `EXEMPT`."""
@@ -543,7 +602,28 @@ def audited(method, path):
     """Is this request written to the audit log when it is allowed?"""
     if method != "GET":
         return True
-    return path.split("?", 1)[0].startswith(SIDE_EFFECT_GETS)
+    clean = path.split("?", 1)[0]
+    # Device management is audited even when it only reads. `GET /api/v1/devices`
+    # is the inventory of every credential to this machine, which is a very
+    # different thing to read than a status page — and unlike `/api/state`, it
+    # is not polled, so logging it buries nothing.
+    return clean.startswith(SIDE_EFFECT_GETS) or _under_admin(clean)
+
+
+def _under_admin(path):
+    """Is this path inside the admin surface? Exact segment, not substring.
+
+    `startswith("/api/v1/devices")` alone would also match
+    `/api/v1/devices-of-other-people`, which is the direction that is safe here
+    (more refusals) but would be the wrong direction if this list were ever
+    reused for an allowance. So it is written correctly once.
+    """
+    return any(path == p or path.startswith(p + "/") for p in ADMIN)
+
+
+def admin(method, path):
+    """Does this route answer only to this machine holding no token?"""
+    return _under_admin(path.split("?", 1)[0])
 
 
 def parse_bearer(header):
@@ -618,9 +698,12 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
 
     The order below is load-bearing; each step is where it is for a reason:
 
-    1. **Exempt route** — before anything is parsed. `/api/health` must answer
-       when the credential is the thing being diagnosed, and it validates no
-       token, so there is nothing here to brute-force.
+    1. **Exempt route** — before the budget, after the browser guards are in
+       scope. `/api/health` must answer when the credential is the thing being
+       diagnosed, and `POST /api/v1/pair` must answer a phone that has no token
+       yet; neither validates a token, so there is nothing here to brute-force.
+       Exempt means *no token required*, NOT *no checks*: the cross-site guards
+       run on both, because one of them is a mutation.
     2. **Loopback with no credential** — before the budget is consulted. This
        is what makes the browser un-throttleable: a request that presents
        nothing from a machine that is already inside cannot fail, so it can
@@ -631,6 +714,9 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
        timing of a refusal it was never going to pass.
     4. **Shape**, then **identity**, then **revocation**. Each refuses; each
        spends one from the budget.
+    4a. **Admin** — after the token is known good, so the answer is "this route
+       is not yours" rather than "who are you". No token reaches it; see
+       `ADMIN`.
     5. **The browser guards** — `Origin`, and `Content-Type` on a mutation.
        LAST, on BOTH allow paths, which is `browser_guards`' own docstring:
        they are about the browser rather than the caller, so they must not
@@ -655,8 +741,6 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
     reason the failure budget exists.
     """
     now = time.time() if now is None else now
-    if exempt(method, path):
-        return ALLOW_LOOPBACK
     presented = parse_bearer(header)
     home = loopback(peer) and bool(config.CFG.get("auth_trust_loopback", True))
 
@@ -693,6 +777,26 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
                           f"what stops another site's page reaching your "
                           f"agents through your browser", spend=0)
         return None
+
+    if exempt(method, path):
+        # No token needed — and the browser guards STILL RUN. That is the
+        # change pairing forced, and it was a real hole for the ten minutes it
+        # existed: `POST /api/v1/pair` is an unauthenticated mutation, so a
+        # `return` here would have let a page you are merely visiting post a
+        # `text/plain` pairing claim from your browser with no preflight. It
+        # could only guess at the code, but "it would probably fail anyway" is
+        # not how rule 6 reads.
+        #
+        # It stays ABOVE the failure budget, which is what `/api/health` needs:
+        # the route you use to diagnose a credential must answer even to a peer
+        # that has burned its budget presenting the broken one.
+        blocked = browser_guards()
+        if blocked:
+            return blocked
+        if audited(method, path):
+            audit(at=now, peer=peer, device=None, label="unauthenticated",
+                  method=method, path=path[:200], outcome="allow")
+        return ALLOW_LOOPBACK
 
     if header is None and home:
         blocked = browser_guards()
@@ -752,6 +856,19 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
         return refuse(401, REVOKED,
                       f"device '{device.get('label')}' was revoked; pair again "
                       f"to get a new token")
+    if admin(method, path):
+        # A GOOD token, refused. This is the whole of `ADMIN`: authentication
+        # succeeded and the route still is not theirs, because the thing behind
+        # it is the ability to revoke devices — including this one. It is
+        # spend=0 deliberately: the caller is a known device making a legitimate
+        # mistake, not somebody guessing, and charging it would let a buggy app
+        # lock its own phone out of the API it is entitled to.
+        return refuse(403, ADMIN_ONLY,
+                      f"device management answers to the Mac itself and to no "
+                      f"token — not even a valid one, because a device that "
+                      f"could revoke devices could revoke the device that "
+                      f"would have revoked it. Use the board, or "
+                      f"`python3 -m orchestra --list-devices`.", spend=0)
     blocked = browser_guards()
     if blocked:
         return blocked
@@ -775,19 +892,30 @@ def bind_refusal(host):
     part that makes it a refusal rather than a warning — it would do it
     SILENTLY, because the failure looks exactly like success.
 
-    `0.0.0.0` is refused whatever the registry says. It is not a tailnet bind;
-    it is every interface including the coffee-shop wifi, and ADR 0013 is
-    explicitly scoped to the tailnet ("if the server is ever exposed … TLS
-    stops being optional and this ADR must be superseded"). Making that
-    transition loud rather than silent is the ADR's own instruction.
+    `0.0.0.0` is refused unless the user asked for it by a DIFFERENT NAME.
+    It is not a tailnet bind; it is every interface including the coffee-shop
+    wifi, and ADR 0013 is explicitly scoped to the tailnet ("if the server is
+    ever exposed … TLS stops being optional and this ADR must be superseded").
+    Making that transition loud rather than silent is the ADR's own instruction.
+
+    So `--host 0.0.0.0` remains a refusal — that spelling is one slip of muscle
+    memory away from a tailnet address, and its error message now names the
+    flag that does what the user probably meant (`--tailnet`). The escape hatch
+    is `--bind-every-interface`, which cannot be typed by accident and cannot
+    be set from the config file at all (`config.load_config` overwrites the key
+    from the parsed arguments every time, so a stale line in a JSON file cannot
+    quietly open the machine). It does NOT bypass the registry check below: a
+    wide bind with nobody registered is refused however loudly it was asked
+    for.
     """
-    if loopback(host) or host in ("localhost", ""):
+    if loopback_bind(host):
         return None
-    if host in ("0.0.0.0", "::", "*"):
+    if host in ("0.0.0.0", "::", "*") and not config.CFG.get("bind_every_interface"):
         return (f"refusing to bind {host}: that is every interface, not the "
                 f"tailnet. This server has no TLS by design (ADR 0013, which "
                 f"is scoped to WireGuard) and serves your transcript text. "
-                f"Bind the tailnet address explicitly.")
+                f"Use --tailnet to bind the tailnet address, or say what you "
+                f"mean with --bind-every-interface.")
     known, error = load_registry()
     if error:
         return (f"refusing to bind {host}: the device registry at {REGISTRY} "

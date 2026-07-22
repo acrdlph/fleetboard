@@ -44,7 +44,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import (config, auth, gitrepo, limits, observer, terminal, chat,
-               dispatch, resume, finish)
+               dispatch, resume, finish, pairing, tailnet)
 
 MAX_SUBSCRIBERS = 32        # concurrent SSE streams; config key "sse_max_subscribers"
 KEEPALIVE_S = 25.0          # silence before a comment frame; key "sse_keepalive_s"
@@ -219,6 +219,41 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         self.close_connection = True
 
+    def _json(self, status, payload):
+        """One JSON answer with a real status code, then hang up.
+
+        The legacy routes share a tail that always sends 200 and puts the error
+        inside the body. `/api/v1` does not — see the note in `do_POST` — so it
+        needs a writer of its own, and this is it. `Cache-Control: no-store`
+        because two of its callers carry a live pairing code and one carries a
+        token: a proxy or a disk cache holding either is a credential left on
+        the floor.
+        """
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _advertised_host(self):
+        """The address to put in the QR — where the PHONE should connect.
+
+        `CFG["host"]` is what we bound, and when that is a tailnet address it
+        is exactly right. When it is loopback it is exactly wrong: a QR saying
+        `127.0.0.1` sends the phone to its own web server. So loopback falls
+        back to the detected tailnet address, and only if there is none does it
+        emit the bound address — a pairing window opened on a loopback-only
+        server is a rehearsal, and it should look like one rather than fail
+        silently at the phone.
+        """
+        bound = config.CFG.get("host") or "127.0.0.1"
+        if auth.loopback(bound):
+            return tailnet.address() or bound
+        return bound
+
     def do_GET(self):
         if self.path.startswith("/api/events"):
             # EARLY RETURN, and it is the whole structural change (ENGINE.md
@@ -227,6 +262,19 @@ class Handler(BaseHTTPRequestHandler):
             # Content-Length — the one header a stream must never send, and the
             # tail that makes all nine of the others work.
             return self._sse()
+        if self.path.startswith("/api/v1/devices"):
+            # The versioned surface starts here (ADR 0009). Everything else in
+            # this handler is the legacy unversioned board API and stays where
+            # it is; the routes born with pairing are born on `/api/v1`, which
+            # is what the Swift client will be written against.
+            #
+            # `auth.ADMIN` already refused every token holder before this line
+            # ran — `parse_request` is the seam — so reaching this branch means
+            # the caller is the Mac itself. It reads a list of every credential
+            # to this machine, which is why `auth.audited` logs it even though
+            # it is a GET.
+            return self._json(200, {"ok": True, "devices": auth.devices(),
+                                    "pairing": pairing.state()})
         if self.path.startswith("/api/health"):
             # The one route that answers without a token (auth.EXEMPT), so it
             # is also the one route whose payload is a security decision. It
@@ -297,6 +345,14 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "text/html; charset=utf-8"
         elif self.path.startswith("/guide"):
             body = (config.HERE / "guide.html").read_bytes()
+            ctype = "text/html; charset=utf-8"
+        elif self.path.startswith("/pair"):
+            # Served like every other page: from disk, on every request, so an
+            # edit shows up on reload. It carries no secret of its own — the
+            # code and the QR arrive from `/api/v1/devices/pair/open`, which is
+            # a POST, so merely LOADING this page cannot open a pairing window.
+            # That distinction is the reason it is not a GET.
+            body = (config.HERE / "pair.html").read_bytes()
             ctype = "text/html; charset=utf-8"
         else:
             self.send_error(404)
@@ -504,6 +560,51 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(n).decode() or "{}")
         except (ValueError, OSError):
             payload = {}
+        # ---- /api/v1, the versioned surface (ADR 0009) ----
+        #
+        # These four answer with REAL STATUS CODES rather than this handler's
+        # in-payload `{"ok": false}` convention, and the exception is
+        # deliberate. The legacy routes are read by one client — the board —
+        # which renders the message either way. These are read by a Swift
+        # client written from API.md, which has to branch on "the window is
+        # closed" (409) versus "you are not allowed here" (403) versus "slow
+        # down" (429) before it has parsed anything. A 200 carrying a failure
+        # is a contract that only works when the reader is a browser you also
+        # wrote.
+        if self.path.startswith("/api/v1/pair"):
+            # The bootstrap. `auth.EXEMPT` lets it through with no token —
+            # every other guard in `pairing.claim` still applies, starting with
+            # the peer range and ending with a constant-time code comparison.
+            result, error = pairing.claim(
+                self.client_address[0] if self.client_address else "", payload)
+            if error:
+                status, code, message = error
+                return self._json(status, {"ok": False, "error": code,
+                                           "message": message})
+            return self._json(200, {"ok": True, **result})
+        if self.path.startswith("/api/v1/devices/pair/open"):
+            w = pairing.open_window(host=self._advertised_host())
+            return self._json(200, {"ok": True, **w})
+        if self.path.startswith("/api/v1/devices/pair/close"):
+            pairing.close()
+            return self._json(200, {"ok": True, "pairing": pairing.state()})
+        if self.path.startswith("/api/v1/devices/"):
+            # `/api/v1/devices/<id>/revoke`. Parsed rather than matched so the
+            # path shape is API.md §2.5's, which is what the Swift client and
+            # the docs both say — and `auth.ADMIN` covers the whole subtree by
+            # prefix, so an id this parse does not recognise is still refused
+            # for everyone but the Mac.
+            parts = self.path.split("?", 1)[0].strip("/").split("/")
+            if len(parts) == 5 and parts[4] == "revoke":
+                device = auth.revoke_device(parts[3])
+                if device is None:
+                    return self._json(404, {"ok": False,
+                                            "error": "device_unknown",
+                                            "message": f"no device {parts[3]}"})
+                return self._json(200, {"ok": True, "device": device})
+            self.send_error(404)
+            return
+
         if self.path.startswith("/api/reserve"):
             result = limits.set_reserve(payload.get("account"), payload.get("percent"))
         elif self.path.startswith("/api/resume/schedule"):

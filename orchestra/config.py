@@ -371,6 +371,22 @@ def load_config(argv=None):
                     help="Claude home dir (repeatable; default: auto-discover ~/.claude*)")
     ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTRA_PORT)")
     ap.add_argument("--host", help="bind address (default 127.0.0.1 — the board serves your transcript text; do not expose it)")
+    # Three ways to choose an address, named so that the dangerous one cannot
+    # be reached by accident. `--tailnet` is the one a user should reach for:
+    # it detects the address rather than asking, so the tailnet IP stops being
+    # a magic number that gets pasted from a stale document. `--host` still
+    # takes an explicit address and still refuses 0.0.0.0. And the wide bind
+    # gets a name that says what it does — you cannot type
+    # `--bind-every-interface` while meaning "the tailnet".
+    ap.add_argument("--tailnet", action="store_true",
+                    help="bind the Tailscale address of this machine, detected "
+                         "automatically; refuses if Tailscale is not up or no "
+                         "device is paired")
+    ap.add_argument("--bind-every-interface", action="store_true",
+                    help="bind 0.0.0.0 — EVERY interface, including whatever "
+                         "network you are on. There is no TLS (ADR 0013) and "
+                         "this serves your transcript text; a paired device is "
+                         "still required")
     ap.add_argument("--window-h", type=float, help="ignore transcripts idle longer than this many hours (default 48)")
     # One flag for one knob. `idle_s` is the only cadence a user has a reason
     # to change from the command line — it is the battery/latency dial — so it
@@ -421,6 +437,15 @@ def load_config(argv=None):
     if args.home: CFG["homes"] = args.home
     if args.port: CFG["port"] = args.port
     if args.host: CFG["host"] = args.host
+    # ALWAYS assigned, never `if args...`. A wide bind must be a thing the user
+    # typed on this run — a leftover `"bind_every_interface": true` in a config
+    # file would otherwise survive forever and open the machine on a run where
+    # nobody asked. Reading it and overwriting it is what makes the flag mean
+    # what its name says. (`--tailnet` resolves to an address in __main__,
+    # which is above `tailnet` in the import graph; this module is a leaf.)
+    CFG["bind_every_interface"] = bool(args.bind_every_interface)
+    if args.bind_every_interface:
+        CFG["host"] = "0.0.0.0"
     if args.window_h: CFG["session_window_h"] = args.window_h
     # `is not None`, not truthiness: `--idle-s 0` is a spin loop and must reach
     # the loop as the mistake it is, not be silently ignored as a default.
