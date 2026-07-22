@@ -1,0 +1,11 @@
+# Build products and local state. Nothing here is reproducible from the repo, and
+# `DerivedData` is measured in gigabytes on a machine with 26 GB free.
+.build/
+DerivedData/
+*.xcuserdatad
+xcuserdata/
+.swiftpm/
+
+# The one file that carries a team id. Signing for a real device is per-developer;
+# the committed project ad-hoc signs for the simulator and needs no team.
+Signing.xcconfig
