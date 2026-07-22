@@ -28,8 +28,8 @@ import time                    # unused here, but tests reach time.sleep as
                                # `orchestra.time.sleep` — keep the name bound
 
 from . import (config, shell, status, gitrepo, procs, transcripts, limits,
-               watcher, observer, identity, terminal, chat, finish, dispatch,
-               resume, server)
+               watcher, observer, identity, auth, terminal, chat, finish,
+               dispatch, resume, server)
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO,
@@ -69,6 +69,13 @@ from .observer import (collect_state, cached_state, demo_state, _cache,
 # read as anything at the top level, and the two codes are what callers branch
 # on. Reach the function as `orchestra.identity.resolve`.
 from .identity import GONE, UNADDRESSED, ADDRESSES
+# `check`, `exempt`, `audit` and `public` are deliberately NOT re-exported —
+# every one of them reads as something else at the top level, and `check` in
+# particular must be unmistakable at its call site. Reach them as
+# `orchestra.auth.check`. REGISTRY and AUDIT_LOG are rebound at runtime (tests
+# point them at a temp dir), so they are absent for the RESUME_STATE reason.
+from .auth import (Verdict, add_device, revoke_device, devices, bind_refusal,
+                   EXEMPT, FAIL_BURST, FAIL_WINDOW_S, LAST_SEEN_S)
 from .terminal import focus_process, send_to_process, _osa_escape
 from .chat import read_chat
 from .finish import (start_finish, _park_on_trunk, _reachable, _closeouts,

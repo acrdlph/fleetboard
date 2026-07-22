@@ -12,6 +12,7 @@ globals (CFG, _limits, DEMO); tests set those and restore them.
 import json
 import pathlib
 import shlex
+import shutil
 import sys
 import tempfile
 import threading
@@ -67,12 +68,21 @@ class ConfigGuard(unittest.TestCase):
         self._limits = dict(fb._limits)
         self._demo = fb.config.DEMO
         self._cpath = fb.config.CONFIG_PATH
+        # Every request through `Handler` now passes `auth.check`, and a
+        # mutation from loopback writes an audit line. Without this, running
+        # the suite appends to the developer's REAL audit log — a test that
+        # edits the machine it runs on.
+        self._audit = fb.auth.AUDIT_LOG
+        self._audit_dir = tempfile.mkdtemp(prefix="fb-audit-")
+        fb.auth.AUDIT_LOG = Path(self._audit_dir) / "audit.log.jsonl"
 
     def tearDown(self):
         fb.CFG.clear(); fb.CFG.update(self._cfg)
         fb._limits.clear(); fb._limits.update(self._limits)
         fb.config.DEMO = self._demo
         fb.config.CONFIG_PATH = self._cpath
+        fb.auth.AUDIT_LOG = self._audit
+        shutil.rmtree(self._audit_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- text utils

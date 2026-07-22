@@ -345,6 +345,15 @@ CFG = {
     # ordering reverses, 0.069 % against 0.082 %), because the check is one
     # `select` and one `MSG_PEEK` per stream per second and writes nothing.
     "sse_liveness_s": 1.0,
+    # Authentication (auth.py). One knob, and it is the one that is dangerous
+    # to touch: `auth_trust_loopback` False makes the local browser present a
+    # token like anything else, which is what you want the day something else
+    # on this machine proxies to the board — `tailscale serve` makes every
+    # request arrive from 127.0.0.1, and this switch is the difference between
+    # that being a bypass and being a login. It defaults True because the board
+    # is a loopback program and a process that can open that socket can already
+    # read every transcript on disk without asking this server at all.
+    "auth_trust_loopback": True,
     "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
     "resume_message": "continue",  # what auto-resume types at the stalled agent
 }
@@ -376,6 +385,19 @@ def load_config(argv=None):
                          "kqueue cannot see, and 3.0 on a platform with no "
                          "watcher")
     ap.add_argument("--config", metavar="FILE", help="path to a orchestra.config.json")
+    # Device administration. Flags rather than a route, because the admin
+    # surface of API.md §2.5 is the one thing a stolen phone must never be able
+    # to reach — a device that could revoke devices could revoke the Mac's
+    # ability to revoke IT. On this machine, at a shell, is a boundary the
+    # network cannot cross. Each one prints and exits; none of them starts a
+    # server. The flags are parsed here so `--help` lists them, and acted on in
+    # __main__, because this module is below `auth` in the import graph.
+    ap.add_argument("--add-device", metavar="LABEL",
+                    help="mint a token for one device and print it ONCE, then exit")
+    ap.add_argument("--list-devices", action="store_true",
+                    help="list registered devices (no tokens — they are stored hashed)")
+    ap.add_argument("--revoke-device", metavar="ID",
+                    help="revoke a device by id; its token stops working immediately")
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)
 

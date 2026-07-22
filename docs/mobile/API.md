@@ -172,6 +172,22 @@ is guaranteed to 429.
 
 ## 2. Authentication
 
+> **As built, 2026-07-22 ([ADR 0014](adr/0014-per-device-bearer-tokens.md), `orchestra/auth.py`).**
+> This section describes `/api/v1`, which does not exist yet. What ships today, on the legacy
+> unversioned surface, is the **subset that is not optional**: §2.1's token format verbatim
+> (`orc1_<devid>_<secret>`, stored as sha256, `hmac.compare_digest`); one check in
+> `Handler.parse_request` that no route can be dispatched past; **loopback trusted** and
+> everything else authenticated; §2.4's exempt list reduced to `GET /api/health` alone (there is
+> no `POST /api/pair` yet, so there is no second open door); the `Origin` rule of §2.3 step 3
+> plus a `Content-Type: application/json` requirement on mutations, which together close CSRF
+> from the local browser; a per-IP failure budget in place of §1.7's full bucket table; and an
+> audit log of every mutation and every refusal.
+>
+> **Not built:** scopes (§2.2 — one token grants everything, and a `read` token that cannot act
+> is not the product yet), pairing (§3 — tokens are minted at a shell), the `Host` allowlist
+> (§2.3 step 2), tailnet whois (step 8), lockdown (step 7), idempotency (step 10), per-device
+> buckets. Each is listed with its reason in ADR 0014; none of them was the missing one.
+
 ### 2.1 Token format
 
 ```

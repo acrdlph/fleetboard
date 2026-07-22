@@ -250,7 +250,8 @@ Persistent settings go in `orchestra.config.json` next to the script
 | `roots` | `[cwd]` | dirs whose git-repo children are watched |
 | `pattern` | `""` | regex filter on worktree dir names |
 | `homes` | `[]` | Claude home dirs; `[]` auto-discovers `~/.claude*` |
-| `host` / `port` | `127.0.0.1` / `4242` | keep the host on loopback: the board serves your transcript text |
+| `host` / `port` | `127.0.0.1` / `4242` | the board serves your transcript text. Off loopback it refuses to start until a device is registered (`--add-device`), and refuses `0.0.0.0` outright |
+| `auth_trust_loopback` | `true` | requests from this machine need no token. Set false only if something proxies to the board — a proxy makes every peer look local |
 | `session_window_h` | `48` | ignore transcripts idle longer than this |
 | `quiet_s` | `45` | unexplained silence before a live agent stops reading WORKING |
 | `flicker_dwell_s` | `3.0` | a status must stand this long before it may quieten; escalation never waits |
@@ -417,6 +418,15 @@ headroom + reserve buffers, the reserve-persist round-trip, dispatch-log
 parsing, and an HTTP smoke test that boots the real server in `--demo` mode
 and hits every endpoint.
 
+**Auth tests** (`tests/test_auth.py`) come in three shapes because the claims
+do: the decision (`auth.check` with an explicit peer, header and clock — every
+refusal in the design is one row), the wire (a real server on a real port whose
+handler believes its peer is on the tailnet, which is what proves the check is
+in the request path rather than merely in a function), and the routes — read
+back out of `server.py`'s own AST and each required to be exempt-by-list or to
+refuse a stranger, so a route added later cannot start out unguarded and a
+hard-coded list cannot rot.
+
 **Integration tests** (`tests/test_integration.py`) exercise the *real*
 pipeline against controlled fixtures — no dependency on your live fleet:
 
@@ -438,7 +448,25 @@ dispatch (kickoff → READY → instruction → DONE).
 ## Security & spending
 
 - **The board serves your prompts and your agents' replies.** It binds to
-  127.0.0.1 and should stay there; a warning prints if you bind wider.
+  127.0.0.1. Loopback is trusted — a process that can open that socket is
+  already running as you and can read `~/.claude*` without asking this server
+  — so the browser needs no token. **Everything else must present one:**
+
+  ```bash
+  python3 -m orchestra --add-device "iPhone"   # prints the token ONCE
+  python3 -m orchestra --list-devices
+  python3 -m orchestra --revoke-device 9f3ab21c
+  ```
+
+  The token goes in `Authorization: Bearer orc1_…`. Only `GET /api/health` is
+  exempt. Devices live in `devices.json` as sha256 hashes, so a copy of that
+  file is not a way in, and every mutation and every refusal is appended to
+  `audit.log.jsonl`. Binding anything but loopback **refuses to start** until a
+  device exists — it used to warn and bind anyway.
+- **A website you visit cannot drive your fleet.** Mutations must be sent as
+  `Content-Type: application/json` and a cross-site `Origin` is refused, which
+  is what stops another page borrowing your browser's loopback trust to type
+  at an agent. If you script the API by hand, send that header.
 - **Actions type into your terminals.** Chat/resume literally keystroke the
   target terminal — same as you typing. They fire only on your click.
 - **Dispatch spends usage.** A launched agent runs

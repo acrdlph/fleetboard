@@ -1,6 +1,9 @@
 orchestra.config.json
 dispatch.log.jsonl
 resume.schedule.json
+devices.json
+devices.json.tmp
+audit.log.jsonl
 __pycache__/
 *.log
 nohup.out

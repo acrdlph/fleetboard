@@ -1,4 +1,11 @@
-"""orchestra.server — the only door in: one handler, loopback, no framework.
+"""orchestra.server — the only door in: one handler, one check, no framework.
+
+THE DOOR IS NOW LOCKED. `parse_request` runs `auth.check` before any `do_*`
+method is dispatched, so authentication is not a thing each route remembers to
+do — it is a thing no route can reach past. Loopback is trusted (the browser
+has no token and never will); everything else presents `Authorization: Bearer
+orc1_…`; `GET /api/health` is the single exempt route. The reasoning is in
+`auth.py`, which is deliberately a leaf: it cannot import the code it guards.
 
 `Handler` is the whole HTTP surface. GET is the watching half — the board's
 state (with the resume schedules riding along so it needs no second fetch),
@@ -32,11 +39,12 @@ import select
 import socket
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import (config, gitrepo, limits, observer, terminal, chat, dispatch,
-               resume, finish)
+from . import (config, auth, gitrepo, limits, observer, terminal, chat,
+               dispatch, resume, finish)
 
 MAX_SUBSCRIBERS = 32        # concurrent SSE streams; config key "sse_max_subscribers"
 KEEPALIVE_S = 25.0          # silence before a comment frame; key "sse_keepalive_s"
@@ -113,6 +121,104 @@ class Handler(BaseHTTPRequestHandler):
     # (p50, one stream) — genuinely incremental. Do not "modernise" this.
     protocol_version = "HTTP/1.0"
 
+
+    # ------------------------------------------------------------ the door
+    #
+    # `parse_request` is where authentication happens, and it is the ONLY place
+    # in this process where it happens. That is not a stylistic choice — it is
+    # the one seam a route cannot get past. `handle_one_request` does exactly
+    # this, in this order, and has since Python 2:
+    #
+    #     if not self.parse_request():   # <- we return False here and the
+    #         return                     #    request is over
+    #     method = getattr(self, 'do_' + self.command)
+    #     method()
+    #
+    # So there is no `do_*` that can forget the check, no branch inside `do_GET`
+    # that can skip it, and no route somebody adds next month that starts out
+    # unguarded — including a `do_PUT` that does not exist yet, and including
+    # `/api/events`, which returns early from `do_GET` and would slip past a
+    # guard written at the top of the elif chain. A method this handler does not
+    # implement is also refused BEFORE it is told it is not implemented, which
+    # is the right order: an unauthenticated peer learns nothing about the
+    # surface.
+    #
+    # Putting the check in a decorator on each `do_*`, or a first line in both,
+    # was the alternative. Both are one edit away from being wrong, and the edit
+    # is invisible in review.
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False            # malformed request line; already answered
+        peer = self.client_address[0] if self.client_address else ""
+        verdict = auth.check(peer, self.headers.get("Authorization"),
+                             self.command, self.path,
+                             origin=self.headers.get("Origin"),
+                             host=self.headers.get("Host"),
+                             content_type=self.headers.get("Content-Type"))
+        if verdict.ok:
+            # The device that just authenticated, for a route that ever needs
+            # to know WHO is asking (API.md's `devices/self/*` will). Nothing
+            # reads it today; it is None for a trusted-loopback request, which
+            # is the state that would otherwise have to be invented later.
+            self.device = verdict.device
+            return True
+        self._refuse(verdict)
+        return False
+
+    def _refuse(self, verdict):
+        """The refusal, in the same shape as every other error the board reads.
+
+        `{"ok": false, "error": …}` is this server's error convention (module
+        docstring), so a refusal renders in the board's existing message path
+        rather than as a blank tab. The status is real, though — unlike the
+        in-payload errors, a 401 is something an HTTP client must be able to
+        act on without parsing anything, and `WWW-Authenticate` is what makes
+        it a legal one.
+
+        THE BODY OF A REFUSED POST IS NOT READ, and that took three
+        measurements to settle. Answering while the client is still writing can
+        leave it blocked in `sendall`, raising BrokenPipe INSTEAD OF READING
+        THE 401 — a revoked phone that cannot tell "revoked" from "the Mac is
+        asleep" retries forever. A draft of this handler therefore drained the
+        body first, and a probe against a hand-rolled server said the guard was
+        needed from 512 KB up.
+
+        It is not, and that probe was the wrong harness: it closed the socket
+        outright, where `socketserver.shutdown_request` half-closes it
+        (`SHUT_WR`) first — which lets the client's remaining bytes drain into
+        the kernel instead of earning an RST that discards the response.
+        Re-measured against THIS server, a refused POST whose body is never
+        read:
+
+            400 KB · 600 KB · 800 KB   401, every time
+            1 MB                       401, mostly — flaky with the drain and
+                                       without it
+            2 MB and up                BrokenPipe / ConnectionReset
+
+        The board's own POSTs are kilobytes — a chat message, a mission brief —
+        so the whole band a drain could rescue is one no client reaches, and
+        the price was reading a megabyte on behalf of somebody who has not
+        authenticated. Removed; the test that "proved" it was flaky in exactly
+        the band the measurement says is flaky. What is left is this note, so
+        that the next person to probe it on a toy server finds the answer
+        before writing the code.
+        """
+        body = json.dumps({"ok": False, "error": verdict.code,
+                           "message": verdict.message}).encode()
+        self.send_response(verdict.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if verdict.status == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="orchestra"')
+        if verdict.retry_after:
+            self.send_header("Retry-After", str(int(verdict.retry_after)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+
     def do_GET(self):
         if self.path.startswith("/api/events"):
             # EARLY RETURN, and it is the whole structural change (ENGINE.md
@@ -121,7 +227,20 @@ class Handler(BaseHTTPRequestHandler):
             # Content-Length — the one header a stream must never send, and the
             # tail that makes all nine of the others work.
             return self._sse()
-        if self.path.startswith("/api/state"):
+        if self.path.startswith("/api/health"):
+            # The one route that answers without a token (auth.EXEMPT), so it
+            # is also the one route whose payload is a security decision. It
+            # says a server that speaks this protocol is alive here and what
+            # its clock reads — and NOTHING that varies with what the fleet is
+            # doing: no counts, no worktrees, no hostname, no device list, not
+            # even whether any device is registered. The clock is the point:
+            # every other route's timestamps are unreadable to a client whose
+            # own clock is wrong, and diagnosing that must not require the
+            # credential you are trying to diagnose.
+            body = json.dumps({"ok": True, "service": "orchestra",
+                               "api": "1.0", "time": time.time()}).encode()
+            ctype = "application/json"
+        elif self.path.startswith("/api/state"):
             # schedules ride along so the board needs no second fetch
             body = json.dumps({**observer.cached_state(),
                                "resumes": resume.resume_public()}).encode()
