@@ -78,7 +78,9 @@ shared helper down**, to the module that already sits below both ends of the cyc
 | `account_label` | `transcripts.py` | **`config.py`** | `procs.claude_processes` calls it, and `transcripts.scan_sessions` calls `procs.pair_sessions_with_procs` — so `transcripts` owning it makes procs↔transcripts mutual. It is a four-line pure string function on a home-dir name with zero dependencies, called from six modules. It is a shared leaf helper, not transcript logic. Direction becomes `config → procs → transcripts`, which is the order this ADR intended. |
 | `closeout_shell` | `finish.py` (implied by "the closeout saga") | **`dispatch.py`** | `finish.start_finish` calls `dispatch.start_dispatch`, and `dispatch._run_dispatch` was the only caller of `closeout_shell` — mutual. It is a pure f-string builder for the tmux command a dispatch runs, takes the brief as a parameter and touches none of the `CLOSEOUT_*` constants, so it carries nothing with it. Direction becomes `finish → dispatch`, one way. |
 
-**The one true cycle, and the one late import.** `observer.collect_state` reaps `finish._closeouts`;
+**The one true cycle, and the one late import.** `observer.collect_state` reads `finish._closeouts`
+(it *reaped* it until the sweep thread landed — under a perpetual loop that write became a
+scheduled reap nobody requested, so pruning moved to `finish`, ENGINE.md §2.5);
 `finish.start_finish` invalidates `observer._cache`. This ADR pins `_closeouts`→finish and
 `_cache`→observer, so neither could simply move. It is broken at *import* time only: `finish`
 imports `observer` at module level (act depends on observe — the correct direction), and

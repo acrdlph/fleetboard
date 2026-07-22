@@ -153,9 +153,10 @@ The arrow from OBSERVER to SERVER is `snapshot()` / `wait_for()`. The arrow back
 > read *"Both live in `orchestra.py` at module scope (§2.7); the direction is enforced by a grep
 > test, not by the import system."* They no longer do. `observer.py` and `server.py` are separate
 > modules and the import system enforces the direction: `server` imports `observer`, never the
-> reverse. The one back-edge that exists — `observer.collect_state` reaping `finish._closeouts` —
-> is a **deliberate, commented function-local import**, which is exactly the kind of thing a grep
-> test could not have caught. The rule is unchanged; its enforcement got stronger.
+> reverse. The one back-edge that exists — `observer.collect_state` READING `finish._closeouts`
+> (it reaped it until step 2 shipped; §2.5's deletion is done) — is a **deliberate, commented
+> function-local import**, which is exactly the kind of thing a grep test could not have caught.
+> The rule is unchanged; its enforcement got stronger.
 
 ### 2.2 Why ENGINE / BROKER / ACTUATOR was rejected
 
