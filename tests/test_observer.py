@@ -41,7 +41,8 @@ def _git(cwd, *args):
 
 # ------------------------------------------------------ synthetic collect_state
 
-def fake_state(at, *, cards=(("alpha", 0),), cpu=1.0, etime="01:00", age_s=5,
+def fake_state(at, *, cards=(("alpha", 0),), cpu=1.0, etime="01:00",
+               last_write_at=1000.0,
                other_cpu=0.5, counts=None, status="working"):
     """A collect_state() result, hand-built. `publish` reads exactly four keys."""
     return {
@@ -51,7 +52,7 @@ def fake_state(at, *, cards=(("alpha", 0),), cpu=1.0, etime="01:00", age_s=5,
             {"name": name, "availability": "busy",
              "git": {"branch": "main", "dirty": dirty},
              "sessions": [{"sid": f"s-{name}", "status": status,
-                           "last_write_at": 1000.0, "age_s": age_s}],
+                           "last_write_at": last_write_at}],
              "live_procs": [{"pid": 7, "cpu": cpu, "etime": etime,
                              "tty": "ttys001", "reachable": True}]}
             for name, dirty in cards],
@@ -113,23 +114,41 @@ class TestVersioning(CacheGuard):
         self.assertEqual(seen, sorted(seen))
 
     def test_ticking_stopwatches_do_not_bump_the_version(self):
-        """age_s / cpu / etime move on their own. They still ship — they just
-        do not get a vote, or v would tick once a second forever."""
+        """cpu / etime move on their own. They still ship — they just do not
+        get a vote, or v would tick once a second forever."""
         o = fb.Observer()
-        o.publish(fake_state(1000.0, cpu=1.0, etime="01:00", age_s=5))
-        snap = o.publish(fake_state(1001.0, cpu=98.6, etime="01:01", age_s=6,
+        o.publish(fake_state(1000.0, cpu=1.0, etime="01:00"))
+        snap = o.publish(fake_state(1001.0, cpu=98.6, etime="01:01",
                                     other_cpu=77.7))
         self.assertEqual(snap.v, 1)
         # …and the reading a client renders is the NEW one, not the stale one
         self.assertEqual(snap.cards["alpha"]["live_procs"][0]["cpu"], 98.6)
-        self.assertEqual(snap.cards["alpha"]["sessions"][0]["age_s"], 6)
         self.assertEqual(snap.other_procs[0]["cpu"], 77.7)
 
-    def test_a_status_change_still_bumps_even_though_age_drove_it(self):
-        """age_s is out of the diff; what a threshold crossing MEANS is not."""
+    def test_a_session_has_no_stopwatch_left_to_exempt(self):
+        """The exemption list for sessions is EMPTY, and that is the assertion.
+
+        `age_s` was the only entry and it is off the wire, so a session object
+        is time-invariant end to end and the version diffs it whole. If a
+        now-derived field ever comes back, either it is exempted here — and
+        this goes red — or it is not, and `v` starts ticking on the clock."""
+        self.assertEqual(fb.observer._UNDIFFED_SESSION_KEYS, ())
+
+    def test_a_write_bumps_the_version_even_with_nothing_else_changed(self):
+        """The flip side of taking `age_s` out of the diff. A moving age was a
+        function of WHEN YOU ASKED and had to be exempted; `last_write_at` moves
+        only when an agent actually wrote a line, so it is real news and gets a
+        vote — a tool_use that changes no status and no visible text still
+        reaches a client as a new version."""
+        o = fb.Observer()
+        o.publish(fake_state(1000.0, last_write_at=1000.0))
+        self.assertEqual(o.publish(fake_state(1001.0, last_write_at=1000.5)).v, 2)
+
+    def test_a_status_change_bumps(self):
+        """What a threshold crossing MEANS is on the wire and in the diff."""
         o = fb.Observer()
         o.publish(fake_state(1000.0))
-        st = fake_state(1001.0, age_s=400)
+        st = fake_state(1001.0)
         st["worktrees"][0]["sessions"][0]["status"] = "ended"
         self.assertEqual(o.publish(st).v, 2)
 

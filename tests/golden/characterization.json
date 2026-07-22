@@ -70,7 +70,7 @@
   },
   "state_payload": {
    "cases": 1,
-   "sha256": "b4f2bba9c52b5bbf"
+   "sha256": "74d946ac25967456"
   }
  },
  "snapshot": {
@@ -98336,7 +98336,6 @@
        "sessions": [
         {
          "account": "main",
-         "age_s": "<int>",
          "branch": "main",
          "cwd": "<TMP>/code/alpha",
          "id": "sess-alp",
@@ -98378,7 +98377,6 @@
        "sessions": [
         {
          "account": "main",
-         "age_s": "<int>",
          "branch": "main",
          "cwd": "<TMP>/code/beta",
          "id": "sess-bet",
@@ -98421,7 +98419,6 @@
        "sessions": [
         {
          "account": "main",
-         "age_s": "<int>",
          "branch": "main",
          "cwd": "<TMP>/code/gamma",
          "id": "sess-gam",

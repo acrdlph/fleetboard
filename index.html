@@ -407,9 +407,10 @@ function rel(s) {
 }
 
 // ---- ages animate locally, off an absolute stamp ---------------------------
-// Sessions carry `last_write_at` (an absolute unix float — ENGINE.md §3.4), so
-// "wrote 12s ago" is the CLIENT's arithmetic against Date.now(), not a number
-// the server counted down for us. Rendering the server's `age_s` froze the age
+// Sessions carry `last_write_at` (an absolute unix float — ENGINE.md §3.4) and
+// NOTHING ELSE about time: the `age_s` that used to ride beside it is off the
+// wire. So "wrote 12s ago" is the CLIENT's arithmetic against Date.now(), not a
+// number the server counted down for us. Rendering the server's age froze it
 // for the whole 5s poll interval and then jumped; this ticks every second with
 // no round-trip. Same idiom as the resume countdown below.
 // The age is deliberately NOT in the card's html string: html that moved every
@@ -417,7 +418,7 @@ function rel(s) {
 // is now time-invariant, and only this one text node moves.
 function setAgeState(el) {
   const since = parseFloat(el.dataset.since);
-  if (!isFinite(since)) return;   // pre-`last_write_at` server: keep its age_s
+  if (!isFinite(since)) { el.textContent = "—"; return; }   // no stamp: say so
   el.textContent = rel(Math.max(0, Math.floor(Date.now() / 1000 - since))) + " ago";
 }
 function stampAges() { document.querySelectorAll(".age").forEach(setAgeState); }
@@ -512,7 +513,7 @@ function render(st) {
           <span class="st ${s.status}"><span class="g">${stt.glyph}</span> ${stt.label}${resetTick}</span>
           <span class="acct">[${esc(s.account)}]</span>
           <span class="meta">${esc(s.model || "?")}</span>
-          <span class="meta age" data-since="${s.last_write_at != null ? s.last_write_at : ""}">${s.last_write_at != null ? "" : rel(s.age_s) + " ago"}</span>
+          <span class="meta age" data-since="${s.last_write_at != null ? s.last_write_at : ""}"></span>
           ${s.subdir ? `<span class="subdir">./${esc(s.subdir)}</span>` : ""}
           ${s.branch && s.branch !== g.branch ? `<span class="meta"> ${esc(s.branch)}</span>` : ""}
           ${s.subagents_active ? `<span class="subag">⚙ subagents running</span>`
@@ -1165,11 +1166,18 @@ function openMission() {
   $("mText").focus();
 }
 // the board's session registry is keyed `worktree|sid`; a dispatch only knows
-// its worktree, so match on that and take the freshest session (lowest age).
+// its worktree, so match on that and take the freshest session.
+// THE ORDER INVERTS. This sorted ascending by `age_s`, where the freshest
+// session had the SMALLEST number and a missing value sorted last as 1e9. Off
+// `last_write_at` the freshest has the LARGEST number, so the comparator is
+// reversed and the sentinel for a missing stamp becomes -Infinity, not +1e9 —
+// keep both halves or the dispatch drawer opens a chat with the STALEST
+// session in the worktree, which is exactly the one nobody is talking to.
 function chatKeyForWorktree(wt) {
   const keys = Object.keys(REG).filter(k => REG[k].wt === wt);
   if (!keys.length) return null;
-  return keys.sort((a, b) => (REG[a].s.age_s ?? 1e9) - (REG[b].s.age_s ?? 1e9))[0];
+  const at = k => REG[k].s.last_write_at ?? -Infinity;
+  return keys.sort((a, b) => at(b) - at(a))[0];
 }
 // `ts` is the server's local time with no zone offset written on it, so a
 // client anywhere else renders it silently wrong. `ts_epoch` (added beside it,

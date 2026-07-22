@@ -567,7 +567,12 @@ class TestPairSessionsWithProcs(unittest.TestCase):
     """Which terminal belongs to which chat, for a worktree running several."""
 
     def _s(self, sid, account, age):
-        return {"sid": sid, "account": account, "age_s": age}
+        # Freshest-first is the CONTRACT (see the function's docstring); the
+        # pairing itself never reads a clock, so what decides these tests is
+        # list order. The stamp is still spelled the way the wire spells it —
+        # `last_write_at`, absolute, bigger is NEWER — so the fixture stays
+        # consistent for a reader that one day does consult it.
+        return {"sid": sid, "account": account, "last_write_at": 10_000.0 - age}
 
     def _p(self, pid, account):
         return {"pid": pid, "account": account}
@@ -821,9 +826,14 @@ class TestNoCountdownOnTheWire(ConfigGuard):
     """ENGINE.md §3.4 is a schema rule, so it gets a schema test: walk every
     payload this server composes and fail on any field that is a duration
     counted from the server's own `now`. Named fields rather than a heuristic —
-    `age_s` still ships beside `last_write_at` on purpose until step 6."""
+    a heuristic on the NAME would have to guess about `session_window_h`,
+    `sweep_ms` and `durationMs`, none of which are countdowns.
 
-    BANNED = {"resets_in", "resets_in_seconds", "resets_in_s"}
+    `age_s` joined the list when it came off the wire. It is the only entry
+    here that ever shipped, so it is the only one a regression could plausibly
+    re-add — which is exactly why it is named."""
+
+    BANNED = {"resets_in", "resets_in_seconds", "resets_in_s", "age_s"}
 
     def _walk(self, obj, path="$"):
         if isinstance(obj, dict):
@@ -1800,11 +1810,14 @@ class TestFireResume(ResumeGuard):
         super().tearDown()
 
     def board(self, status="limit", pid=None, reachable=True, handed=None,
-              present=True, loose_pid=None, age_s=7200):
-        # age_s defaults to "parked two hours" — what a limit-hit session looks
-        # like. Tests that mean "the agent moved on" pass a small age.
+              present=True, loose_pid=None, wrote_ago_s=7200):
+        # The board carries `last_write_at`, an ABSOLUTE stamp — `age_s` is off
+        # the wire — so the fixture takes an age and turns it into one here.
+        # It defaults to "wrote two hours ago", what a limit-hit session looks
+        # like; tests that mean "the agent moved on" pass a small age.
+        import time as _t
         sess = {"sid": "s1", "status": status, "pid": pid, "cwd": "/w/wt/sub",
-                "handed_to": handed, "age_s": age_s}
+                "handed_to": handed, "last_write_at": _t.time() - wrote_ago_s}
         procs = [{"pid": pid, "reachable": reachable}] if pid else []
         if loose_pid:   # someone ELSE's live terminal in the same worktree
             procs.append({"pid": loose_pid, "reachable": True})
@@ -1823,7 +1836,7 @@ class TestFireResume(ResumeGuard):
         return "wt|s1"
 
     def test_already_resumed_session_is_left_alone(self):
-        self.board(status="working", pid=9, age_s=5)
+        self.board(status="working", pid=9, wrote_ago_s=5)
         fb.fire_resume(self.arm())
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
         self.assertEqual(self.sent, [])
@@ -1833,7 +1846,7 @@ class TestFireResume(ResumeGuard):
         """3am, no browser has hit /api/limits, so the limit join never ran and
         the parked session reads 'waiting' instead of 'limit'. The old guard
         (status != "limit" -> done) cancelled the very resume it was armed for."""
-        self.board(status="waiting", pid=42, age_s=7200)
+        self.board(status="waiting", pid=42, wrote_ago_s=7200)
         fb.fire_resume(self.arm())
         self.assertEqual(self.sent, [(42, "continue")])
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
@@ -1841,7 +1854,7 @@ class TestFireResume(ResumeGuard):
     def test_session_that_wrote_since_arming_is_left_alone(self):
         """Movement is proven by a write after we armed — not by the status
         string, which the cold cache makes unreliable."""
-        self.board(status="waiting", pid=42, age_s=1)
+        self.board(status="waiting", pid=42, wrote_ago_s=1)
         fb.fire_resume(self.arm())
         self.assertEqual(self.sent, [])
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
@@ -1852,7 +1865,7 @@ class TestFireResume(ResumeGuard):
             with self.subTest(status=st):
                 fb._resumes.clear()
                 self.sent.clear()
-                self.board(status=st, pid=42, age_s=7200)
+                self.board(status=st, pid=42, wrote_ago_s=7200)
                 fb.fire_resume(self.arm())
                 self.assertEqual(self.sent, [])
 

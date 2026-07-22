@@ -188,6 +188,56 @@ CFG = {
     # ● WORKING after an agent is gone (driven, 6 runs: the transcript is
     # 0.82–0.87 s old at the moment the process disappears from `ps`).
     "orphan_grace_s": 90,      # a fresh write with no process: seen yet, or over
+    # `subagent_grace_s` — how long after the last write anywhere under
+    # `<session-id>/` the card still shows ⚙ subagents running. The last of the
+    # inherited numbers, and the only one that was measurably TOO SHORT.
+    #
+    # It is a display hint and nothing else: `subagents_active` is read by one
+    # line of index.html and feeds no status, no availability and no dispatch,
+    # so neither error can put two agents on one worktree. What it can do is
+    # flicker, and flicker is the thing this project spends numbers on.
+    #
+    # THE POPULATION IS NOT THE CONVERSATION'S. One `agent-*.jsonl` under the
+    # tree is one subagent's whole life, so its first and last timestamps
+    # bracket a span in which that subagent is definitely running. Measured
+    # over ~/.claude* — 8 homes, 148 trees, 18,145 runs (32 multi-hour files
+    # dropped: a resumed file, not one turn), 605,784 writes:
+    #
+    #                        p50     p95      p99
+    #     tree writes        0.2 s   5.9 s   27.0 s
+    #     main transcript    1.0 s  43.1 s  407.9 s
+    #
+    # An order of magnitude denser at the tail. A workflow agent writing
+    # steadily looks nothing like a conversation, which is the whole reason
+    # this could not go on borrowing `working_s`.
+    #
+    # But the gap distribution is the WRONG one to place a percentile in here,
+    # and that is the interesting part. `quiet_s` gets one draw per chance to
+    # misfire, because one misfire is one false summons. A subagent run is p50
+    # 23 writes long (p90 67), so 0.18 % of silences reaching 90 s is 1 RUN IN
+    # 15 whose ⚙ blinks off and back on mid-flight. The event that costs
+    # something is a run going dark AT ALL, so the distribution to choose from
+    # is the LONGEST silence inside one run: p50 13.4 s, p75 35.1, p90 71.3,
+    # p95 104.0, p99 195.2, p99.5 296.6, max 1200.
+    #
+    #      V    runs that blink   lit with nothing running   pp per added s
+    #     60        13.30 %              7.7 %                  0.394
+    #     90         6.57 %              9.4 %                  0.224   <- was
+    #    120         3.68 %             10.9 %                  0.096
+    #    150         1.83 %             12.2 %                  0.062
+    #    180         1.17 %             13.3 %                  0.022   <- now
+    #    240         0.71 %             15.4 %                  0.008
+    #    300         0.50 %             17.3 %                  0.004
+    #
+    # 180 is where `quiet_s`'s own rule puts it — between the p95 and the p99
+    # of the pause it must tolerate — and it is where the return per second of
+    # added lateness falls off a cliff (90→120 buys 0.096 pp/s, 120→150 0.062,
+    # 150→180 0.022, 180→240 0.008). It takes the flicker from 1 run in 15 to 1
+    # in 86 and pays for it with 3.9 pp more of an indicator lit after the work
+    # stopped — over-count on a hint, which is the harmless direction.
+    # On the board's OWN worktrees the case is stronger still: 123 runs, p95
+    # 252 s, 35.77 % blinking at 90 against 14.63 % at 180.
+    "subagent_grace_s": 180,   # last write under <session-id>/: still running
     # De-escalation dwell (ENGINE.md §6.3(a)): a status must stand this long
     # before it may quieten. Escalation toward more attention never waits. It
     # does NOT stack on `quiet_s` — see `status.settle`.

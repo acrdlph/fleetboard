@@ -152,7 +152,12 @@ class _Fleet(unittest.TestCase):
         self._save = {k: fb.CFG.get(k) for k in
                       ("roots", "homes", "pattern", "exclude_accounts",
                        "reserve_percent", "quiet_s", "working_s", "delegated_s",
-                       "block_grace_s", "orphan_grace_s")}
+                       "block_grace_s", "orphan_grace_s", "subagent_grace_s",
+                       # `max_sessions` joined the list the moment a test moved
+                       # it: unrestored, it silently truncated a LATER class's
+                       # fixture and that class failed for a reason that was
+                       # nowhere in its own code.
+                       "max_sessions")}
         self._demo, self._procs, self._cl = (fb.config.DEMO,
                                              fb.procs.claude_processes,
                                              fb.limits.cached_limits)
@@ -471,7 +476,9 @@ class TestTurnEndedIsPositional(_Fleet):
             user_msg("do a thing"), assistant_msg(text="done"), turn_end()])
         self._proc()
         s = self._session()
-        self.assertLess(s["age_s"], fb.CFG["working_s"])   # inside the window
+        # inside the window — the age is derived from the absolute stamp now,
+        # here as on the board, because `age_s` no longer rides the wire
+        self.assertLess(time.time() - s["last_write_at"], fb.CFG["working_s"])
         self.assertEqual(s["status"], "waiting")
         self.assertTrue(s["turn_ended"])                   # observed, on the wire
         self.assertEqual(fb.collect_state()["worktrees"][0]["availability"], "attention")
@@ -884,6 +891,196 @@ class TestTheGraceKeysAreWired(_Fleet):
         self.assertEqual(self._aged(fp, 15)["status"], "ended")
         fb._cache["state"] = None
         self.assertEqual(fb.collect_state()["free_worktrees"], ["myapp"])
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestTheOrderInverts(_Fleet):
+    """Session ORDER, now that it is read off an absolute stamp.
+
+    `age_s` sorted ASCENDING — the freshest session had the smallest number.
+    `last_write_at` sorts the same population DESCENDING, and every one of
+    these tests exists because the inverted version passed the whole suite:
+    four order mutations survived it, and a board that sorts backwards is
+    silent about it. Each test below is one of those four.
+
+    They are worth more than their subject suggests. The pre-sort decides
+    which session a live terminal is attributed to, and the final sort decides
+    which sessions survive `max_sessions` — so "sorted backwards" means the
+    board shows the stalest chats and hangs the pid on the wrong one.
+    """
+
+    def _home(self, label):
+        h = self.tmp / label
+        (h / "projects").mkdir(parents=True, exist_ok=True)
+        return h
+
+    def _sess(self, home, sid, ago_s, entries=None):
+        fp = write_transcript(home, self.repo, "main", sid=sid,
+                              entries=entries or [user_msg("go"),
+                                                  assistant_msg(text="on it")])
+        t = time.time() - ago_s
+        os.utime(fp, (t, t))
+        return fp
+
+    def _collect(self):
+        fb.memo_clear()
+        fb._cache["state"] = None
+        return fb.collect_state()["worktrees"][0]["sessions"]
+
+    def test_the_live_terminal_is_attributed_to_the_freshest_session(self):
+        """The pre-sort. `pair_sessions_with_procs` claims accounts in LIST
+        ORDER and its docstring says that list must be freshest-first, so the
+        order is the whole contract — one terminal, two chats on the same
+        account, and it belongs to the one being typed into."""
+        h = self._home(".claude")
+        fb.CFG["homes"] = [str(h)]
+        self._sess(h, "old", 3600)
+        self._sess(h, "fresh", 2)
+        fb.procs.claude_processes = lambda **_: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": "claude", "account": "main",
+            "tmux_target": None, "shells": 0}]
+        by_sid = {s["sid"]: s for s in self._collect()}
+        self.assertEqual(by_sid["fresh"]["pid"], 7)
+        self.assertIsNone(by_sid["old"]["pid"])
+
+    def test_the_cap_keeps_the_freshest_of_an_equal_status_group(self):
+        """The final sort. `max_sessions` truncates AFTER it, so with the
+        comparison inverted the card shows the two oldest chats in the
+        worktree and drops the one that just wrote."""
+        h = self._home(".claude")
+        fb.CFG["homes"] = [str(h)]
+        for sid, ago in (("oldest", 300), ("middle", 200), ("newest", 5)):
+            self._sess(h, sid, ago)
+        fb.CFG["max_sessions"] = 2
+        self.assertEqual([s["sid"] for s in self._collect()],
+                         ["newest", "middle"])
+
+    def _three_accounts(self):
+        """One worktree, three accounts: a limit-hit session parked an hour ago
+        and two live ones that wrote after it."""
+        homes = {lbl: self._home(d) for lbl, d in
+                 (("main", ".claude"), ("work", ".claude-work"),
+                  ("spare", ".claude-spare"))}
+        fb.CFG["homes"] = [str(h) for h in homes.values()]
+        self._sess(homes["main"], "parked", 3600)
+        self._sess(homes["spare"], "second", 60)
+        self._sess(homes["work"], "freshest", 5)
+        # one live terminal, on the parked account: without it the parked
+        # session reads ○ ENDED and never reaches the limit join at all
+        fb.procs.claude_processes = lambda **_: [{
+            "pid": 7, "cpu": 0.0, "etime": "01:00", "tty": None, "host": None,
+            "cwd": str(self.repo), "cmd": "claude", "account": "main",
+            "tmux_target": None, "shells": 0}]
+        fb._limits["data"] = {
+            "available": True, "fetched_at": time.time(),
+            "accounts": [{"slug": ".claude", "config_dir": str(homes["main"]),
+                          "ok": True, "plan": "max", "headroom_percent": 0,
+                          "limits": [{"label": "Session", "group": "session",
+                                      "percent": 100, "remaining_percent": 0,
+                                      "model_scoped": False,
+                                      "exhausted_now": True,
+                                      "resets_at": time.time() + 3600}]}]}
+        return homes
+
+    def test_the_handoff_names_the_account_that_wrote_LAST(self):
+        """A limit-hit session whose worktree has a fresher live session is no
+        longer the actionable one. FRESHER is `last_write_at` GREATER — and
+        with two candidates the annotation must name the most recent, not
+        merely one of them. `min` here survived the whole suite."""
+        saved = dict(fb._limits)
+        try:
+            self._three_accounts()
+            by_sid = {s["sid"]: s for s in self._collect()}
+            self.assertEqual(by_sid["parked"]["status"], "limit")
+            self.assertEqual(by_sid["parked"]["handed_to"], "work")
+            self.assertNotIn("handed_to", by_sid["freshest"])
+        finally:
+            fb._limits.clear()
+            fb._limits.update(saved)
+
+    def test_a_handed_off_session_sinks_below_the_live_ones(self):
+        """The 4.5 rank, and the freshest-first tiebreak among the rest."""
+        saved = dict(fb._limits)
+        try:
+            self._three_accounts()
+            self.assertEqual([s["sid"] for s in self._collect()],
+                             ["freshest", "second", "parked"])
+        finally:
+            fb._limits.clear()
+            fb._limits.update(saved)
+
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestTheSubagentIndicatorHasItsOwnClock(_Fleet):
+    """`subagents_active` (the ⚙ on the card) against real bytes.
+
+    It read `working_s` for two releases, and the measurement says 90 s is
+    the wrong number for THIS population: a subagent tree is an order of
+    magnitude denser than a conversation at the tail (p99 27 s against 408 s),
+    and a run is p50 23 writes long, so a silence rate that would be fine per
+    summons blinked the ⚙ off mid-flight on 1 run in 15. `subagent_grace_s`
+    is 180; config.py carries the distribution.
+
+    The gap between the two numbers is the whole test. 120 s is past
+    `working_s` and inside `subagent_grace_s`, so this class is red the moment
+    the old constant comes back — which is exactly what the last two phases
+    learned to check for.
+    """
+
+    def _tree(self):
+        """A session whose main transcript is long idle and whose subagent tree
+        is the only thing moving — the case the indicator exists for."""
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("delegate everything"), assistant_msg(text="delegated"),
+            turn_end()])
+        old = time.time() - 3600
+        os.utime(fp, (old, old))
+        sub = fp.with_suffix("")
+        sub.mkdir()
+        sf = sub / "agent-1.jsonl"
+        sf.write_text(json.dumps(assistant_msg(text="still going")) + "\n")
+        return sf
+
+    def _aged(self, sf, secs):
+        t = time.time() - secs
+        os.utime(sf, (t, t))
+        fb.memo_clear()
+        fb._cache["state"] = None
+        return fb.collect_state()["worktrees"][0]["sessions"][0]
+
+    def test_a_subagent_quiet_past_working_s_is_still_running(self):
+        sf = self._tree()
+        g = fb.CFG["subagent_grace_s"]
+        self.assertGreater(g, fb.CFG["working_s"])     # the split is the point
+        self.assertTrue(self._aged(sf, 5)["subagents_active"])
+        # past the OLD number, inside the measured one: 90 s said "no subagents"
+        # here, and the tree had written 30 s later in 1 run out of 15
+        self.assertTrue(self._aged(sf, fb.CFG["working_s"] + 30)["subagents_active"])
+        self.assertTrue(self._aged(sf, g - 5)["subagents_active"])
+
+    def test_it_does_go_out_eventually(self):
+        """The other error. A lit ⚙ on a tree that finished is over-count, and
+        it has to be bounded or the indicator means nothing."""
+        sf = self._tree()
+        self.assertFalse(self._aged(sf, fb.CFG["subagent_grace_s"] + 5)["subagents_active"])
+
+    def test_the_key_is_what_decides_it(self):
+        """Moving the key alone moves the answer — the proof that the call site
+        reads THIS number and not one of the four others in CFG."""
+        sf = self._tree()
+        fb.CFG["subagent_grace_s"] = 10
+        self.assertTrue(self._aged(sf, 5)["subagents_active"])
+        self.assertFalse(self._aged(sf, 15)["subagents_active"])
+        fb.CFG["subagent_grace_s"] = 600
+        self.assertTrue(self._aged(sf, 300)["subagents_active"])
+
+    def test_a_session_with_no_tree_at_all_never_lights_it(self):
+        write_transcript(self.home, self.repo, "main", sid="s2", entries=[
+            user_msg("do it yourself"), assistant_msg(text="on it")])
+        fb._cache["state"] = None
+        for s in fb.collect_state()["worktrees"][0]["sessions"]:
+            self.assertFalse(s["subagents_active"])
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")

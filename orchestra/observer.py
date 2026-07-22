@@ -166,10 +166,14 @@ def collect_state(fresh=None, git=None, cold=False, settle=None):
         alive = [s for s in ss if s["status"] in ("working", "waiting", "needs_input", "blocked")]
         for s in ss:
             if s["status"] == "limit":
-                succ = [a for a in alive if a["age_s"] < s["age_s"]]
+                # FRESHER, off the absolute stamp: `age_s` has left the wire and
+                # the comparison inverts with it — a successor wrote LATER, so
+                # its `last_write_at` is LARGER where its age was SMALLER.
+                succ = [a for a in alive if a["last_write_at"] > s["last_write_at"]]
                 if succ:
-                    s["handed_to"] = min(succ, key=lambda a: a["age_s"])["account"]
-        ss.sort(key=lambda s: (4.5 if s.get("handed_to") else rank[s["status"]], s["age_s"]))
+                    s["handed_to"] = max(succ, key=lambda a: a["last_write_at"])["account"]
+        ss.sort(key=lambda s: (4.5 if s.get("handed_to") else rank[s["status"]],
+                               -s["last_write_at"]))
 
     def _attention_statuses(ss):
         return [s["status"] for s in ss
@@ -534,20 +538,25 @@ class Snapshot:
     sweep_ms: float = 0.0
 
 
-# The stopwatches. Three card fields move on their own with nothing in the
-# world having changed: `age_s` is `int(now - last_write_at)` and ticks once a
-# second, `etime` is the same shape off `ps`, and `cpu` is a resampled
-# percentage. All three ride the wire — the board draws them — but none may
-# decide a version. Left in the diff, `v` would tick once a second forever on
-# any box with a live agent, deltas would degenerate to full snapshots, and the
-# notifier would fire on nothing. §3.2 says diff the composed view; this says
-# the composed view is the card minus its stopwatches.
+# The stopwatches. Card fields that move on their own with nothing in the world
+# having changed: `etime` off `ps` and `cpu`, a resampled percentage. Both ride
+# the wire — the board draws them — but neither may decide a version. Left in
+# the diff, `v` would tick once a second forever on any box with a live agent,
+# deltas would degenerate to full snapshots, and the notifier would fire on
+# nothing. §3.2 says diff the composed view; this says the composed view is the
+# card minus its stopwatches.
 #
-# Nothing is lost by removing them: every one has an ABSOLUTE twin already in
-# the same object — `last_write_at` beside `age_s` in `scan_sessions` — and
-# `status`, which is what a threshold crossing actually means, keeps its vote.
+# Nothing is lost by removing them: `status`, which is what a threshold crossing
+# actually means, keeps its vote.
+#
+# SESSIONS NO LONGER HAVE ONE. `age_s` was the third, and the exemption existed
+# only because it shipped: it is off the wire now (§3.4), so a session object is
+# time-invariant end to end and the version diffs it WHOLE. The empty tuple is
+# the assertion, not an oversight — `_diffable` skips the rebuild entirely when
+# there is nothing to strip, and `test_session_stopwatches_are_gone` fails if a
+# now-derived key ever comes back.
 _UNDIFFED_PROC_KEYS = ("cpu", "etime")
-_UNDIFFED_SESSION_KEYS = ("age_s",)
+_UNDIFFED_SESSION_KEYS = ()
 
 
 def _strip(items, keys):
@@ -557,12 +566,13 @@ def _strip(items, keys):
 def _diffable(card):
     """The card as the version sees it: identical but for the stopwatches."""
     live, sess = card.get("live_procs"), card.get("sessions")
-    if not live and not sess:
+    strip_sess = bool(sess) and bool(_UNDIFFED_SESSION_KEYS)
+    if not live and not strip_sess:
         return card
     out = dict(card)
     if live:
         out["live_procs"] = _strip(live, _UNDIFFED_PROC_KEYS)
-    if sess:
+    if strip_sess:
         out["sessions"] = _strip(sess, _UNDIFFED_SESSION_KEYS)
     return out
 
@@ -1079,7 +1089,7 @@ def demo_state():
         seq[0] += 1
         return {"id": "demo0000", "sid": sid or f"demo-{seq[0]}",
                 "account": acct, "status": status,
-                "last_write_at": now - age, "age_s": age,
+                "last_write_at": now - age,
                 "cwd": "/demo", "subdir": subdir, "branch": None, "model": model,
                 "pending_tools": pend or [], "topic": topic, "last_assistant": said}
 

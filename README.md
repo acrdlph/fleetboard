@@ -254,7 +254,11 @@ Persistent settings go in `orchestra.config.json` next to the script
 | `session_window_h` | `48` | ignore transcripts idle longer than this |
 | `quiet_s` | `45` | unexplained silence before a live agent stops reading WORKING |
 | `flicker_dwell_s` | `3.0` | a status must stand this long before it may quieten; escalation never waits |
-| `working_s` | `90` | the two graces `quiet_s` did **not** take over: how long an unresolved tool is "running" rather than BLOCKED, and how long a fresh write with no visible process is WORKING rather than ENDED |
+| `block_grace_s` | `60` | how long an unresolved tool_use is a tool **running** before it is you it is waiting for (■ BLOCKED) |
+| `orphan_grace_s` | `90` | how long a fresh write with **no** visible process is still WORKING rather than ○ ENDED — the dangerous one: ENDED makes a worktree FREE, and FREE is what dispatch aims at |
+| `delegated_s` | `600` | shelf life of a background launch that never reported back, as an explanation for a quiet session |
+| `subagent_grace_s` | `180` | how long after the last write under `<session-id>/` the card still shows **⚙ subagents running** |
+| `working_s` | `90` | the fallback the four keys above are `None`-defaulted to. Nothing on the board reaches it any more — every call site names the clock it means. Change one of those instead |
 | `max_sessions` | `6` | sessions shown per worktree card |
 | `exclude_accounts` | `[]` | account labels dispatch/router never **auto**-picks |
 | `reserve_percent` | `{}` | `{label: pct}` headroom kept free before AUTO-pick treats an account as full |

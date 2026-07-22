@@ -843,10 +843,11 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                     # degenerates to "everything changed". It also lets the
                     # client animate "wrote 2.3s ago" off Date.now() at frame
                     # rate instead of stepping once per poll.
-                    # `age_s` ships alongside it for one release (index.html,
-                    # map.html and the suite still read it); removed in step 6.
+                    # The `age_s` that used to ride beside it is GONE from the
+                    # wire (both clients animate off this stamp now). Age is
+                    # still computed — below, from `now`, for the ladder and
+                    # the sort — it just never leaves the process.
                     "last_write_at": last_write,
-                    "age_s": int(age),
                     "cwd": cwd,
                     "subdir": os.path.relpath(cwd, wt) if cwd != wt else None,
                     "branch": tail["branch"],
@@ -873,7 +874,13 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                     "last_assistant": tail["last_assistant"],
                     "last_user": tail["last_user"],
                     "subagent_said": subagent_said,
-                    "subagents_active": bool(sub_mtime and now - sub_mtime < config.CFG["working_s"]),
+                    # Its own clock at last, and a longer one: `working_s` was
+                    # measured on a conversation's silences and this tree is an
+                    # order of magnitude denser, so 90 s blinked the ⚙ off
+                    # mid-flight on 1 subagent run in 15. config.py carries the
+                    # distribution and the trade.
+                    "subagents_active": bool(
+                        sub_mtime and now - sub_mtime < config.CFG["subagent_grace_s"]),
                 })
                 if tail["turn_ended"]:
                     # conditional, like tool_running/bg_shell: present means
@@ -890,7 +897,12 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
 
     rank = {"needs_input": 0, "blocked": 1, "working": 2, "waiting": 3, "ended": 4}
     for wt, sessions in by_wt.items():
-        sessions.sort(key=lambda s: s["age_s"])
+        # FRESHEST FIRST. This used to read `key=age_s` ascending; the same
+        # order off the absolute stamp is `last_write_at` DESCENDING — a bigger
+        # age is OLDER, a bigger stamp is NEWER. `reverse=True` rather than a
+        # negated key because Python's sort is stable in both directions: equal
+        # stamps keep glob order, exactly as equal ages did.
+        sessions.sort(key=lambda s: s["last_write_at"], reverse=True)
         # A live process proves at most ONE session is really attended.
         # N procs under a worktree vouch for its N freshest sessions —
         # freshness beats cwd matching (recorded cwds drift as agents cd
@@ -913,8 +925,13 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
             s["pid_certain"] = bool(proc and proc.get("account") == s["account"])
             # `sess_status`, not `status`: the module object of that name is
             # what classify_session now hangs off, and a local would shadow it.
+            # Age is derived HERE, from this sweep's `now`, and handed to the
+            # ladder as an argument — it is not a field on the session and
+            # never reaches the wire. The old `int(age)` rounding is gone with
+            # it, which changes nothing: every threshold is an integer, and
+            # `int(a) < T` and `a < T` agree for integer T on a non-negative a.
             sess_status, tool_running = status.classify_session(
-                s["age_s"], alive, s["pending_tools"],
+                now - s["last_write_at"], alive, s["pending_tools"],
                 s["pending_workflows"] + s["pending_bg_agents"]
                 + s["pending_bg_tools"],
                 skip_perms, config.CFG["working_s"], shell_n,
@@ -934,6 +951,7 @@ def scan_sessions(worktrees, all_procs, now, cold=False):
                 s["tool_running"] = True
                 if shell_n and not s["pending_tools"]:
                     s["bg_shell"] = True     # transcript idle, shell alive
-        sessions.sort(key=lambda s: (rank[s["status"]], s["age_s"]))
+        # severity, then freshest first — same inversion as the sort above
+        sessions.sort(key=lambda s: (rank[s["status"]], -s["last_write_at"]))
         by_wt[wt] = sessions[: config.CFG["max_sessions"]]
     return by_wt

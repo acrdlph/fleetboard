@@ -309,8 +309,12 @@ def fire_resume(key):
     # resets, which is precisely when we fire. An idle prompt looks identical
     # whether the agent ran out of juice or finished its turn. A write *after we
     # armed* is the thing that actually proves it moved on under its own steam.
-    age = s.get("age_s") if s else None
-    if age is not None and now - float(age) > float(r.get("created_at") or 0):
+    # Straight off the absolute stamp. This used to reconstruct the write clock
+    # as `now - age_s`, which mixed two clocks — the snapshot's `now` and this
+    # firing's — and rounded to the second on the way through; `last_write_at`
+    # IS the write clock, so the comparison is now the one the sentence means.
+    wrote_at = s.get("last_write_at") if s else None
+    if wrote_at is not None and float(wrote_at) > float(r.get("created_at") or 0):
         return _resume_set(key, status="done", fired_at=now, message=
                            f"session moved on since arming ({s['status']}) — nothing sent")
 

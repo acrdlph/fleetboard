@@ -351,7 +351,12 @@ function tipHTML(b) {
   h += `<div class="dim mo">forked ${rel(now-b.fork_ts)} ago</div>`;
   if (wt) {
     for (const s of wt.sessions.slice(0, 3))
-      h += `<div class="dim mo">· ${esc(s.status)} [${esc(s.account)}]${s.handed_to ? ` ↳ continued by [${esc(s.handed_to)}]` : ""} ${esc(s.model||"")} ${rel(s.age_s)} ago</div>`;
+      // `last_write_at` is absolute (ENGINE.md §3.4) and `age_s` is gone, so the
+      // age is computed here. Against Date.now(), NOT against `topo.generated_at`
+      // like the commit stamps above it: those come from the topology payload and
+      // this comes from /api/state, two fetches on two clocks — subtracting one
+      // payload's stamps from the other's would show ages minutes out.
+      h += `<div class="dim mo">· ${esc(s.status)} [${esc(s.account)}]${s.handed_to ? ` ↳ continued by [${esc(s.handed_to)}]` : ""} ${esc(s.model||"")} ${s.last_write_at != null ? rel(Date.now()/1000 - s.last_write_at) + " ago" : "—"}</div>`;
     for (const p of wt.live_procs)
       h += `<div class="mut mo">⌖ ${p.pid}${p.tty ? " · " + esc(p.tty) : ""}${p.host ? " · " + esc(p.host) : ""} <span class="dim">— click to focus</span></div>`;
   }
