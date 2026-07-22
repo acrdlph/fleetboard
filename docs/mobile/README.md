@@ -16,10 +16,11 @@ are.
 
 | | |
 |---|---|
-| **Phase** | A — design (nearly settled) · first code shipped |
-| **Shipped** | **Layer 0** — classifier ladder reordered (`classify_session`, now `orchestra/status.py`). 142 tests pass; input-space diff confirms only the two intended changes. · **ADR 0010** — `orchestra.py` split into the `orchestra/` package, behaviour-identical against `tests/characterize.py` (1,589 pinned cases). |
-| **Next milestone** | collapse the git subprocess storm (see *Development path*, step 1) |
-| **Last updated** | 2026-07-21 |
+| **Phase** | B — backend, in flight |
+| **Shipped** | steps 0–3 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core |
+| **Next** | step 5 (the status model) then step 4 (SSE) — see *Development path* |
+| **Tests** | 349 · characterization 1,592 cases |
+| **Last updated** | 2026-07-22 |
 
 Design documents are being generated and reconciled. Until each is listed as **settled** below,
 treat it as draft.
@@ -112,17 +113,38 @@ Each step is independently shippable and independently valuable. Steps 1–2 mak
 browser board** dramatically faster and carry no iOS risk at all — they would be worth doing
 even if the phone client were cancelled.
 
-| step | what | expected result |
+| step | what | result |
 |---|---|---|
-| **1** | Collapse the git storm: one `git status --porcelain=v2 --branch` per worktree instead of five calls; parallelise across worktrees; memoise on `stat()` of `.git/HEAD` + index | 1641 ms → ~200 ms |
-| **2** | Move collection off the request path onto a continuous background loop with a monotonic state version | requests stop blocking; push becomes possible |
-| **3** | Event-driven invalidation via `kqueue` — react to transcript and git writes instead of sweeping | sub-second detection |
-| **4** | SSE to the browser with a delta protocol; retire the 5 s poll | sub-second board updates |
-| **5** | Revisit the status model — tighten `working_s = 90` using precise write timestamps, with an anti-flicker rule | `WORKING` stops lying |
-| **6** | Ingest Claude Code hooks; reconcile signal sources by rank | `BLOCKED` / `YOUR TURN` become observed, not inferred |
-| **7** | Auth, device pairing, tailnet bind | the server is safe to reach from a phone |
-| **8** | APNs event pipeline | alerts reach a locked phone |
-| **9** | iOS client, against the now-settled contract | the actual app |
+| **0** ✅ | three unattended-path bugs | an armed 3am resume fired at all; one resume stopped costing 3× usage; 27/654 transcripts stopped quoting the harness back as you |
+| **1** ✅ | git storm: 5 spawns → 2, parallelised | `collect_state` 1641 → 506 ms |
+| **2** ✅ | publish point — background sweep, versioned immutable snapshots | `/api/state` 506 ms → **0.8 ms**; push becomes possible at all |
+| **—** ✅ | make the sweep affordable: git on a 15 s cadence, transcript memo, `(pid,start)` cwd memo | 55% → 15% of a core |
+| **3** ✅ | kqueue watcher — react to writes instead of sweeping | idle **5.3%** of a core; write→board ~1 s (was a 30 s cadence); 220 fds |
+| **—** ✅ | identity-addressed mutations (ADR 0008) | a recycled pid is refused, not delivered to the wrong agent |
+| **5** ⬜ | **status model — `working_s = 90`** | `WORKING` stops lying. **Next.** |
+| **4** ⬜ | SSE + delta protocol; retire the 5 s browser poll | the browser finally sees the ~1 s the server already knows |
+| **6** ⬜ | Claude Code hooks; reconcile signal sources by rank | `BLOCKED`/`YOUR TURN` become observed, not inferred |
+| **7** ⬜ | auth, device pairing, tailnet bind | safe to reach from a phone |
+| **8** ⬜ | APNs event pipeline | alerts reach a locked phone |
+| **9** ⬜ | iOS client, against the settled contract | the actual app |
+
+**Why 5 before 4.** Notifications fire on status *transitions*. Building the SSE stream and the
+APNs pipeline on a status model we already know is wrong means every transition changes
+underneath them later, and the notifier gets rebuilt. Settle what a status means, then stream it.
+Step 3 is also what makes step 5 possible: the 90 s window existed because a stateless collector
+could only ask "is the mtime within 90 s?" — precise write timestamps now exist and are unused.
+
+## Open items — deliberately deferred, not forgotten
+
+| item | why it is parked | where |
+|---|---|---|
+| `age_s` still ships beside `last_write_at` | one release of overlap so nothing breaks; remove with step 6 | `transcripts.py` |
+| `working_s = 90`, and `thinking_s`/`block_grace_s`/`orphan_grace_s` default to it | Layer 0 kept them conservative so it was provably behaviour-identical; tightening is step 5 and needs the anti-flicker rule | `status.py`, `config.py` |
+| transcript memo can be defeated by a size+mtime_ns+inode-identical rewrite | adversarial only — transcripts are append-only; the 60 s cold reconcile bounds it | ADR 0011 |
+| `dirty` cannot be memoised | it is the working tree; no cheap stat sees an edit. Bounded by `GIT_S` and dated by `freshness["git"]` | ADR 0011 |
+| a dispatch's new branch is not nudged | the branch is cut by the launched agent minutes later, with no signal back; bounded by `GIT_S` | `dispatch.py` |
+| `ENGINE.md` is stale in three places | measurement supersedes it; the doc is a design record, not rewritten | ADR 0011 |
+| the transcript corpus is ~5 GB / 18,773 files, +1,000/day | orchestra's own inputs are a slow disk leak; wants a retention policy | — |
 
 **The load-bearing interface is the delta/event format introduced at step 4.** The browser
 consumes it over SSE, the APNs pipeline is derived from it, and the Swift client reconciles
