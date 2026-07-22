@@ -220,7 +220,7 @@ that, with `/proc`-based process detection. Optional: `tmux` (dispatch),
 
 ```bash
 python3 -m orchestra [--root DIR]... [--pattern REGEX] [--home DIR]...
-                      [--port N] [--window-h H] [--demo]
+                      [--port N] [--window-h H] [--idle-s S] [--demo]
 ./start.sh            # restart + open browser (extra args passed through)
 ```
 
@@ -231,6 +231,7 @@ python3 -m orchestra [--root DIR]... [--pattern REGEX] [--home DIR]...
 | `--home DIR` | auto | Claude home dirs; default finds `~/.claude*` |
 | `--port N` | 4242 | also `ORCHESTRA_PORT` env |
 | `--window-h H` | 48 | ignore transcripts idle longer than this many hours |
+| `--idle-s S` | 3.0 | seconds between sweeps when nothing is changing (see below) |
 | `--demo` | — | fictional data (screenshots, kicking the tires) |
 
 Persistent settings go in `orchestra.config.json` next to the script
@@ -238,8 +239,69 @@ Persistent settings go in `orchestra.config.json` next to the script
 
 ```json
 { "roots": ["/Users/you/code"], "pattern": "myproject", "cclimits_cmd": null,
-  "exclude_accounts": [], "router_home": null, "reserve_percent": {"main": 20} }
+  "exclude_accounts": [], "router_home": null, "reserve_percent": {"main": 20},
+  "idle_s": 3.0, "git_s": 15.0 }
 ```
+
+| key | default | meaning |
+|---|---|---|
+| `roots` | `[cwd]` | dirs whose git-repo children are watched |
+| `pattern` | `""` | regex filter on worktree dir names |
+| `homes` | `[]` | Claude home dirs; `[]` auto-discovers `~/.claude*` |
+| `host` / `port` | `127.0.0.1` / `4242` | keep the host on loopback: the board serves your transcript text |
+| `session_window_h` | `48` | ignore transcripts idle longer than this |
+| `working_s` | `90` | a transcript written within this reads as WORKING |
+| `max_sessions` | `6` | sessions shown per worktree card |
+| `exclude_accounts` | `[]` | account labels dispatch/router never **auto**-picks |
+| `reserve_percent` | `{}` | `{label: pct}` headroom kept free before AUTO-pick treats an account as full |
+| `cclimits_cmd` / `router_home` | `null` | override the limits binary / pin the router to one Claude home |
+| `resume_delay_s` | `60` | auto-resume fires this long after a limit reset |
+| `resume_message` | `"continue"` | what auto-resume types at the stalled agent |
+| **the sweep's cadences** | | *costs measured below; all five are seconds* |
+| `idle_s` | `3.0` | between sweeps when nothing is changing — **the battery knob** |
+| `hot_s` | `0.15` | floor between sweeps after a mutation, so a burst can't spin the loop |
+| `git_s` | `15.0` | minimum between `git` fan-outs |
+| `reconcile_s` | `60.0` | how often a sweep goes cold: bypass every cache, count the disagreements |
+| `max_stale_s` | `8.0` | hard ceiling between sweeps |
+
+**What the cadences cost.** orchestra watches continuously — one thread sweeps
+forever, so the board hears that an agent needs you without anybody refreshing
+anything. That is a real, permanent CPU cost, which is why it is a setting and
+why here is the bill. Measured on a nine-worktree fleet (709 transcripts on
+disk, ~47 inside the 48 h window), 120 s per row, with
+`getrusage(RUSAGE_SELF) + RUSAGE_CHILDREN` — wall time and `ps -o time` on the
+server process both understate this by ~2×, because the sweep is a parallel
+fan-out and most of its cost is billed to the `git` and `ps` children it
+spawns. One knob varies per row; the rest are at their defaults:
+
+| | | CPU (1 core = 100 %) | sweeps / git runs | what you trade |
+|---|---|---|---|---|
+| `idle_s` | `5.0` | 16 % | 24 / 8 | |
+| | **`3.0`** | **17 %** | 40 / 8 | the default |
+| | `2.0` | 19 % | 60 / 8 | |
+| | `1.0` | 28 % | 119 / 8 | notice ~2 s sooner, for ~1.6× the CPU |
+| `git_s` | `5.0` | 29 % | 40 / 20 | branch/ahead/behind/dirty ≤5 s old |
+| | **`15.0`** | **17 %** | 40 / 8 | the default |
+| | `60.0` | 9 % | 40 / 2 | a dirty count can be a minute stale |
+| `reconcile_s` | **`60.0`** | **17 %** | 40 / 8 | the default |
+| | off | 16 % | 40 / 8 | saves ~1 point; nothing audits the caches |
+
+Read that table before tuning `idle_s`, because it is not the knob it looks
+like. **`git_s` is.** The `git` fan-out is 79 % of a sweep's cost, so what
+dominates the bill is how often git runs, not how often the sweep does —
+tripling the sweep rate (3.0 → 1.0) costs 11 points, while tripling the git
+rate (15 → 5) costs 12 on its own. A sweep that skips git is cheap: that is
+what the transcript and process caches bought, and it is why 5.0 and 3.0 are
+one point apart. And `reconcile_s` — the cold pass that bypasses every cache
+and counts what they got wrong — is close to free, so turning it off buys a
+rounding error and gives up the only thing that can catch a cache lying.
+
+Both budgets are for changes **nobody told the board about** — an agent going
+quiet, a file saved in an editor. Every mutation you make on the board
+(finish, dispatch, chat) nudges the sweep, which pulls the next one forward
+*and* forces git off its cadence, so you never wait out `git_s` for your own
+actions. And nothing is ever silently stale: each card publishes how old its
+git data is.
 
 `exclude_accounts` names accounts (by label) that dispatch/router will never
 **auto**-pick — useful for keeping a primary account (e.g. `main` = `~/.claude`)

@@ -37,7 +37,21 @@ CFG = {
     "max_sessions": 6,         # per worktree card
     "exclude_accounts": [],    # account labels never AUTO-picked for dispatch
     "reserve_percent": {},     # {label: pct} buffer kept free before AUTO-pick treats account as full ("*" = default)
-    "git_s": 15.0,             # min seconds between git fan-outs on the sweep (ENGINE.md §2.5)
+    # The sweep's five cadences (ENGINE.md §2.5). They are keys and not
+    # constants because they trade notification latency against battery, and
+    # the right trade belongs to whoever owns the laptop: measured on a
+    # nine-worktree fleet, `idle_s` 3.0 costs 17 % of one core continuously
+    # and 1.0 costs 28 %. Every default here is the measured value shipped in
+    # observer.py, which is where the measurements and the reasoning live —
+    # read the tables beside IDLE_S/GIT_S before changing one, and note that
+    # `git_s` moves the bill more than `idle_s` does. Observer(idle_s=…) still
+    # wins over the file: the tests drive the loop at cadences no user would
+    # choose.
+    "idle_s": 3.0,             # seconds between sweeps with no evidence of change
+    "hot_s": 0.15,             # floor between sweeps after a nudge, so a burst can't spin
+    "git_s": 15.0,             # min seconds between git fan-outs on the sweep
+    "reconcile_s": 60.0,       # cold sweep: bypass every memo, count the disagreements
+    "max_stale_s": 8.0,        # never wait longer than this between sweeps
     "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
     "resume_message": "continue",  # what auto-resume types at the stalled agent
 }
@@ -56,6 +70,16 @@ def load_config(argv=None):
     ap.add_argument("--port", type=int, help="port (default 4242, env ORCHESTRA_PORT)")
     ap.add_argument("--host", help="bind address (default 127.0.0.1 — the board serves your transcript text; do not expose it)")
     ap.add_argument("--window-h", type=float, help="ignore transcripts idle longer than this many hours (default 48)")
+    # One flag for one knob. `idle_s` is the only cadence a user has a reason
+    # to change from the command line — it is the battery/latency dial — so it
+    # gets the `--window-h` treatment. The other four (hot_s, git_s,
+    # reconcile_s, max_stale_s) stay file-only, like `working_s`: they are
+    # tuning for someone who has already read observer.py, and a flag each
+    # would be five ways to misconfigure the loop for one that is used.
+    ap.add_argument("--idle-s", type=float, metavar="S",
+                    help="seconds between sweeps when nothing is changing "
+                         "(default 3.0, ~17%% of one core; 1.0 notices ~2s "
+                         "sooner and costs ~28%%)")
     ap.add_argument("--config", metavar="FILE", help="path to a orchestra.config.json")
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)
@@ -81,6 +105,9 @@ def load_config(argv=None):
     if args.port: CFG["port"] = args.port
     if args.host: CFG["host"] = args.host
     if args.window_h: CFG["session_window_h"] = args.window_h
+    # `is not None`, not truthiness: `--idle-s 0` is a spin loop and must reach
+    # the loop as the mistake it is, not be silently ignored as a default.
+    if args.idle_s is not None: CFG["idle_s"] = args.idle_s
     return args
 
 

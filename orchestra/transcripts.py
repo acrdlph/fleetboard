@@ -61,12 +61,14 @@ HEAD_BYTES = 16 * 1024
 #
 # TWO RULES, and they are the whole reason this is safe:
 #
-# * THE KEY CONTAINS EVERYTHING THAT CAN CHANGE THE ANSWER. Size AND mtime_ns,
-#   so an append is a miss; `(st_dev, st_ino)` and not just the path, so a
-#   transcript that is rotated or replaced under its own name is a miss too.
-#   That trap is not hypothetical: `_proven_in_transcript` kept a byte offset
-#   with no identity check, a delivered message read as undelivered, and an
-#   agent redid its work three times at 3x usage (ENGINE.md §4.2).
+# * THE KEY CONTAINS EVERYTHING THAT CAN CHANGE THE ANSWER — everything a real
+#   writer changes, at any rate; `StatMemo`'s docstring records exactly where
+#   that stops being true and why the reconcile below bounds it. Size AND
+#   mtime_ns, so an append is a miss; `(st_dev, st_ino)` and not just the path,
+#   so a transcript that is rotated or replaced under its own name is a miss
+#   too. That trap is not hypothetical: `_proven_in_transcript` kept a byte
+#   offset with no identity check, a delivered message read as undelivered, and
+#   an agent redid its work three times at 3x usage (ENGINE.md §4.2).
 # * IT IS BOUNDED. The corpus grows ~982 `.jsonl`/day, so an unbounded map is a
 #   leak with a multi-day uptime (§4.7). LRU cap plus an idle sweep, below.
 #
@@ -114,13 +116,45 @@ class StatMemo:
     """A pure-function cache whose key is the stat of the thing it read.
 
     Not a model of the world and not a state machine: the value is a function
-    of the bytes, and the key changes whenever the bytes can have. So it never
-    goes stale — it is only ever evicted, and eviction costs one re-read.
+    of the bytes, and the key changes whenever the bytes can have. So it does
+    not go stale — it is only ever evicted, and eviction costs one re-read.
+    "Whenever the bytes can have" is doing real work in that sentence, and it
+    is not free: see THE BOUNDARY below for the one write that changes the
+    bytes without changing the key.
 
     `ident` is WHAT was read — `(path, st_dev, st_ino)`. Identity is in the
     ident so a rotated file misses; the path is in it too so a recycled inode
     at a different path cannot be mistaken for a hit. `key` is the part that
     moves — `(st_size, st_mtime_ns)`.
+
+    THE BOUNDARY (ADR 0011). Four numbers decide a hit — `st_size`,
+    `st_mtime_ns`, `st_dev`, `st_ino` — so a write that preserves ALL FOUR
+    serves stale content: an in-place rewrite of the same byte count, on the
+    same inode, with `os.utime(p, ns=…)` putting the nanosecond mtime back.
+    Reproduced on disk, not argued from the key — see
+    `test_the_boundary_an_in_place_rewrite_preserving_all_four_stats`, which
+    exists to make this paragraph go red if the key ever gets stronger. Two
+    things keep it a recorded boundary and not a bug:
+
+    * It is adversarial, not realistic. Claude Code transcripts are appended
+      to, never rewritten, so `st_size` moves on every real write. Nothing in
+      this repo rewrites one; the failure needs a deliberate editor.
+    * It is BOUNDED. The cold reconcile (config key `reconcile_s`, 60 s by
+      default) bypasses this memo entirely, re-reads from the file, and counts
+      a disagreement into `scan_drift`/`tree_drift`. So a defeated key costs at
+      most one `reconcile_s` of stale text and is visible afterwards rather
+      than silent — which
+      is the entire difference between this and the byte-offset cache that let
+      a delivered message read as undelivered (§4.2).
+
+    Recorded because the boundary of a cache should be written down where the
+    cache is, not discovered later by whoever is holding it. And note how the
+    first attempt to demonstrate it FAILED and read as proof of safety:
+    `os.utime` with float seconds cannot restore the nanosecond component
+    (measured here: ...216723268 came back as ...216723203), so the key moved
+    anyway and the memo correctly missed. A negative result from a test that
+    could not have succeeded is not evidence — that one is pinned too, as
+    `test_a_float_utime_cannot_restore_the_nanoseconds_it_truncated`.
 
     LOCKED, for the same reason `procs.ProcMemo` is. `scan_sessions` runs on
     the sweep thread AND on any HTTP thread whose `cached_state()` found a

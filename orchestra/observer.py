@@ -321,8 +321,46 @@ def collect_state(fresh=None, git=None, cold=False):
 # sweep is now ONE `ps` (0.068) and the transcript scan (0.076) and nothing
 # else worth naming — there is no fourth cheap win here, and the next honest
 # argument is about GIT_S or about IDLE_S, with its own measurement.
-IDLE_S = 3.0        # cadence with no evidence of change
-HOT_S = 0.15        # floor between sweeps after a nudge
+#
+# All five cadences below are DEFAULTS for config keys of the same name, not
+# constants (`config.CFG["idle_s"]` &c). This one is the reason: the tables
+# above are a trade whose right answer depends on whose laptop it is and
+# whether it is plugged in, and it was a number you had to edit code to change.
+#
+# The knob table shipped for README.md, on the finished build — same fleet,
+# same instrument, 120 s per row, one knob moved and the rest at their
+# defaults. It is not the A/B tables above and does not supersede them: those
+# isolate what each optimisation bought, this prices the settings a user can
+# actually turn.
+#
+#   knob            value    CPU    sweeps  git_probes
+#   idle_s           5.0     16 %      24        8
+#   idle_s           3.0     17 %      40        8      <- default
+#   idle_s           2.0     19 %      60        8
+#   idle_s           1.0     28 %     119        8
+#   git_s            5.0     29 %      40       20
+#   git_s           60.0      9 %      40        2
+#   reconcile_s      off     16 %      40        8
+#
+# Two things in there are worth more than the numbers themselves.
+#
+# FIRST: `idle_s` is not the expensive knob, `git_s` is. Tripling the sweep
+# rate (3.0 -> 1.0) costs 11 points; tripling the GIT rate (15 -> 5) costs 12
+# on its own, at an unchanged sweep rate. That is the memos' doing — a sweep
+# that skips git is now ~0.15 CPU-s — and it is why 5.0 and 3.0 are one point
+# apart. Anyone arguing about `idle_s` is arguing about the cheaper half.
+#
+# SECOND: the numbers this replaces were WRONG, and wrong in the direction that
+# flatters an argument. The brief for this change quoted "1.0 costs 43 % and
+# 3.0 costs 15 %" — 43 % is the row measured BEFORE the transcript memo and the
+# process memo landed (it is in the first table above, where it was correct).
+# Carried forward unmeasured, it overstates today's cost of `idle_s` 1.0 by
+# 15 points and would have told a user that the aggressive setting is
+# unaffordable when it is merely dearer. Re-measured because ADR 0011 says a
+# performance claim without a measurement is not a claim — including, and
+# especially, a claim inherited from this file's own earlier tables.
+IDLE_S = 3.0        # cadence with no evidence of change; config key "idle_s"
+HOT_S = 0.15        # floor between sweeps after a nudge; config key "hot_s"
 
 # git's own clock, §2.5's `git_s`. The document says 5.0 and calls it a
 # "re-probe cadence WITHIN a sweep", implying a memo; there cannot be one.
@@ -366,9 +404,21 @@ GIT_S = 15.0        # minimum interval between git fan-outs; config key "git_s"
 # The cold scan costs 260 CPU-ms against a warm 76 on this fleet, and the cold
 # process probe 116 against a warm 73, once a minute: well under 1 % duty for
 # the only thing that can catch a memo lying.
-RECONCILE_S = 60.0
-MAX_STALE_S = 8.0   # never wait longer than this between sweeps
+RECONCILE_S = 60.0  # config key "reconcile_s"
+MAX_STALE_S = 8.0   # never wait longer than this between sweeps; key "max_stale_s"
 HIST = 512          # version/changed-keys ring, §3.5
+
+
+def _cadence(key, default, given):
+    """One cadence, resolved: explicit argument > config key > the constant.
+
+    `given is None` and not `or given`, because 0.0 is a meaningful (if
+    unwise) value for every one of these and truthiness would silently swap a
+    caller's 0 for 3.0. A key present in the file but unparseable as a float
+    is a config error the user wants to hear about at startup, so the
+    ValueError is left to propagate rather than quietly falling back.
+    """
+    return float(config.CFG.get(key, default) if given is None else given)
 
 
 @dataclass(frozen=True)
@@ -458,8 +508,7 @@ class GitCadence:
     """
 
     def __init__(self, every_s=None):
-        self.every_s = float(config.CFG.get("git_s", GIT_S)
-                             if every_s is None else every_s)
+        self.every_s = _cadence("git_s", GIT_S, every_s)
         self._info = {}          # root -> the last git_info for it
         self._at = {}            # root -> wall clock of the probe that produced it
         self._full_at = 0.0      # last full fan-out
@@ -510,15 +559,24 @@ class Observer:
     attribute read of a frozen object.
     """
 
-    def __init__(self, *, idle_s=IDLE_S, hot_s=HOT_S, git_s=None,
-                 reconcile_s=RECONCILE_S, max_stale_s=MAX_STALE_S):
+    def __init__(self, *, idle_s=None, hot_s=None, git_s=None,
+                 reconcile_s=None, max_stale_s=None):
         # §2.5 also lists limits_s. It is not implemented and not accepted: it
         # would start polling cclimits from the sweep, which is step 7. A
         # parameter that silently does nothing is worse than an absent one.
-        # `git_s` left None reads config.CFG["git_s"], so the cadence is a
-        # setting on disk and not a constant you have to edit code to change.
-        self.idle_s, self.hot_s = idle_s, hot_s
-        self.reconcile_s, self.max_stale_s = reconcile_s, max_stale_s
+        #
+        # Every cadence left None reads its config key, so all five are
+        # settings on disk rather than constants you have to edit code to
+        # change; an explicit argument still wins, which is how the tests drive
+        # the loop at cadences no user would choose. The read happens HERE and
+        # not at each use, so a live config edit takes effect at the next
+        # `Observer(...)` and never mid-loop — a cadence that changed under a
+        # running `_loop` would make `sweeps`-per-second unattributable to any
+        # setting, and this module's whole argument is made of measurements.
+        self.idle_s = _cadence("idle_s", IDLE_S, idle_s)
+        self.hot_s = _cadence("hot_s", HOT_S, hot_s)
+        self.reconcile_s = _cadence("reconcile_s", RECONCILE_S, reconcile_s)
+        self.max_stale_s = _cadence("max_stale_s", MAX_STALE_S, max_stale_s)
         self._git = GitCadence(git_s)
         self._cv = threading.Condition()
         self._wake = threading.Event()
@@ -719,7 +777,10 @@ class Observer:
                 "nudges": self._nudges, "errors": self._errors,
                 "last_error": self._last_error,
                 "freshness": dict(self._fresh),
+                # all five cadences, so "did my config take?" is answerable
+                # from the running loop and not only from the file on disk
                 "idle_s": self.idle_s, "hot_s": self.hot_s,
+                "reconcile_s": self.reconcile_s, "max_stale_s": self.max_stale_s,
                 **self._git.stats(), **transcripts.memo_stats(),
                 **procs.proc_memo_stats()}
 

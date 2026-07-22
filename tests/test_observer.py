@@ -14,6 +14,8 @@ real and nothing depends on the developer's live fleet.
     python3 -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import json
 import shutil
 import subprocess
@@ -630,6 +632,121 @@ class TestGitCadence(CacheGuard):
             st = fb.collect_state(fresh=fresh)
             self.assertGreaterEqual(fresh["git"], before)
             self.assertEqual(st["worktrees"][0]["git"]["branch"], "main")
+
+
+# ---------------------------------------------------------- cadences as config
+
+# The five knobs and where each is read. `git_s` lands on the GitCadence rather
+# than the Observer, which is exactly the kind of asymmetry a table catches and
+# five hand-written asserts do not.
+CADENCES = [
+    ("idle_s", "IDLE_S", lambda o: o.idle_s),
+    ("hot_s", "HOT_S", lambda o: o.hot_s),
+    ("git_s", "GIT_S", lambda o: o._git.every_s),
+    ("reconcile_s", "RECONCILE_S", lambda o: o.reconcile_s),
+    ("max_stale_s", "MAX_STALE_S", lambda o: o.max_stale_s),
+]
+
+
+class TestCadencesAreConfig(CacheGuard):
+    """Phase 3: the loop's cadences are settings, not constants.
+
+    `idle_s` is the knob a user reaches for — the battery/latency trade, 17 %
+    of a core at 3.0 against 28 % at 1.0 on the fleet these were measured on —
+    and the right value depends on whose laptop it is. The other four come
+    along because a loop with one tunable cadence and four hardcoded ones is a
+    loop nobody can reason about, and because `git_s` turns out to move the
+    bill further than `idle_s` does.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._cfg = dict(fb.CFG)
+        self._cpath = fb.config.CONFIG_PATH
+
+    def tearDown(self):
+        fb.CFG.clear()
+        fb.CFG.update(self._cfg)     # CFG is mutated in place, never rebound
+        fb.config.CONFIG_PATH = self._cpath
+        super().tearDown()
+
+    def test_every_cadence_is_a_config_key(self):
+        for key, _const, read in CADENCES:
+            with self.subTest(key=key):
+                fb.CFG[key] = 4.25
+                self.assertEqual(read(fb.Observer()), 4.25)
+
+    def test_an_explicit_argument_still_beats_the_file(self):
+        """The tests drive this loop at cadences no user would choose; a config
+        key that overrode its own caller would make every timing test a
+        function of whatever is on disk."""
+        for key, _const, read in CADENCES:
+            with self.subTest(key=key):
+                fb.CFG[key] = 4.25
+                self.assertEqual(read(fb.Observer(**{key: 0.5})), 0.5)
+
+    def test_zero_is_a_value_and_not_a_missing_setting(self):
+        """`or` instead of `is None` would swap a deliberate 0.0 for whatever
+        is behind it, and the mistake would be invisible: the loop would simply
+        run at 3.0 while the setting said 0.0.
+
+        The explicit-0.0 case needs the config key set to something ELSE, or
+        `given or CFG[key]` falls through to an identical 0.0 and the bug reads
+        as correct — which is exactly what the first version of this test did.
+        """
+        for key, _const, read in CADENCES:
+            with self.subTest(key=key):
+                fb.CFG[key] = 0.0                       # 0 from the file
+                self.assertEqual(read(fb.Observer()), 0.0)
+                fb.CFG[key] = 9.0                       # …and 0 from the caller
+                self.assertEqual(read(fb.Observer(**{key: 0.0})), 0.0)
+
+    def test_the_defaults_on_disk_are_the_measured_constants(self):
+        """observer.py carries the measurements next to the constants (ADR
+        0011). If CFG's defaults drift from them, the documented numbers stop
+        describing what actually runs."""
+        for key, const, _read in CADENCES:
+            with self.subTest(key=key):
+                self.assertEqual(self._cfg[key], getattr(fb.observer, const))
+
+    def test_a_config_file_on_disk_reaches_the_loop(self):
+        """The round trip a user actually performs: edit orchestra.config.json,
+        start the board, get that cadence."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "orchestra.config.json"
+            p.write_text(json.dumps({"idle_s": 1.5, "hot_s": 0.05,
+                                     "git_s": 30.0, "reconcile_s": 20.0,
+                                     "max_stale_s": 2.0}))
+            fb.load_config(["--config", str(p)])
+            self.assertEqual(fb.config.CONFIG_PATH, p)
+            o = fb.Observer()
+            self.assertEqual([read(o) for _k, _c, read in CADENCES],
+                             [1.5, 0.05, 30.0, 20.0, 2.0])
+            # …and the running loop can be asked what it picked up, so "did my
+            # edit take?" is answerable without reading the file back
+            st = o.stats()
+            self.assertEqual([st["idle_s"], st["hot_s"], st["git_s"],
+                              st["reconcile_s"], st["max_stale_s"]],
+                             [1.5, 0.05, 30.0, 20.0, 2.0])
+
+    def test_idle_s_has_a_flag_because_it_is_the_battery_knob(self):
+        """`--idle-s` beats the file, like every other flag. The other four are
+        deliberately file-only, so asking for them is an argparse error rather
+        than a silently ignored word."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "orchestra.config.json"
+            p.write_text(json.dumps({"idle_s": 1.5}))
+            fb.load_config(["--config", str(p), "--idle-s", "0.75"])
+            self.assertEqual(fb.CFG["idle_s"], 0.75)
+            self.assertEqual(fb.Observer().idle_s, 0.75)
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                fb.load_config(["--hot-s", "0.9"])
+
+    def test_a_cadence_is_a_float_however_it_was_written(self):
+        """JSON says 2, `--idle-s` says '2'; the loop does arithmetic on it."""
+        fb.CFG["idle_s"] = 2
+        self.assertIsInstance(fb.Observer().idle_s, float)
 
 
 # ------------------------------------------------------- the read-only rule

@@ -345,6 +345,57 @@ class TestTranscriptMemo(_Fleet):
         os.replace(other, fp)
         self.assertEqual(self._sessions()[0]["last_assistant"], "bbbbbbb")
 
+    def test_the_boundary_an_in_place_rewrite_preserving_all_four_stats(self):
+        """The documented limit of the key (ADR 0011, `StatMemo`'s docstring).
+
+        Four numbers decide a hit — size, mtime_ns, dev, ino — so a rewrite
+        that preserves all four serves the old parse. This test exists to keep
+        the docstring HONEST: if somebody strengthens the key, this goes red
+        and the prose describing the boundary has to move with it.
+
+        It is adversarial, not realistic — transcripts are appended to, and
+        `test_an_append_defeats_the_memo` above is the real case — and the
+        second half is why it is a recorded boundary rather than a bug: the
+        cold reconcile reads the file anyway and counts the disagreement.
+        """
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"),
+            assistant_msg(text="aaaaaaa"), turn_end()])
+        self.assertEqual(self._sessions()[0]["last_assistant"], "aaaaaaa")
+        st = os.stat(fp)
+        body = fp.read_text().replace("aaaaaaa", "bbbbbbb")   # same byte count
+        fp.write_text(body)
+        os.utime(fp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        after = os.stat(fp)
+        self.assertEqual((after.st_size, after.st_mtime_ns, after.st_dev, after.st_ino),
+                         (st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino))
+        # …and so the memo hands back text that is no longer in the file
+        self.assertEqual(self._sessions()[0]["last_assistant"], "aaaaaaa")
+        self.assertEqual(fb.memo_stats()["scan_drift"], 0)    # silently, so far
+
+        fb._cache["state"] = None                             # the bound: 60 s
+        s = fb.collect_state(cold=True)["worktrees"][0]["sessions"][0]
+        self.assertEqual(s["last_assistant"], "bbbbbbb")      # read from the file
+        self.assertEqual(fb.memo_stats()["scan_drift"], 1)    # …and counted
+
+    def test_a_float_utime_cannot_restore_the_nanoseconds_it_truncated(self):
+        """Why the boundary above needs `ns=`. The first attempt to demonstrate
+        it used `os.utime(fp, (atime, mtime))`, the memo correctly missed, and
+        that read as proof the key was safe. It was proof of nothing: float
+        seconds cannot carry st_mtime_ns, so the key moved. A negative result
+        from a test that could not have succeeded is not evidence."""
+        fp = write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("Build a login screen"),
+            assistant_msg(text="aaaaaaa"), turn_end()])
+        self.assertEqual(self._sessions()[0]["last_assistant"], "aaaaaaa")
+        st = os.stat(fp)
+        fp.write_text(fp.read_text().replace("aaaaaaa", "bbbbbbb"))
+        os.utime(fp, (st.st_atime, st.st_mtime))              # float, not ns=
+        after = os.stat(fp)
+        self.assertEqual(after.st_size, st.st_size)
+        self.assertNotEqual(after.st_mtime_ns, st.st_mtime_ns)
+        self.assertEqual(self._sessions()[0]["last_assistant"], "bbbbbbb")
+
     def test_the_cold_reconcile_re_reads_and_counts_a_memo_that_lies(self):
         """§4.3 #1/#4. Nothing else can catch this: a stale parse looks exactly
         like a quiet agent, so a memo nobody audits fails silently forever."""
