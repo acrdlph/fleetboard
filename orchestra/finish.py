@@ -257,6 +257,13 @@ def start_finish(wt_name):
                     "message": "already landed and clean — nothing to finish"}
         parked = _park_on_trunk(git_root, trunk)
         if parked:
+            # The one path where the board itself moves git — switch + pull.
+            # It KNOWS the branch changed under it, so it says so: without this
+            # the card serves the old branch until git's own clock comes round
+            # (GIT_S, up to 15s), and this is the single mutation the observer
+            # could never have inferred any sooner.
+            observer._cache["t"] = 0.0
+            observer.nudge("finish/park")
             return parked
         # the switch itself failed — fall through and let an agent sort it out
     # any leftover file — even untracked scratch — goes to an agent: whether

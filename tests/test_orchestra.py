@@ -837,6 +837,22 @@ class TestStartFinish(ConfigGuard):
         self.assertTrue(self.git.ran("pull"))
         self.assertEqual(self.dispatched, [])   # no agent, no account usage
 
+    def test_parking_on_the_trunk_pulls_git_forward(self):
+        """The one mutation the board performs on git itself (switch + pull).
+        It knows the branch changed, so it must say so — otherwise the card
+        keeps serving the old branch until git's own clock comes round."""
+        saved, saved_t = fb.observer._observer, fb._cache["t"]
+        o = fb.Observer(git_s=600.0)
+        o._git._forced = False                   # as if git had just been probed
+        fb.observer._observer = o
+        try:
+            out = self.finish(landed=True, branch="feat/x")
+        finally:
+            fb.observer._observer, fb._cache["t"] = saved, saved_t
+        self.assertEqual(out["mode"], "parked")
+        self.assertEqual(o.stats()["nudges"], 1)
+        self.assertTrue(o._git._forced)          # the next sweep re-probes git
+
     def test_landed_untracked_scratch_goes_to_the_slim_agent(self):
         # cleaning is a judgment call — an agent decides what's droppable
         out = self.finish(landed=True, porcelain="?? a.tmp\n?? b.tmp\n")
