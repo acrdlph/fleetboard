@@ -462,6 +462,84 @@ def _touch(devid, now):
             pass        # a registry that cannot be written still authenticates
 
 
+# The push sub-object's writable keys. A device may register ONLY its own push
+# endpoint and preferences (API.md §9.23) — never its scope, its id, its
+# created stamp, or anything else the registry holds. The allow-list is here,
+# beside the store, because "the server writes only these keys" is a security
+# statement and a security statement belongs where it can be enforced rather
+# than trusted: a caller who put `revoked: null` in the body must not be able
+# to un-revoke themselves through the push route.
+PUSH_KEYS = frozenset({"backend", "token", "environment", "topic",
+                       "app_version", "tz", "tz_offset_min", "settings",
+                       "quiet_hours", "rules", "muted_until", "nudge_min",
+                       "privacy", "registered_at", "last_push_at",
+                       "last_push_status"})
+
+
+def set_push(devid, fields, now=None):
+    """Write the calling device's `push` sub-object — and ONLY its push keys.
+
+    Returns the stored push object, or None for an unknown device. The device
+    id comes from the authenticated token (`Handler.device`), never from the
+    body, so a device can only ever write its OWN endpoint — registering push
+    is not an escalation, but writing ANOTHER device's endpoint would be, and
+    the id not being a parameter is what makes that unreachable rather than
+    merely disallowed.
+    """
+    now = time.time() if now is None else now
+    clean = {k: v for k, v in (fields or {}).items() if k in PUSH_KEYS}
+    with _lock:
+        known, error = load_registry()
+        if error or devid not in known:
+            return None
+        devices_ = {k: dict(v) for k, v in known.items()}
+        push = dict(devices_[devid].get("push") or {})
+        push.update(clean)
+        push["registered_at"] = now
+        devices_[devid]["push"] = push
+        try:
+            _write_registry(devices_)
+        except OSError:
+            pass
+        return push
+
+
+def get_push(devid):
+    """The device's stored push object, or None."""
+    known, _ = load_registry()
+    d = known.get(devid)
+    return dict(d["push"]) if d and d.get("push") else None
+
+
+def note_push(devid, status, now=None):
+    """Record the outcome of the last push to this device — the 'last delivered
+    4m ago (200)' the settings screen shows. A push that silently stopped after
+    a restore is otherwise indistinguishable from a quiet fleet, discovered a
+    week late."""
+    now = time.time() if now is None else now
+    with _lock:
+        known, error = load_registry()
+        if error or devid not in known or not known[devid].get("push"):
+            return
+        devices_ = {k: dict(v) for k, v in known.items()}
+        devices_[devid]["push"] = dict(devices_[devid]["push"])
+        devices_[devid]["push"]["last_push_at"] = now
+        devices_[devid]["push"]["last_push_status"] = str(status)
+        try:
+            _write_registry(devices_)
+        except OSError:
+            pass
+
+
+def push_devices():
+    """Every registered device that has a push endpoint, hashes stripped —
+    the fan-out set for the notifier."""
+    known, _ = load_registry()
+    return [public(d) for d in known.values()
+            if d.get("push") and (d["push"].get("token"))
+            and not d.get("revoked")]
+
+
 # ------------------------------------------------------------- the rate budget
 
 _buckets = {}      # ip -> [tokens, last_touched]
@@ -670,6 +748,17 @@ def audited(method, path):
     return clean.startswith(SIDE_EFFECT_GETS) or _under_admin(clean)
 
 
+# The one carve-out from the admin surface: a device's OWN self-service routes.
+# `/api/v1/devices/self/*` is under `/api/v1/devices` by path, but it is `read`
+# scoped, not admin — a phone registers its own push endpoint and preferences
+# (API.md §9.23), and scoping that to admin would make push structurally
+# impossible on a phone, silently and permanently, because APNs tokens rotate
+# on reinstall and restore. The id in these routes is always the literal
+# `self`, resolved to the CALLER's device from its token — never a parameter —
+# so "manage myself" cannot become "manage another device" by editing the path.
+SELF_SUBTREE = "/api/v1/devices/self"
+
+
 def _under_admin(path):
     """Is this path inside the admin surface? Exact segment, not substring.
 
@@ -677,7 +766,13 @@ def _under_admin(path):
     `/api/v1/devices-of-other-people`, which is the direction that is safe here
     (more refusals) but would be the wrong direction if this list were ever
     reused for an allowance. So it is written correctly once.
+
+    `/api/v1/devices/self/*` is explicitly NOT admin — see `SELF_SUBTREE`. The
+    check is segment-exact for the same reason the ADMIN check is: a substring
+    test would let `/api/v1/devices/selfish` masquerade as self-service.
     """
+    if path == SELF_SUBTREE or path.startswith(SELF_SUBTREE + "/"):
+        return False
     return any(path == p or path.startswith(p + "/") for p in ADMIN)
 
 

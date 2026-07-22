@@ -16,7 +16,7 @@ reachable from the tailnet (API.md §2.5 puts every device route behind
 import sys
 import threading
 
-from orchestra import auth, config, observer, resume, server, tailnet
+from orchestra import auth, config, notify, observer, resume, server, tailnet
 
 
 def _devices(args):
@@ -46,6 +46,21 @@ def _devices(args):
         d = auth.revoke_device(args.revoke_device)
         print(f"revoked {d['id']} ({d['label']})" if d else
               f"no such device: {args.revoke_device}")
+        return True
+    if args.send_test_push:
+        # The whole pipeline, one shot, no server. Signs a real JWT and does the
+        # real HTTP/2 POST — the only thing it cannot do without a .p8 is get a
+        # 200, and it names precisely which piece is missing when it does not.
+        r = notify.send_test()
+        print(f"push test → {r.get('message', r)}")
+        if r.get("health", {}).get("problems"):
+            print("\n  not configured yet:")
+            for p in r["health"]["problems"]:
+                print(f"    · {p}")
+            print("\n  set up an APNs key: docs/mobile/APNS-SETUP.md")
+        elif r.get("apns_id"):
+            print(f"  apns-id: {r['apns_id']}"
+                  + (f"  reason: {r['reason']}" if r.get("reason") else ""))
         return True
     return False
 
@@ -110,6 +125,15 @@ def main():
         # own kind of hell. Not calling this degrades to exactly the old lazy
         # collect-on-request — that is the rollback story, one line long.
         observer.start_observer()
+        # The push pipeline is a CONSUMER of the observer's publish point, the
+        # same shape as the SSE stream: one daemon that waits for a new version,
+        # derives the events that version implies, logs them, and pushes any
+        # that survive quality control. It never drives the sweep and never
+        # blocks it; with no APNs key configured every phone gets a NoopSink and
+        # the pipeline still runs end to end, which is what makes the whole
+        # thing provable before a key exists.
+        threading.Thread(target=notify.push_loop, args=(observer,),
+                         daemon=True).start()
     # server.Server, not a bare ThreadingHTTPServer: the listen backlog and the
     # dropped-subscriber handling that `/api/events` needs live on the class,
     # and a board started with the stock one would stream perfectly and then

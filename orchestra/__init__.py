@@ -29,7 +29,8 @@ import time                    # unused here, but tests reach time.sleep as
 
 from . import (config, shell, status, gitrepo, procs, hooks, transcripts,
                limits, watcher, observer, identity, auth, terminal, chat,
-               finish, dispatch, resume, qr, tailnet, pairing, server)
+               finish, dispatch, resume, qr, tailnet, pairing, push, notify,
+               server)
 
 # ---- public surface (facade). Re-exported so tests, tools and
 # tests/characterize.py can keep saying `orchestra.<name>`. DEMO,
@@ -81,6 +82,7 @@ from .identity import GONE, UNADDRESSED, ADDRESSES
 # `orchestra.auth.check`. REGISTRY and AUDIT_LOG are rebound at runtime (tests
 # point them at a temp dir), so they are absent for the RESUME_STATE reason.
 from .auth import (Verdict, add_device, revoke_device, devices, bind_refusal,
+                   set_push, get_push, note_push, push_devices,
                    EXEMPT, ADMIN, FAIL_BURST, FAIL_WINDOW_S, LAST_SEEN_S)
 # `_window` is rebound on every `open_window`, so it is absent for the
 # RESUME_STATE reason — reach it as `orchestra.pairing._window`.
@@ -101,4 +103,15 @@ from .resume import (schedule_resume, cancel_resume, resume_public,
                      load_resumes, _tmux_resume, _wait_composer_idle,
                      _proven_in_transcript, _session_on_board, _resumes,
                      RESUME_POLL_S, RESUME_MAX_ATTEMPTS, RESUME_READY_S)
+# `post`, `sink`, `Response` and `b64u` are deliberately NOT re-exported: every
+# one of them reads as something else at the top level (`post` especially, in a
+# module that also serves HTTP). Reach them as `orchestra.push.post`.
+# `der_to_raw` IS re-exported — it is the one function here whose name is
+# unambiguous anywhere, and it is the one a reader goes looking for.
+from .push import (der_to_raw, sign_es256, provider_jwt, ProviderToken,
+                   Credentials, APNsSink, NoopSink, Backoff, SigningError,
+                   JWT_TTL_S, HOSTS)
+from .notify import (Event, EventLog, Notifier, Preferences, Service, derive,
+                     project, compose, quiet_now, service, send_test, push_loop,
+                     EVENT_TYPES, LEVELS, GLYPH)
 from .server import (Handler, Server, sse_stats, MAX_SUBSCRIBERS, KEEPALIVE_S)

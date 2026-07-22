@@ -44,7 +44,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import (config, auth, gitrepo, limits, observer, terminal, chat,
-               dispatch, resume, finish, pairing, tailnet)
+               dispatch, resume, finish, pairing, tailnet, notify)
 
 MAX_SUBSCRIBERS = 32        # concurrent SSE streams; config key "sse_max_subscribers"
 KEEPALIVE_S = 25.0          # silence before a comment frame; key "sse_keepalive_s"
@@ -91,6 +91,19 @@ def _sse_reset():
     """Tests only: the census is process-wide, so it outlives a test case."""
     with _subs_lock:
         _subs.update(open=0, peak=0, opened=0, rejected=0)
+
+
+def _v1_match(path, base):
+    """A `/api/v1` route matched at a SEGMENT boundary, never by substring.
+
+    `base` itself or `base/<anything>` — so `/api/v1/events` and
+    `/api/v1/events/open` both match and `/api/v1/eventsX` does not. This is the
+    router half of the rule the guard already enforces (`auth._under_admin`):
+    the two disagreeing by one character is exactly how `/api/v1/devicesX`
+    served the device inventory a phone should never have seen.
+    """
+    clean = path.split("?", 1)[0]
+    return clean == base or clean.startswith(base + "/")
 
 
 def _query(path):
@@ -339,6 +352,28 @@ class Handler(BaseHTTPRequestHandler):
             result = chat.read_chat(qa.group(1), qs.group(1)) if qa and qs else \
                 {"ok": False, "error": "need account & sid"}
             body = json.dumps(result).encode()
+            ctype = "application/json"
+        elif _v1_match(self.path, "/api/v1/events"):
+            # The durable side of push (API.md §9.22). Push is lossy; this is
+            # not, so the phone reconciles against it on every foreground — and
+            # /events/open is the withdrawal route that stops a resolved
+            # question sitting on the lock screen forever. Matched at a SEGMENT
+            # boundary, never by `startswith` — API.md §2.3 "no prefix routing",
+            # so `/api/v1/eventsX` is a 404 and not this route (the same hole
+            # `/api/v1/devicesX` was, pinned by test_no_v1_route_can_be_reached
+            # _by_a_suffix).
+            body = json.dumps(self._events_get()).encode()
+            ctype = "application/json"
+        elif self.path.split("?", 1)[0] == "/api/v1/push/status":
+            # What the settings screen shows: is push configured, what did the
+            # last send return, when. `push.sink().health()` says exactly which
+            # piece is missing when it is not ready — a NoopSink names the
+            # config key, an APNsSink names a bad Key ID or a missing binary.
+            from . import push as pushmod
+            dev = getattr(self, "device", None)
+            body = json.dumps({"ok": True, "push": pushmod.sink().health(),
+                               "registered": bool(dev and auth.get_push(dev["id"]))
+                               if dev else False}).encode()
             ctype = "application/json"
         elif self.path.split("?", 1)[0] in ("/", "/index", "/index.html"):
             body = (config.HERE / "index.html").read_bytes()
@@ -613,6 +648,16 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/v1/devices/pair/close":
             pairing.close()
             return self._json(200, {"ok": True, "pairing": pairing.state()})
+        # A device's OWN push endpoint and preferences. `read`-scoped, not admin
+        # (auth.SELF_SUBTREE) — a phone registers its own token, which rotates
+        # on reinstall and restore, and gating that behind the Mac-only admin
+        # scope would make push structurally impossible on a phone. The device
+        # is the AUTHENTICATED one (`self.device`), never a path parameter, so a
+        # token can only ever write its own endpoint.
+        if route in ("/api/v1/devices/self/push",
+                     "/api/v1/devices/self/settings",
+                     "/api/v1/push/test", "/api/v1/push/mute"):
+            return self._push_self(route, payload)
         if auth.admin("POST", route):
             # `/api/v1/devices/<id>/revoke`. Parsed rather than matched so the
             # path shape is API.md §2.5's, which is what the Swift client and
@@ -697,8 +742,91 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---------------------------------------------------------- push, events
+
+    def _push_self(self, route, payload):
+        """The device self-service routes (API.md §9.23). The device is the
+        AUTHENTICATED one — a loopback request has none, which is refused here
+        because these routes are ABOUT a device and loopback is nobody."""
+        dev = getattr(self, "device", None)
+        if not dev:
+            return self._json(403, {"ok": False, "error": "device_required",
+                                    "message": "these routes identify the "
+                                    "calling device by its token — loopback "
+                                    "holds none"})
+        devid = dev["id"]
+        if route == "/api/v1/devices/self/push":
+            token = payload.get("token")
+            if payload.get("backend", "apns") == "apns" and not \
+                    notify_token_ok(token):
+                return self._json(422, {"ok": False,
+                                        "error": "push_token_invalid",
+                                        "message": "token must be 64–200 hex "
+                                        "characters"})
+            stored = auth.set_push(devid, payload)
+            if stored is None:
+                return self._json(404, {"ok": False, "error": "device_unknown"})
+            warnings = []
+            st = payload.get("settings") or {}
+            if st.get("time_sensitive_allowed") is False:
+                warnings.append("time_sensitive_allowed is false — P1 alerts "
+                                "will be suppressed by any Focus, including Sleep")
+            return self._json(200, {"ok": True, "backend": stored.get("backend"),
+                                    "environment": stored.get("environment"),
+                                    "warnings": warnings})
+        if route == "/api/v1/devices/self/settings":
+            stored = auth.set_push(devid, {
+                k: payload[k] for k in ("quiet_hours", "rules", "privacy",
+                                        "nudge_min") if k in payload})
+            if stored is None:
+                return self._json(404, {"ok": False, "error": "device_unknown"})
+            return self._json(200, {"ok": True, "settings": {
+                k: stored.get(k) for k in ("quiet_hours", "rules", "privacy",
+                                           "nudge_min")}})
+        if route == "/api/v1/push/mute":
+            try:
+                mins = float(payload.get("minutes") or 0)
+            except (TypeError, ValueError):
+                mins = 0
+            until = time.time() + max(0.0, min(mins, 7 * 24 * 60)) * 60
+            auth.set_push(devid, {"muted_until": until})
+            return self._json(200, {"ok": True, "muted_until": until})
+        if route == "/api/v1/push/test":
+            # The real thing end to end: composes a notification, signs a real
+            # JWT, does the real HTTP/2 POST. The only step it cannot complete
+            # without a .p8 is the 200 — and it says exactly which piece is
+            # missing, which is the whole point of a test button.
+            return self._json(200, notify.send_test(devid))
+        return self._json(404, {"ok": False, "error": "unknown_route"})
+
+    def _events_get(self):
+        """`/api/v1/events`, `/events/{id}`, `/events/open` (API.md §9.22)."""
+        route = self.path.split("?", 1)[0]
+        log = notify.service().log
+        if route == "/api/v1/events/open":
+            return {"ok": True, "open": log.open_keys(), "as_of": time.time()}
+        if route.startswith("/api/v1/events/") and route != "/api/v1/events/":
+            eid = route.rsplit("/", 1)[1]
+            ev = log.get(eid)
+            if ev is None:
+                return {"ok": False, "error": "event_not_found"}
+            return ev
+        q = _query(self.path)
+        try:
+            limit = max(1, min(200, int(q.get("limit", 50))))
+        except ValueError:
+            limit = 50
+        return log.since(q.get("since"), limit=limit)
+
     def log_message(self, *args):
         pass
+
+
+def notify_token_ok(token):
+    """An APNs device token is 64–200 hex — the same check `push` uses, reached
+    here without importing `push` on the hot path."""
+    from . import push as pushmod
+    return bool(pushmod.TOKEN_RE.match(token or ""))
 
 
 class Server(ThreadingHTTPServer):

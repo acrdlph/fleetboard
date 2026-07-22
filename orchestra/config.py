@@ -356,6 +356,19 @@ CFG = {
     "auth_trust_loopback": True,
     "resume_delay_s": 60,      # auto-resume fires this long after the limit reset
     "resume_message": "continue",  # what auto-resume types at the stalled agent
+    # Push (ADR 0003, orchestra/push.py). Empty until the user creates an APNs
+    # auth key at developer.apple.com — see docs/mobile/APNS-SETUP.md. With
+    # these unset the whole notification pipeline still runs (events are
+    # derived, logged, deduped, coalesced), and only the last hop reports "no
+    # key"; dropping a real .p8 in place and setting these four needs no code
+    # change and no restart of the pipeline. NONE OF THESE IS A SECRET except
+    # by reference: `apns_key_path` points at the one file that IS one, which
+    # is why push.py refuses a world-readable key.
+    "apns_key_path": "",       # the .p8 auth key downloaded from Apple
+    "apns_key_id": "",         # the 10-char Key ID shown beside the key
+    "apns_team_id": "",        # the 10-char Team ID (top-right of the portal)
+    "apns_topic": "",          # the app's bundle id, e.g. sh.orchestra.app
+    "apns_environment": "production",  # or "sandbox" for a development build
 }
 
 DEMO = False
@@ -414,6 +427,12 @@ def load_config(argv=None):
                     help="list registered devices (no tokens — they are stored hashed)")
     ap.add_argument("--revoke-device", metavar="ID",
                     help="revoke a device by id; its token stops working immediately")
+    ap.add_argument("--send-test-push", action="store_true",
+                    help="send ONE test notification to the paired device with "
+                         "a registered push token, print the transport result "
+                         "(status, apns-id, reason) and exit. Works the moment "
+                         "an APNs key is configured; before that it says which "
+                         "piece is missing. See docs/mobile/APNS-SETUP.md")
     ap.add_argument("--demo", action="store_true", help="serve fictional demo data (for screenshots)")
     args = ap.parse_args(argv)
 
