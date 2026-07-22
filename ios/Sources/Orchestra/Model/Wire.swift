@@ -297,6 +297,19 @@ public struct Session: Sendable, Equatable, Decodable, Identifiable {
     /// **The wire key is `bg_shell`.** IOS-APP.md §3.3 calls it
     /// `background_shell`; the server has never written that name.
     public let bgShell: Bool
+    /// **Wire key present ONLY when true** (`transcripts.py`, ADR 0007). A live
+    /// Claude Code hook edge exists for this session — orchestra launched this
+    /// agent and passed it a `--settings` fragment. Most sessions on most
+    /// machines are false and always will be: an agent the user started
+    /// themselves cannot be hooked. The UI must read this as "extra sure",
+    /// never as "the others are suspect".
+    public let hooked: Bool
+    /// **Wire key `status_src`, present ONLY when "observed"** — meaning the
+    /// status above is the one the CLI itself reported. Absent means inferred,
+    /// INCLUDING on a hooked session whose hook the ladder outranked (a `Stop`
+    /// that lost to a live background shell). So `hooked && !statusObserved` is
+    /// a real and honest state, not a contradiction.
+    public let statusObserved: Bool
 
     public init(shortID: String, sid: String, account: String, lastWriteAt: Double,
                 cwd: String, subdir: String?, branch: String, model: String,
@@ -306,7 +319,8 @@ public struct Session: Sendable, Equatable, Decodable, Identifiable {
                 subagentSaid: String?, subagentsActive: Bool, pid: Int32?,
                 pidCertain: Bool, status: SessionStatus, turnEnded: Bool?,
                 limit: SessionLimit?, handedTo: String?, toolRunning: Bool,
-                bgShell: Bool) {
+                bgShell: Bool, hooked: Bool = false,
+                statusObserved: Bool = false) {
         self.shortID = shortID
         self.sid = sid
         self.account = account
@@ -332,6 +346,8 @@ public struct Session: Sendable, Equatable, Decodable, Identifiable {
         self.handedTo = handedTo
         self.toolRunning = toolRunning
         self.bgShell = bgShell
+        self.hooked = hooked
+        self.statusObserved = statusObserved
     }
 
     enum CodingKeys: String, CodingKey {
@@ -350,6 +366,8 @@ public struct Session: Sendable, Equatable, Decodable, Identifiable {
         case handedTo = "handed_to"
         case toolRunning = "tool_running"
         case bgShell = "bg_shell"
+        case hooked
+        case statusSrc = "status_src"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -379,6 +397,12 @@ public struct Session: Sendable, Equatable, Decodable, Identifiable {
         handedTo = try c.decodeIfPresent(String.self, forKey: .handedTo)
         toolRunning = try c.decodeIfPresent(Bool.self, forKey: .toolRunning) ?? false
         bgShell = try c.decodeIfPresent(Bool.self, forKey: .bgShell) ?? false
+        hooked = try c.decodeIfPresent(Bool.self, forKey: .hooked) ?? false
+        // A STRING on the wire, not a bool — the server may add a third source
+        // rank later, and `== "observed"` degrades to `false` for anything it
+        // has not heard of rather than crashing a screen.
+        statusObserved =
+            (try c.decodeIfPresent(String.self, forKey: .statusSrc)) == "observed"
     }
 
     public var lastWrite: Date { Date(timeIntervalSince1970: lastWriteAt) }

@@ -58,6 +58,50 @@ struct DecodeTests {
         #expect(decoded.filter { $0.turnEnded == nil }.count == 3)
     }
 
+    /// ADR 0007. `hooked` and `status_src` are BOTH conditional — the server
+    /// writes neither on a session with no live hook edge, which on the captured
+    /// fixture is every one of them. So this whole feature must be invisible to
+    /// a decoder that has never seen it, and the captured board is the proof.
+    @Test func anUnhookedBoardDecodesWithNoHookKeysAtAll() throws {
+        let raw = try #require(try JSONSerialization.jsonObject(
+            with: Self.fixture("state")) as? [String: Any])
+        let sessions = (try #require(raw["worktrees"] as? [[String: Any]]))
+            .flatMap { ($0["sessions"] as? [[String: Any]]) ?? [] }
+        #expect(sessions.allSatisfy { $0["hooked"] == nil && $0["status_src"] == nil },
+                "the fixture predates hooks; if it stops doing so this test is void")
+        let decoded = try Self.board().worktrees.flatMap(\.sessions)
+        #expect(decoded.allSatisfy { !$0.hooked && !$0.statusObserved })
+    }
+
+    /// The three states the pair can be in, and the third is the one that looks
+    /// like a contradiction and is not: a hooked session whose hook the ladder
+    /// outranked reports `hooked` WITHOUT `status_src`, and the row must render
+    /// that as "hook-backed, but this answer was inferred" rather than round it
+    /// up to observed.
+    @Test func hookedAndObservedAreSeparateFacts() throws {
+        func session(_ extra: [String: Any]) throws -> Session {
+            var raw: [String: Any] = ["sid": "s1", "account": "main",
+                                      "status": "blocked", "last_write_at": 1.0]
+            raw.merge(extra) { _, b in b }
+            return try JSONDecoder().decode(
+                Session.self, from: JSONSerialization.data(withJSONObject: raw))
+        }
+        let plain = try session([:])
+        #expect(!plain.hooked && !plain.statusObserved)
+
+        let observed = try session(["hooked": true, "status_src": "observed"])
+        #expect(observed.hooked && observed.statusObserved)
+
+        let vetoed = try session(["hooked": true])
+        #expect(vetoed.hooked && !vetoed.statusObserved)
+
+        // A source rank this build has never heard of must degrade to inferred,
+        // never throw: `status_src` is a STRING on the wire precisely so the
+        // server can add one.
+        let future = try session(["hooked": true, "status_src": "telepathy"])
+        #expect(future.hooked && !future.statusObserved)
+    }
+
     /// `# branch.ab` is ABSENT from porcelain v2 when there is no upstream — not
     /// `+0 -0`. So `ahead`/`behind` arrive as null, and the row must be able to
     /// tell "zero commits ahead" from "no upstream to be ahead of".

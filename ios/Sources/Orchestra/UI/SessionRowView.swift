@@ -91,6 +91,7 @@ struct SessionRowView: View {
     private var statusLine: some View {
         HStack(alignment: .firstTextBaseline, spacing: Space.sm) {
             StatusPill(style)
+            hookMark
             Text(verbatim: "[\(session.account)]")
                 .font(OrcFont.meta)
                 .foregroundStyle(Palette.statusFree)
@@ -109,6 +110,33 @@ struct SessionRowView: View {
             }
             Spacer(minLength: Space.xs)
             ageSlot
+        }
+    }
+
+    /// ADR 0007's badge, and the whole design brief for it is RESTRAINT.
+    ///
+    /// Only agents orchestra launched are hooked; an agent the user started
+    /// themselves cannot be, and never will be. So the overwhelming majority of
+    /// rows on the overwhelming majority of boards carry nothing here, and this
+    /// mark must read as *"this one is extra sure"* — never as *"the others are
+    /// suspect"*. A filled dot when the status we are showing is the one Claude
+    /// Code itself reported; a hollow one when the session is hooked but the
+    /// ladder outranked its hook (a `Stop` that lost to a live background
+    /// shell), because claiming `observed` there would be the phone asserting a
+    /// certainty the server explicitly declined to.
+    ///
+    /// It carries no colour of its own — `textTertiary`, the quietest thing on
+    /// the row — because the status pill is already the loud element and a
+    /// second coloured token beside it competes with it for the same glance.
+    @ViewBuilder private var hookMark: some View {
+        if session.hooked {
+            Image(systemName: session.statusObserved
+                  ? "smallcircle.filled.circle" : "circle")
+                .font(OrcFont.meta)
+                .foregroundStyle(Palette.textTertiary)
+                .accessibilityLabel(session.statusObserved
+                    ? "observed — reported by Claude Code's own hook"
+                    : "hook-backed session; this status came from inference")
         }
     }
 
