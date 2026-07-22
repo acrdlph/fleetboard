@@ -264,16 +264,30 @@ class TestDeltaSince(CacheGuard):
     def test_delta_before_the_first_sweep_is_none(self):
         self.assertIsNone(fb.Observer().delta_since(0))
 
+    def test_the_two_branches_carry_the_same_envelope(self):
+        """The shape of the bug this class was found by: the snapshot branch
+        carried `other_procs` and the delta branch did not, so a resuming
+        client's view depended on WHICH branch answered it. Whatever the two
+        branches carry, they must carry the same thing — `base` excepted, which
+        is what makes a delta a delta."""
+        o = self._wound()
+        full = o.delta_since(0)
+        delta = o.delta_since(o.snapshot().v - 1)
+        self.assertEqual(full["type"], "snapshot")
+        self.assertEqual(delta["type"], "delta")
+        self.assertEqual(set(delta) - {"base"}, set(full))
+        self.assertNotIn("base", full)
+
 
 # ------------------------------------------- a delta RECONSTRUCTS the snapshot
 
-def ordered_state(at, cards, *, other=(9,)):
+def ordered_state(at, cards, *, other=(9,), counts=None):
     """A collect_state() result with the card ORDER and each card's status
     under the test's control — the two things the reconstruction claim is
     about. `cards` is [(name, dirty, status)]; `other` is loose-process pids."""
     return {
         "generated_at": at,
-        "counts": {"working": len(cards)},
+        "counts": counts or {"working": len(cards)},
         "worktrees": [
             {"name": name, "availability": "busy",
              "git": {"branch": "main", "dirty": dirty},
@@ -397,6 +411,60 @@ class TestDeltaReconstructsTheSnapshot(CacheGuard):
         c.apply(d)
         self.assertEqual([p["pid"] for p in c.view["other_procs"]], [9, 11])
         self.assertEqual(c.view, served(o.snapshot()))
+
+    def test_every_bump_term_reaches_a_delta_consumer(self):
+        """THE CLASS, not the instance. `publish` bumps `v` on three terms —
+        cards, `counts`, `other_procs`. For each one ALONE, a client holding the
+        previous version must land exactly where a client that took the snapshot
+        whole lands. `other_procs` was the one that did not: the version moved,
+        the frame said `{"cards": {}}`, and the client stayed wrong until its
+        cursor fell out of the 512-version ring."""
+        base = [("alpha", 0, "working"), ("beta", 0, "working")]
+        moves = {
+            "cards": dict(cards=[("alpha", 1, "working"), ("beta", 0, "working")]),
+            "counts": dict(cards=base, counts={"working": 1, "waiting": 1}),
+            "other_procs": dict(cards=base, other=(9, 11)),
+        }
+        for term, move in moves.items():
+            with self.subTest(term=term):
+                o, c = fb.Observer(), Client()
+                o.publish(ordered_state(1000.0, base))
+                c.apply(o.delta_since(0))
+                before = o.snapshot().v
+                o.publish(ordered_state(1001.0, **move))
+                self.assertEqual(o.snapshot().v, before + 1,
+                                 f"{term} alone must bump v")
+                d = o.delta_since(c.v)
+                self.assertEqual(d["type"], "delta")
+                c.apply(d)
+                # the whole claim: the delta reconstructed the snapshot
+                self.assertEqual(c.view, served(o.snapshot()))
+
+    def test_nothing_outside_the_composed_view_can_bump_the_version(self):
+        """The other end of the same invariant, and the half that keeps it true
+        tomorrow. The three terms above ride every frame; a FOURTH would not,
+        and would be exactly this bug again. So the terms are pinned closed:
+        every other top-level field of `collect_state`'s result moves without
+        moving `v`, because a client either derives it (`free_worktrees`),
+        fetches it beside the stream (`hostname`, `user`), or already has it on
+        every frame (`generated_at`, which rides as `at` with no vote).
+
+        Add a term to `publish` without adding it to `delta_since` and this
+        test says so before a phone does."""
+        for field, value in [("hostname", "elsewhere"), ("user", "someone"),
+                             ("free_worktrees", ["alpha"]),
+                             ("generated_at", 1001.0),
+                             ("resumes", {"alpha": 1}), ("a_field_from_2027", 1)]:
+            with self.subTest(field=field):
+                o = fb.Observer()
+                first = ordered_state(1000.0, [("alpha", 0, "working")])
+                first.update(hostname="here", user="me", free_worktrees=[],
+                             resumes={}, a_field_from_2027=0)
+                o.publish(first)
+                after = dict(first, generated_at=1001.0)
+                after[field] = value
+                self.assertEqual(o.publish(after).v, 1,
+                                 f"{field} moved v but rides no frame")
 
     def test_a_client_that_lagged_catches_up_in_one_delta(self):
         """The suspended-phone path (ADR 0004): four versions happen while the

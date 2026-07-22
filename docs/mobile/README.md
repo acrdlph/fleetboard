@@ -17,9 +17,9 @@ are.
 | | |
 |---|---|
 | **Phase** | B — backend, in flight |
-| **Shipped** | steps 0–3 + 5 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core. An ended turn is read off the transcript rather than waited out, and delegated work — including the background tasks the CLI's own counts miss — holds the turn open |
-| **Next** | step 4 phase 2 — move `index.html` off `setInterval(tick, 5000)` and onto the stream |
-| **Tests** | 465 · characterization 5,656 cases (18 sections) |
+| **Shipped** | steps 0–5 + identity: the board watches on its own clock, reacts to writes, and costs 5.3% of a core. An ended turn is read off the transcript rather than waited out, and delegated work — including the background tasks the CLI's own counts miss — holds the turn open. The board is told over SSE rather than asking, and the delta envelope is closed as a class: every term that can bump the version rides every frame |
+| **Next** | step 7 — auth, device pairing, tailnet bind. The server has no authentication of any kind and 127.0.0.1 is the only thing protecting it; a phone cannot reach it until that is fixed |
+| **Tests** | 482 · characterization 5,656 cases (18 sections) |
 | **Last updated** | 2026-07-22 |
 
 Design documents are being generated and reconciled. Until each is listed as **settled** below,
@@ -156,14 +156,31 @@ could only ask "is the mtime within 90 s?" — precise write timestamps now exis
 | `dirty` cannot be memoised | it is the working tree; no cheap stat sees an edit. Bounded by `GIT_S` and dated by `freshness["git"]` | ADR 0011 |
 | a dispatch's new branch is not nudged | the branch is cut by the launched agent minutes later, with no signal back; bounded by `GIT_S` | `dispatch.py` |
 | `ENGINE.md` is stale in seven places, `FRESHNESS.md` in two | nine rows in ADR 0011's table now, not the four this row used to claim — steps 5.3–5.5 added `delegated`'s definition, `block_grace_s`'s derivation and `orphan_grace_s = 10`. Measurement supersedes them; the docs are a design record, not rewritten | ADR 0011 |
-| a delta whose only change was `other_procs` tells the client nothing | `publish` bumps the version when `other_procs` differs (`new_o != self._dother`), but `changed` is built from CARD keys only, and `delta_since`'s delta branch returns `cards`/`counts`/`freshness` and **no `other_procs` at all** — the snapshot branch does. So a bump caused solely by a stray `claude` appearing or exiting reaches a resuming client as `{"cards": {}}`, and its `other_procs` stays stale until the cursor falls out of the 512-version ring and earns a full snapshot. Harmless while the browser polls; it becomes real the moment a client's only input is the stream. Two lines to fix, but they are in step 2's `delta_since` and want their own mutations and their own commit rather than riding along inside the transport change | `observer.py`:964–986 |
-| `delta_since` never sends `other_procs` | the version bumps when the stray-process list changes, but the delta branch returns only cards/counts/freshness — so a resuming client's `other_procs` stays stale until its cursor falls out of the 512-ring. Harmless while the browser also polls; real the moment a client's ONLY input is the stream, i.e. iOS | `observer.py` `delta_since` |
 | the transcript corpus is ~5 GB / 18,773 files, +1,000/day | orchestra's own inputs are a slow disk leak; wants a retention policy | — |
 
 **The load-bearing interface is the delta/event format introduced at step 4.** The browser
 consumes it over SSE, the APNs pipeline is derived from it, and the Swift client reconciles
 against it. Design it once, correctly, for all three consumers — that is the whole point of the
 sequencing in ADR 0004.
+
+Its envelope is now **closed, and closed as a class rather than as a list**. `publish` bumps `v`
+on exactly three terms — the stopwatch-stripped cards, `counts`, `other_procs` — and all three
+ride every frame; a term that can move the version and cannot ride one tells a client "something
+changed" and gives it no way to learn what. Two tests pin it from both ends, because either half
+alone rots: every bump term must reach a delta consumer, **and** nothing outside those three may
+bump at all, so adding a fourth fails the suite instead of failing a phone. `other_procs` was the
+one that was missing, and it now rides whole rather than being tracked in the changed-keys ring:
+measured on the live 9-worktree fleet that is 1,172 B on a median 7,853 B delta (15 %, 2.9 % of a
+41,384 B snapshot) against 22 version bumps in 150 s — 172 B/s per subscriber — and ring-tracking
+it would save 166 B/s in exchange for a second changed-set, i.e. a second source of truth about
+what moved, which is the exact shape of the bug being closed. Per-entity change tracking gets
+paid for once, generally, in `/api/v1` §7.1's op address space, where `other` is already a leaf
+beside `counts`, `free` and `order`. Everything absent from a frame is absent deliberately and
+says why in `delta_since`: `drift`/`sweep_ms` (diagnostics, no vote, `/api/stats`),
+`hostname`/`user` (constant for the process, side fetch), `free_worktrees` (a pure function of
+the cards — on the wire it would be a second copy that can disagree) and `resumes` (owned by
+`resume.py`, which the observer does not watch, so arming one moves no version and it could not
+ride this stream however the frame were shaped).
 
 ---
 

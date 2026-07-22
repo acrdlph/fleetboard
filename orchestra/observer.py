@@ -908,6 +908,12 @@ class Observer:
         composed cards, never a fact-key -> card-key dependency map — a map is a
         second source of truth that drifts from the composition the first time
         somebody edits the pairing heuristic.
+
+        THE COMPOSED VIEW IS EXACTLY THREE TERMS: the stopwatch-stripped cards,
+        `counts`, and `other_procs`. Adding a fourth is not a local change —
+        every term here MUST ride every frame `delta_since` builds, or a client
+        is told the version moved and given no way to learn what moved. Read
+        `delta_since`'s audit before adding one; two tests fail if you do not.
         """
         now = state.get("generated_at") or time.time()
         cards = {c["name"]: c for c in state.get("worktrees", [])}
@@ -971,11 +977,51 @@ class Observer:
         THE CONTRACT IS RECONSTRUCTION, not "the fields that moved". A client
         holding version `n` and applying this must end up with the SAME view as
         a client that took the snapshot at `v` whole — same cards, same order,
-        same counts, same loose processes. Only `cards` is actually diffed,
-        because cards are ~99% of the bytes; everything beside them travels in
-        full on every frame precisely so that reconstruction is exact. Two of
-        those used to be missing, and both were silent divergence rather than a
-        visible break:
+        same counts, same loose processes. ONE RULE, not two: `cards` is
+        diffed, because cards are ~99 % of the bytes; EVERYTHING ELSE rides
+        whole on every frame, precisely so that reconstruction is exact.
+
+        THE AUDIT, because one of these was missing and the class matters more
+        than the instance. `publish` bumps `v` on exactly three terms — the
+        composed cards, `counts`, `other_procs` — and all three ride here. A
+        term that can move the version and cannot ride a frame is the bug: the
+        client is told "something changed" and given no way to learn what, and
+        it stays wrong until its cursor falls out of the 512-version ring.
+        Pinned from BOTH ends, because either half alone rots: every bump term
+        reaches a delta consumer (`test_every_bump_term_reaches_a_delta_-
+        consumer`), and nothing outside those three may bump at all
+        (`test_nothing_outside_the_composed_view_can_bump_the_version`, which
+        fails the day somebody adds a fourth term without adding it here).
+        A third test pins the two branches to the same field set modulo `base`.
+
+          field        rides   why
+          cards        diff    the only diffed field, ~99 % of the bytes
+          order        whole   the board's triage order — see below
+          counts       whole   a bump term; 85 B on the live fleet
+          other_procs  whole   a bump term — see below
+          freshness    whole   how old each KIND of probe is (§3.3). Moves with
+                               NO version bump (that is the point of the
+                               no-bump path), so it can never cause this bug;
+                               it rides because it is 2 B and dates the frame
+          at, v, base  whole   the clock and the cursor
+          drift        NO      deliberate: loop diagnostics, not board state.
+          sweep_ms     NO      Neither takes part in the version rule, so
+                               neither can produce this bug class, and both
+                               are served whole by /api/stats
+          hostname     NO      deliberate: constant for the life of the
+          user         NO      process. The side fetch, stream.js `refresh()`
+          free_worktr  NO      deliberate: a pure function of the cards, which
+                               this contract already guarantees are exact. On
+                               the wire it would be a second copy that can
+                               disagree with the first — every applier derives
+                               it (stream.js `state()`)
+          resumes      NO      deliberate: it lives in resume.py, which the
+                               observer does not watch at all, so arming one
+                               moves no version and it could not ride this
+                               stream however the frame were shaped
+
+        The two that used to be missing, and both were silent divergence rather
+        than a visible break:
 
         * **`order`.** `Snapshot.cards` is in the board's triage order and the
           board renders it in the order it arrives. A delta names only the
@@ -990,11 +1036,54 @@ class Observer:
           a claude process appearing outside every watched worktree bumps the
           version ON ITS OWN — an otherwise EMPTY delta. Without the list on the
           frame that bump says "something changed" and carries no way to learn
-          what, and the board's "⌁ live agents" tile drifts.
+          what, and the board's "⌁ live agents" tile drifts. Harmless while the
+          browser also polls; it is the whole input the moment a phone is the
+          client.
 
-        Both are small and bounded (a name list; a handful of loose processes)
-        next to the cards a delta exists to avoid resending.
+        WHOLE ON EVERY FRAME, rather than tracked in the changed-keys ring like
+        a card — measured on the live 9-worktree / 9-loose-process fleet, not
+        guessed, because the ratio it is weighed against is real (a 41,384 B
+        snapshot frame against a 7,787 B one-card delta):
+
+            other_procs, serialised                     1,172 B  (9 procs)
+            one-card delta with it / without          7,787 B / 6,597 B
+            i.e. 15 % of a median delta, 2.9 % of a full snapshot
+
+            150 s of the real loop: 54 sweeps, 22 version bumps
+              21 bumps moved cards only, 1 moved cards AND other_procs,
+              0 moved other_procs alone, 0 moved counts alone
+            so carrying it costs 22 x 1,189 B = 26 KB / 150 s = 172 B/s per
+            subscriber, 5.5 KB/s at the 32-subscriber cap. Ring-tracking it
+            would save 21 of those 22 — 166 B/s — over a tunnel WireGuard has
+            already encrypted, to a phone for which the frame ARRIVING is the
+            expensive event and its size is not.
+
+        And it would cost the one thing this envelope is built out of. The ring
+        holds CARD NAMES and this function reads them as `snap.cards.get(k)`, so
+        a non-card entry in it is an instruction to DELETE a card; tracking
+        `other_procs` there needs a second changed-set — a second source of
+        truth about what moved, which is exactly what `publish`'s "diff by
+        equality, never a fact-key -> card-key map" rule exists to prevent, and
+        exactly the shape of the bug being fixed here: a version rule and a wire
+        format that knew different things. Two rules where there is now one, for
+        15 % of a frame.
+
+        When per-entity change tracking IS worth paying for it is worth paying
+        for generally, not for one field: /api/v1 §7.1 already gives `other` an
+        address in the op space beside `counts`, `free` and `order`, and that is
+        where it lands — as the format's rule, not as an exception inside this
+        one. (A free consequence of carrying it whole, meanwhile: the loose
+        processes' `cpu`/`etime` are refreshed on EVERY frame, where a card's
+        stopwatches are only as fresh as the last time that card moved.)
         """
+        # `_snap` BEFORE `_hist`, and the order is load-bearing. `publish`
+        # appends to the ring and THEN rebinds `_snap`, both under `_cv`; this
+        # reads without the lock, so reading the snapshot first guarantees the
+        # ring is never BEHIND it — a publish landing between these two lines
+        # can only add keys, which resend a card at the value `snap` holds.
+        # Reading them the other way round could hand back a snapshot whose
+        # changed keys had already been dropped, i.e. a silently incomplete
+        # delta.
         snap = self._snap
         if snap is None:
             return None

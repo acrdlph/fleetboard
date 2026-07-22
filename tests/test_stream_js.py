@@ -67,12 +67,12 @@ process.stdin.on("end", () => {
 """
 
 
-def fleet_state(at, cards, other=(9,)):
+def fleet_state(at, cards, other=(9,), counts=None):
     """A `collect_state()` result with card order, status and availability all
     under the test's control. `cards` is [(name, dirty, status, availability)]."""
     return {
         "generated_at": at,
-        "counts": {"working": len(cards)},
+        "counts": counts or {"working": len(cards)},
         "worktrees": [
             {"name": name, "availability": avail,
              "git": {"branch": "main", "dirty": dirty},
@@ -134,30 +134,51 @@ class StreamJS(unittest.TestCase):
         """The whole claim, end to end: a sequence of publishes, streamed as
         one snapshot and then deltas, leaves stream.js holding exactly the view
         a client that took each snapshot whole would hold — and exactly what
-        the Python reference applier holds."""
+        the Python reference applier holds.
+
+        The script walks EVERY term that can bump the version — cards, `counts`,
+        `other_procs` — because a term that moves `v` and does not reach this
+        applier is a board that is told something changed and cannot find out
+        what (observer.delta_since's audit)."""
         obs, ref = fb.Observer(), Client()
         script = [
-            ([("alpha", 0, "working", "busy"), ("beta", 0, "working", "busy")], (9,)),
-            ([("alpha", 1, "working", "busy"), ("beta", 0, "working", "busy")], (9,)),
+            ([("alpha", 0, "working", "busy"), ("beta", 0, "working", "busy")], (9,), None),
+            ([("alpha", 1, "working", "busy"), ("beta", 0, "working", "busy")], (9,), None),
             # beta needs input: the server re-sorts it to the top, and the delta
             # names beta ONLY — alpha's position has to come off `order`
             ([("beta", 0, "needs_input", "attention"),
-              ("alpha", 1, "working", "busy")], (9,)),
+              ("alpha", 1, "working", "busy")], (9,), None),
             # a card arrives, and one of them is FREE (a derived field)
             ([("beta", 0, "needs_input", "attention"),
               ("alpha", 1, "working", "busy"),
-              ("gamma", 0, "ended", "free")], (9,)),
+              ("gamma", 0, "ended", "free")], (9,), None),
             # a card leaves — it must arrive as an explicit removal
             ([("beta", 0, "needs_input", "attention"),
-              ("gamma", 0, "ended", "free")], (9,)),
+              ("gamma", 0, "ended", "free")], (9,), None),
             # nothing but a loose claude process appears: the version moves with
             # NO card changing at all
             ([("beta", 0, "needs_input", "attention"),
-              ("gamma", 0, "ended", "free")], (9, 11)),
+              ("gamma", 0, "ended", "free")], (9, 11), None),
+            # …and one of them exits, and then BOTH do. The empty list is the
+            # boundary the applier has to get right: `[]` is truthy in JS and
+            # must overwrite, where a tempting `f.other_procs.length` guard
+            # would silently leave the ⌁ tile showing processes that are gone.
+            ([("beta", 0, "needs_input", "attention"),
+              ("gamma", 0, "ended", "free")], (11,), None),
+            ([("beta", 0, "needs_input", "attention"),
+              ("gamma", 0, "ended", "free")], (), None),
+            # counts alone — the third bump term, and the only one whose change
+            # is invisible on the cards
+            ([("beta", 0, "needs_input", "attention"),
+              ("gamma", 0, "ended", "free")], (), {"needs_input": 1, "ended": 1}),
+            # a card AND the loose list in the same frame: the diffed field and
+            # a whole one have to land together
+            ([("beta", 1, "needs_input", "attention"),
+              ("gamma", 0, "ended", "free")], (13,), {"needs_input": 1, "ended": 1}),
         ]
         steps, expected = [], []
-        for i, (cards, other) in enumerate(script):
-            obs.publish(fleet_state(1000.0 + i, cards, other=other))
+        for i, (cards, other, counts) in enumerate(script):
+            obs.publish(fleet_state(1000.0 + i, cards, other=other, counts=counts))
             frame = obs.delta_since(ref.v or 0)
             ref.apply(frame)
             steps.append({"op": "apply", "frame": frame})
