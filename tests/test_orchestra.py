@@ -1653,6 +1653,36 @@ class TestStatMemo(unittest.TestCase):
         self.assertEqual(len(m), 1)
         self.assertEqual(m.evictions, 0)
 
+    def test_two_threads_cannot_tear_it(self):
+        """`scan_sessions` runs on the sweep thread AND on the HTTP thread of
+        any request that arrives with the cache parked — which is every request
+        right after a mutation, by design. Unlocked, `expire`'s
+        `next(iter(_d))`/`del` pair raises RuntimeError and `get`'s
+        `_d.get`/`move_to_end` pair raises KeyError; both did, within seconds."""
+        import time
+        m = fb.StatMemo(cap=64, idle_s=0.001)
+        errs, stop = [], threading.Event()
+
+        def hammer():
+            i = 0
+            try:
+                while not stop.is_set():
+                    i += 1
+                    ident, key = (f"/f{i % 80}", 1, i % 80), (i, i)
+                    if m.get(ident, key, time.time()) is None:
+                        m.put(ident, key, i, time.time())
+                    if i % 7 == 0:
+                        m.expire(time.time())
+            except Exception as e:                      # noqa: BLE001
+                errs.append(f"{type(e).__name__}: {e}")
+
+        ts = [threading.Thread(target=hammer, daemon=True) for _ in range(4)]
+        [t.start() for t in ts]
+        time.sleep(1.5)
+        stop.set()
+        [t.join(5) for t in ts]
+        self.assertEqual(errs, [])
+
 
 # ------------------------------------------------- the per-generation memo
 

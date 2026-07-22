@@ -32,6 +32,7 @@ bound that keeps it from growing with the corpus.
 import json
 import os
 import re
+import threading
 from collections import OrderedDict
 from pathlib import Path
 
@@ -120,49 +121,70 @@ class StatMemo:
     ident so a rotated file misses; the path is in it too so a recycled inode
     at a different path cannot be mistaken for a hit. `key` is the part that
     moves — `(st_size, st_mtime_ns)`.
+
+    LOCKED, for the same reason `procs.ProcMemo` is. `scan_sessions` runs on
+    the sweep thread AND on any HTTP thread whose `cached_state()` found a
+    parked cache — which is every request immediately after a mutation, by
+    design. Every method here is a read-then-mutate pair, and none of them is
+    atomic: `get` does `_d.get(ident)` and then `move_to_end(ident)`, and
+    `expire` does `next(iter(_d))` and then `del`. Reproduced, not theorised —
+    four threads on this class raise `RuntimeError: OrderedDict mutated during
+    iteration` out of `expire` and `KeyError` out of `get` within seconds. The
+    window is narrow at MEMO_IDLE_S=3600 (`expire` almost always breaks on its
+    first entry), which is exactly what makes it the kind of bug that ships:
+    it surfaces as one 500 on the board, months apart, with no way to reproduce.
+
+    Nothing expensive is ever called under the lock — `_read_facts` and the
+    directory walks run outside it, between a `peek`/`get` and a `put`.
     """
 
     def __init__(self, cap, idle_s=MEMO_IDLE_S):
         self.cap, self.idle_s = cap, idle_s
         self._d = OrderedDict()      # ident -> [key, value, last seen]
+        self._lock = threading.Lock()
         self.hits = self.misses = self.evictions = self.drift = 0
 
     def get(self, ident, key, now):
-        e = self._d.get(ident)
-        if e is None or e[0] != key:
-            self.misses += 1
-            return None
-        e[2] = now
-        self._d.move_to_end(ident)
-        self.hits += 1
-        return e[1]
+        with self._lock:
+            e = self._d.get(ident)
+            if e is None or e[0] != key:
+                self.misses += 1
+                return None
+            e[2] = now
+            self._d.move_to_end(ident)
+            self.hits += 1
+            return e[1]
 
     def peek(self, ident):
         """What the memo holds, without counting a hit — the cold audit's view
         of 'what would have been served'."""
-        e = self._d.get(ident)
-        return None if e is None else (e[0], e[1])
+        with self._lock:
+            e = self._d.get(ident)
+            return None if e is None else (e[0], e[1])
 
     def put(self, ident, key, value, now):
-        self._d[ident] = [key, value, now]
-        self._d.move_to_end(ident)
-        while len(self._d) > self.cap:
-            self._d.popitem(last=False)
-            self.evictions += 1
+        with self._lock:
+            self._d[ident] = [key, value, now]
+            self._d.move_to_end(ident)
+            while len(self._d) > self.cap:
+                self._d.popitem(last=False)
+                self.evictions += 1
 
     def expire(self, now):
         """Drop what has not been observed for `idle_s`. Least-recently-seen
         sits at the front, so this stops at the first live entry."""
-        while self._d:
-            ident = next(iter(self._d))
-            if now - self._d[ident][2] < self.idle_s:
-                break
-            del self._d[ident]
-            self.evictions += 1
+        with self._lock:
+            while self._d:
+                ident = next(iter(self._d))
+                if now - self._d[ident][2] < self.idle_s:
+                    break
+                del self._d[ident]
+                self.evictions += 1
 
     def clear(self):
         """Everything is suspect — after a wake, per §4.5."""
-        self._d.clear()
+        with self._lock:
+            self._d.clear()
 
     def __len__(self):
         return len(self._d)
