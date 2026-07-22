@@ -462,6 +462,40 @@ class TestSynchronousFallback(CacheGuard):
             self.assertEqual(tuple(o._hist)[-1][1], ("alpha",))
 
 
+# ------------------------------------------------------- the read-only rule
+
+@unittest.skipUnless(HAVE_GIT, "git not available")
+class TestTheSweepMutatesNothing(CacheGuard):
+    """§2.5: the observer may not write state a mutation path owns.
+
+    Lazily, `collect_state` reaped `finish._closeouts` for cards whose terminal
+    had gone — a write that only ran when somebody looked. Perpetually, that is
+    a scheduled background action nobody requested, so it is gone: the card
+    stops ADVERTISING the flag, and finish reaps its own map.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_closeouts = dict(fb._closeouts)
+
+    def tearDown(self):
+        fb._closeouts.clear()
+        fb._closeouts.update(self._saved_closeouts)
+        super().tearDown()
+
+    def test_sweeping_forever_never_reaps_a_closeout_flag(self):
+        with FleetFixture():
+            fb._closeouts.clear()
+            fb._closeouts["alpha"] = ts = time.time() - 30   # no live procs
+            o = fb.Observer()
+            for _ in range(3):
+                fb._cache["state"] = None
+                o.sweep()
+            self.assertNotIn("closeout_sent", o.snapshot().cards["alpha"])
+            self.assertEqual(fb._closeouts, {"alpha": ts})
+            self.assertEqual(o.snapshot().v, 1)   # …and nothing looked changed
+
+
 # ------------------------------------------------------------------ fixture
 
 class FleetFixture:

@@ -658,6 +658,7 @@ class TestStartFinish(ConfigGuard):
             self.dispatched.append((brief, kw)) or {"ok": True, "job": "j1"})
 
     def tearDown(self):
+        fb._closeouts.clear()   # nothing reaps these for us any more
         for n, f in self._saved.items():
             setattr(fb.shell, n, f)
         fb.dispatch.start_dispatch = self._saved_dispatch
@@ -816,6 +817,17 @@ class TestStartFinish(ConfigGuard):
         out = self.finish(landed=False)
         self.assertEqual(out["mode"], "dispatch")
         self.assertNotIn("wt", fb._closeouts)
+
+    def test_a_press_prunes_the_stale_flags_the_observer_no_longer_reaps(self):
+        # collect_state used to drop these as a side effect of being looked at.
+        # Under a perpetual sweep that is a write nobody asked for, so reaping
+        # moved here — to the mutation path that owns the map.
+        import time as _t
+        fb._closeouts["other-wt"] = _t.time() - 10 * fb.CLOSEOUT_TTL_S
+        fb._closeouts["fresh-wt"] = _t.time()
+        self.finish(landed=True, branch="feat/x")
+        self.assertNotIn("other-wt", fb._closeouts)
+        self.assertIn("fresh-wt", fb._closeouts)
 
     # -- no terminal, landed ------------------------------------------------
     def test_landed_clean_on_feature_branch_parks_without_agent(self):

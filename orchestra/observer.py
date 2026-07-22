@@ -10,7 +10,9 @@ annotated `handed_to` and stops counting as attention. Then each card gets an
 availability, the cards get a severity sort, and the counts strip is tallied.
 
 Watching is read-only and touches nothing: every read here is a `git`/`ps`
-query or a bounded tail of a transcript. Nothing is written, nothing is typed.
+query or a bounded tail of a transcript. Nothing is written, nothing is typed,
+and no state another module owns is reaped — under a perpetual sweep any such
+write becomes a scheduled background action nobody asked for.
 
 `_cache` holds the last snapshot for `STATE_TTL_S` seconds, so a board polling
 every couple of seconds doesn't re-shell `git` twice a second. It is mutated
@@ -159,14 +161,15 @@ def collect_state(fresh=None):
         c["availability"] = status.card_availability(
             _attention_statuses(c["sessions"]), bool(c["live_procs"]))
         # two-step finish: while a closeout brief is with this card's live
-        # agent, the button reads ✕ close. The flag dies with the terminal,
-        # so a card never offers to close an agent that no longer exists.
+        # agent, the button reads ✕ close. A card with no live procs simply
+        # does not render the flag, so it never offers to close an agent that
+        # no longer exists — the same visible behaviour as before, reached by
+        # reading instead of writing. Reaping the entry belongs to finish
+        # (ENGINE.md §2.5): a perpetual sweep that popped it here would reap
+        # closeout flags on a schedule nobody requested.
         ts = finish._closeouts.get(c["name"])
-        if ts:
-            if c["live_procs"]:
-                c["closeout_sent"] = ts
-            else:
-                finish._closeouts.pop(c["name"], None)
+        if ts and c["live_procs"]:
+            c["closeout_sent"] = ts
 
     matched = {p["pid"] for c in cards for p in c["live_procs"]}
     other = [p for p in all_procs if p["pid"] not in matched]

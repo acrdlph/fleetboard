@@ -100,8 +100,11 @@ class TestCollectPipeline(unittest.TestCase):
         fb.procs.claude_processes = lambda: []                       # no live procs
         fb.limits.cached_limits = lambda refresh=False: {"available": False}
         fb._cache["state"] = None                              # bust the 4s cache
+        self._closeouts = dict(fb._closeouts)
 
     def tearDown(self):
+        fb._closeouts.clear()
+        fb._closeouts.update(self._closeouts)
         for k, v in self._save.items():
             if v is None:
                 fb.CFG.pop(k, None)
@@ -228,12 +231,34 @@ class TestCollectPipeline(unittest.TestCase):
         fb._cache["state"] = None
         card = fb.collect_state()["worktrees"][0]
         self.assertEqual(card["closeout_sent"], ts)
-        # terminal gone → the flag dies; no stale ✕ close on a freed card
+        # terminal gone → the card stops advertising it; no stale ✕ close on a
+        # freed card. The ENTRY survives: reaping it is finish's job, and a
+        # perpetual sweep must not perform a mutation nobody asked for.
         fb.procs.claude_processes = lambda: []
         fb._cache["state"] = None
         card = fb.collect_state()["worktrees"][0]
         self.assertNotIn("closeout_sent", card)
-        self.assertNotIn("myapp", fb._closeouts)
+        self.assertEqual(fb._closeouts["myapp"], ts)
+
+    def test_repeated_sweeps_never_touch_the_closeout_map(self):
+        # the seam the always-running loop makes dangerous: collect_state is
+        # called on a schedule now, so it may not write state finish owns.
+        write_transcript(self.home, self.repo, "main", sid="s1", entries=[
+            user_msg("close it out"), assistant_msg(text="on it"), turn_end()])
+        fb._closeouts.clear()
+        fb._closeouts["myapp"] = time.time() - 30       # live terminal below
+        fb._closeouts["gone-wt"] = time.time() - 30     # no card at all
+        fb._closeouts["ancient"] = time.time() - 10 * fb.CLOSEOUT_TTL_S
+        before = dict(fb._closeouts)
+        fb.procs.claude_processes = lambda: []
+        for _ in range(3):
+            fb._cache["state"] = None
+            fb.collect_state()
+        self.assertEqual(fb._closeouts, before)
+        # …and finish's own pruning does drop what has gone stale
+        fb._prune_closeouts()
+        self.assertNotIn("ancient", fb._closeouts)
+        self.assertIn("myapp", fb._closeouts)
 
 
 @unittest.skipUnless(HAVE_GIT, "git not available")

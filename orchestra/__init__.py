@@ -58,6 +58,7 @@ from .observer import (collect_state, cached_state, demo_state, _cache,
 from .terminal import focus_process, send_to_process, _osa_escape
 from .chat import read_chat
 from .finish import (start_finish, _park_on_trunk, _reachable, _closeouts,
+                     _prune_closeouts, CLOSEOUT_TTL_S,
                      CLOSEOUT_TEXT, SLIM_CLOSEOUT_TEXT, CLOSEOUT_NUDGE_TEXT)
 from .dispatch import (start_dispatch, dispatch_status, read_dispatch_log,
                        deliver_text, kickoff_sent, composer_idle,

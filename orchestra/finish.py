@@ -16,8 +16,9 @@ idles forever while ✕ close refuses forever.
 
 `_closeouts` is the two-step: worktree name -> when its live agent was briefed.
 While it is set the card shows ✕ close instead of ✓ finish, so a mid-closeout
-agent never gets the brief typed at it twice. The flag dies with the terminal,
-so a fresh mission never inherits it.
+agent never gets the brief typed at it twice. A card with no live procs never
+renders it, so it dies with the terminal as far as the board shows, and this
+module reaps the entry itself — on its next action, or by `CLOSEOUT_TTL_S`.
 
 `_park_on_trunk` is the exception to "watching touches nothing": when the
 branch has already landed and the tree is clean, two git commands don't need
@@ -27,9 +28,9 @@ an agent — the provably-safe case.
 transcripts), asks status which step of the two-step it is on, and acts
 through terminal or dispatch. That makes finish the top of the act layer —
 it imports observe, never the other way round. observer needs one thing back
-(it reads `_closeouts` to decide which button a card shows) and it takes it
-through a function-local import, so this module's imports stay a one-way
-DAG. See ADR 0010, 'cycles'.
+(it READS `_closeouts` to decide which button a card shows — it never writes
+it) and it takes it through a function-local import, so this module's imports
+stay a one-way DAG. See ADR 0010, 'cycles'.
 """
 
 import os
@@ -91,9 +92,28 @@ CLOSEOUT_NUDGE_TEXT = (
 # worktree name -> epoch seconds when a closeout brief was typed at its live
 # agent. Step two of ✓ finish: while this is set (and the terminal lives) the
 # board shows ✕ close instead — which only verifies the landing and /exits;
-# it never re-types the brief into a mid-closeout agent. The flag dies with
-# the terminal, so a fresh mission never inherits it.
+# it never re-types the brief into a mid-closeout agent. A card with no live
+# procs never renders the flag, so it dies with the terminal as far as anyone
+# can see; this module reaps the entry itself.
 _closeouts = {}
+
+# An hour-old brief is not a two-step in progress any more — it is an agent
+# that never converged, or a terminal that has been gone for most of an hour.
+# Past this the flag can only mislead (a fresh mission in that worktree greeted
+# by ✕ close and its refusal), so it is dropped and the card goes back to
+# ✓ finish, which is the honest offer at that point.
+CLOSEOUT_TTL_S = 3600.0
+
+
+def _prune_closeouts(now=None):
+    """Drop closeout flags too old to mean anything. Called on this module's
+    next action, because reaping is a MUTATION and only a mutation path may do
+    it (ENGINE.md §2.5) — `collect_state` used to pop stale entries as a side
+    effect of being looked at, which under the perpetual sweep would run on a
+    schedule nobody requested."""
+    now = time.time() if now is None else now
+    for name in [n for n, ts in _closeouts.items() if now - ts > CLOSEOUT_TTL_S]:
+        _closeouts.pop(name, None)
 
 
 def _park_on_trunk(git_root, trunk):
@@ -125,6 +145,7 @@ def start_finish(wt_name):
     doesn't verify)."""
     if config.DEMO:
         return {"ok": False, "message": "demo mode — nothing to finish"}
+    _prune_closeouts()   # every press cleans the whole map, not just this card
     wt = next((w for w in gitrepo.discover_worktrees() if w["name"] == wt_name), None)
     if not wt:
         return {"ok": False, "message": f"unknown worktree '{wt_name}'"}
