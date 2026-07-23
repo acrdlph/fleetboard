@@ -44,7 +44,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import (config, auth, gitrepo, limits, observer, terminal, chat,
-               dispatch, resume, finish, pairing, tailnet, notify)
+               dispatch, resume, finish, pairing, tailnet, notify, idem)
 
 MAX_SUBSCRIBERS = 32        # concurrent SSE streams; config key "sse_max_subscribers"
 KEEPALIVE_S = 25.0          # silence before a comment frame; key "sse_keepalive_s"
@@ -272,6 +272,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _idem_reject(self, status, code, message, extra_headers):
+        """An idempotency refusal (ARCHITECTURE §5.6), in the board's error
+        envelope with a real status code. `retriable` tells the client whether
+        the refusal is safe to re-send as-is (only `operation_in_flight` is);
+        `extra_headers` carries `Retry-After` on that one case. `Cache-Control:
+        no-store` because a refusal must never be served from a proxy cache to a
+        later, different request under the same key."""
+        body = json.dumps({"ok": False, "error": code, "message": message,
+                           "retriable": code in idem.RETRIABLE_CODES}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for hk, hv in (extra_headers or {}).items():
+            self.send_header(hk, str(hv))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _idem_replay(self, status, stored_body):
+        """The stored response for a completed key, byte-identical, marked
+        `Idempotent-Replay: true`. The stored body may be a success (200) or the
+        settled failure (500) — either way the side effect is NOT re-run, which
+        is the whole point of replaying it."""
+        body = json.dumps(stored_body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Idempotent-Replay", "true")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -696,6 +729,13 @@ class Handler(BaseHTTPRequestHandler):
         # A request that is not an object is a request with no fields.
         if not isinstance(payload, dict):
             payload = {}
+        # Idempotency state, initialised BEFORE the try so the `except` can reach
+        # it. A keyless request (every legacy caller, all 1039 tests) never trips
+        # `keyed`, so nothing below calls `idem.*` and the path is byte-for-byte
+        # what it was. `idem_settled` guards the one narrow hazard: the key was
+        # completed with the success, and then the socket write failed — the
+        # `except` must NOT then overwrite that stored 200 with a 500.
+        key, keyed, idem_settled, proceeded = None, False, False, False
         try:
             # ---- /api/v1, the versioned surface (ADR 0009) ----
             #
@@ -772,6 +812,33 @@ class Handler(BaseHTTPRequestHandler):
             # are deferred), but it is the exact latent read→act hole that goes
             # silent the day scopes ship. The four boards only ever GET the log, so
             # exact-matching the POST verbs keeps the byte-compatibility freeze.
+            # ---- wire idempotency (ARCHITECTURE §5.6), keyed mutations only ----
+            #
+            # A retry that lands after `./start.sh` restarted the server has no
+            # in-memory lock left to stop it, so a persisted, boot-tagged
+            # reservation stands in — but ONLY when the client opted in with an
+            # `Idempotency-Key` AND the route actually mutates. `/api/hook` and
+            # every read stay exactly as they were. `begin` records the
+            # reservation write-ahead (before the handler's side effect) and
+            # releases idem's lock before returning, so the handler still takes
+            # its own worktree/pick locks with no lock-ordering cycle.
+            key = self.headers.get("Idempotency-Key")
+            keyed = bool(key) and route in idem.MUTATION_ROUTES
+            if keyed:
+                verdict, data = idem.begin(
+                    key, "POST", route, payload,
+                    _idem_issued_at(self.headers, payload), time.time())
+                if verdict == "reject":
+                    st, code, message, extra = data
+                    self._idem_reject(st, code, message, extra)
+                    return
+                if verdict == "replay":
+                    st, stored = data
+                    self._idem_replay(st, stored)
+                    return
+                # verdict == "proceed": the reservation is on disk; run the
+                # handler below, then settle the key with whatever it returns.
+                proceeded = True
             if route == "/api/hook":
                 # ENGINE.md §7.1: one route, one dict. The hottest POST this server
                 # has — several per agent turn, from every hooked session on the
@@ -832,19 +899,40 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
                 return
-            body = json.dumps(result).encode()
+            body = json.dumps(result).encode()   # before complete(): if `result`
+                                                 # is unserialisable it settles
+                                                 # the key as a 500, not a 200
+            if keyed:
+                idem.complete(key, 200, result)
+                idem_settled = True
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if keyed:
+                self.send_header("Idempotent-Replay", "false")
             self.end_headers()
             self.wfile.write(body)
         except Exception:
             # Same guard as `do_GET`: an unforeseen error is a 500 in the
             # board's envelope, never a bare dropped connection (a client that
             # branches on status codes cannot tell that from a dead server).
+            err = {"ok": False, "error": "internal",
+                   "message": "the board hit an unexpected error"}
+            # Settle the key with the failure so a retry replays the 500 rather
+            # than re-running a side effect that already went wrong — but ONLY
+            # for a request that actually PROCEEDED (owns the reservation). A
+            # request that was rejected (409 in_flight) or replayed and then
+            # failed mid-write must NOT complete the key: that key belongs to a
+            # DIFFERENT request still running, and settling it here would bury
+            # that op's real result under this one's 500. `idem_settled` covers
+            # the other side — a success whose write failed keeps its stored 200.
+            if proceeded and not idem_settled:
+                try:
+                    idem.complete(key, 500, err)
+                except Exception:
+                    pass
             if not getattr(self, "_answered", False):
-                self._json(500, {"ok": False, "error": "internal",
-                                 "message": "the board hit an unexpected error"})
+                self._json(500, err)
             self.close_connection = True
 
     # ---------------------------------------------------------- push, events
@@ -925,6 +1013,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def _idem_issued_at(headers, payload):
+    """The client's `issued_at` for expiry (ARCHITECTURE §5.6) — the
+    `Idempotency-Issued-At` header, else `payload["issued_at"]`, as a float
+    epoch. Absent or unparseable is None: the server then cannot expire the
+    request, which is permitted (clients are asked to send it)."""
+    raw = headers.get("Idempotency-Issued-At")
+    if raw is None:
+        raw = payload.get("issued_at")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def notify_token_ok(token):

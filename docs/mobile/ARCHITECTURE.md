@@ -221,8 +221,8 @@ tell "lost" from "failed."
   │  │ ThreadingHTTPServer · HTTP/1.1 keep-alive · gzip · ETag  │      │
   │  │                                                           │     │
   │  │  loopback :4242  ── plain HTTP, board token, HTML served  │     │
-  │  │  tailnet  :4242  ── TLS (self-signed, SPKI-pinned),       │     │
-  │  │                     bearer token + scopes, NO HTML        │     │
+  │  │  tailnet  :4242  ── plain HTTP (ADR 0013) · bearer token, │     │
+  │  │                   scopes · NO HTML                        │     │
   │  │                                                           │     │
   │  │  GET  /api/v1/state ?since= ?wait=   snapshot + delta     │     │
   │  │  GET  /api/v1/stream                 SSE, field ops       │     │
@@ -353,7 +353,7 @@ orchestra/
   errors.py              ApiError + envelope                                      [NEW]
   auth.py                ROUTES table, guard, devices, pairing, scopes            [NEW]
   qr.py                  QR v5-L / v6-L encoder, SVG + ANSI renderers             [NEW]
-  tls.py                 cert generation, SPKI pin derivation, tailnet supervisor  [NEW]
+  tls.py                 CUT by ADR 0013 (plain HTTP) — only a tailnet-bind supervisor remains [NEW]
   events.py              derive_events, event log, debounce                       [NEW]
   push/                  __init__.py (router), apns.py, ntfy.py, es256.py         [NEW]
   actuate.py             send_to_process, focus_process, start_finish, closeouts
@@ -407,6 +407,13 @@ and Time-Machined. The registry being hash-only makes its leak survivable; **the
 key is not hash-only** — with it an attacker stands up a listener presenting the pinned SPKI,
 the phone's pinning delegate accepts it by construction, and the next dispatch delivers the
 act token.
+
+> **Superseded in part by [ADR 0013](adr/0013-plain-http-over-the-tailnet.md) (Accepted).** The
+> server ships **plain HTTP over the tailnet** — there is no `tls.py`, no `TLS_KEY`/`TLS_CRT`, and
+> no SPKI for a phone to pin (§5.4). So the TLS-private-key row above describes a secret that is
+> not generated, and the spoofed-pinned-listener attack it guards against does not exist as
+> written. The paragraph is kept for the argument that *hash-only registries are survivable and
+> raw private material is not* — which still governs `DEVICES`, `BROWSER` and `APNS_P8`.
 
 Every write goes through one helper (tmp + `os.replace` + `fsync`). `save_resumes()` is
 retrofitted onto it in the same commit: it currently does a plain truncate-then-write with
@@ -601,10 +608,22 @@ indistinguishable in one diff.
 | T7 | retry double-fire | partly | closed by write-ahead idempotency + resource locks (§5.6) |
 | T8 | config as a code-execution sink (`cclimits_cmd` is executed, `resume_message` is typed at an agent) | yes | no general config-write endpoint, ever; `/api/reserve` stays `admin` and stays whitelisted to one key |
 | T10 | rooted phone defeating biometry | yes | **not closed.** Client-side biometry is advisory. The controls that hold are server-side: scopes, rate limits, audit, revoke. Do not oversell Face ID in the guide. |
-| T11 | pre-auth resource exhaustion (TLS handshake on the accept thread, slowloris, unbounded threads) | yes | closed: per-connection handshake on worker threads, socket timeouts, bounded pool, per-IP bucket evaluated **before** the token check |
+| T11 | pre-auth resource exhaustion (slowloris, unbounded threads; the TLS-handshake-on-the-accept-thread variant is **moot under [ADR 0013](adr/0013-plain-http-over-the-tailnet.md)** — there is no handshake) | yes | closed: socket timeouts, bounded pool, per-IP bucket evaluated **before** the token check |
 
 **T5 ships first, alone, before any mobile work.** It is a live vulnerability on a pure
 loopback install and its fix needs no phone, no TLS, and no pairing.
+
+**Reconciled with [ADR 0013](adr/0013-plain-http-over-the-tailnet.md) (Accepted).** This table was
+written against a TLS + SPKI-pinning transport; that design was **dropped in favour of plain HTTP
+over the tailnet** (§5.4). No row's closure depends on the cipher: T1/T3/T4 rest on the per-device
+bearer token, T2/T5 on the `Host`/`Origin`/`Content-Type` guards, and confidentiality on
+WireGuard — **none of which is TLS**. The one protection cert-pinning *would* have added — a server
+identity independent of MagicDNS, so an `act` token could not be redirected to a spoofed listener
+(§5.4 reason 1) — is **not shipped.** Its residual is stated plainly: a spoofed MagicDNS record
+could point the phone at a *wrong tailnet node*, to which it would present its bearer token. That
+residual is bounded, not closed, by the **tailnet ACL** (the wrong node must be a tailnet peer that
+passes `tailscale whois`), by the token being **per-device and revocable**, and by MagicDNS being
+served from the already trusted Tailscale coordination server.
 
 ### 5.2 One route table
 
@@ -668,22 +687,38 @@ Two self-service endpoints exist at `read` scope, whitelisted to their own devic
 
 ### 5.4 Transport: TLS on the tailnet, plain HTTP on loopback
 
-Two listeners, different policies. **Never `0.0.0.0`** — it is indistinguishable from binding
-coffee-shop Wi-Fi.
+> **SUPERSEDED by [ADR 0013](adr/0013-plain-http-over-the-tailnet.md) — Accepted.** What ships is
+> **plain HTTP over the tailnet, plus a scoped iOS ATS exception** (`NSExceptionDomains` for the
+> tailnet address). There is **no server TLS, no self-signed certificate, no SPKI, and nothing for
+> the phone to pin.** WireGuard already gives the link confidentiality and mutual authentication,
+> and the threat inside a tailnet is *device compromise*, which TLS does not address — a hostile
+> tailnet node completes a handshake exactly as happily as a friendly one. The controls that
+> actually ship are the **per-device bearer token** (ADR 0014) and the **tailnet ACL / WireGuard
+> boundary**; the loopback listener stays plain HTTP with the board token as it always was. The
+> analysis below is kept as the historical argument for why TLS was weighed and dropped — **read
+> every present-tense "TLS", "cert", "SPKI" and "pin" claim in this section as proposed-then-cut,
+> not as the shipping contract.** The listener table now reads:
 
 ```
 loopback 127.0.0.1:4242   plain HTTP · serves HTML · board token · CSP
-tailnet  100.x.y.z:4242   TLS, self-signed P-256, SPKI-pinned · bearer + scopes · NO HTML
+tailnet  100.x.y.z:4242   plain HTTP (ADR 0013) · bearer token · NO HTML   ← was: TLS+SPKI-pin
          fd7a:…:4242      (both families — MagicDNS publishes A and AAAA, and iOS
                            Happy-Eyeballs tries v6 first)
 ```
 
-**Why TLS at all, inside a WireGuard tunnel?** On transport confidentiality, honestly, close
-to nothing — Tailscale is already end-to-end encrypted. Four real reasons:
+**Why TLS was considered at all, inside a WireGuard tunnel** — historical; **not shipped, see the
+banner.** On transport confidentiality, honestly, close to nothing — Tailscale is already
+end-to-end encrypted. The four reasons weighed:
 
-1. **Cert pinning gives the phone a server identity independent of DNS.** MagicDNS is
-   controlled by the Tailscale coordination server; pinning the SPKI means a spoofed record
-   cannot redirect the `act` token to an attacker's listener. This is the actual reason.
+1. **Cert pinning would have given the phone a server identity independent of DNS.** MagicDNS is
+   controlled by the Tailscale coordination server; pinning the SPKI would mean a spoofed record
+   could not redirect the `act` token to an attacker's listener. This was the strongest reason —
+   and it is precisely the protection that **ADR 0013 declined to ship.** The residual it leaves
+   is named honestly: a spoofed MagicDNS record could point the phone at a *wrong tailnet node*,
+   to which the phone would present its bearer token. That residual is bounded, not closed, by
+   the tailnet ACL (the wrong node must itself be a tailnet peer that passes `tailscale whois`),
+   by the token being per-device and revocable, and by MagicDNS being served from the already
+   trusted Tailscale coordination server. ADR 0013 accepts it deliberately.
 2. **ATS.** Plain HTTP to an *IP literal* requires `NSAllowsArbitraryLoads` — a blanket
    disable. `NSExceptionDomains` keys are domain names and do not apply to IPs; and
    `NSAllowsLocalNetworking` covers unqualified hostnames, `*.local` and link-local, **not**
@@ -739,6 +774,14 @@ sleep, network changes and re-auth. A `sys.exit` there kills the local board for
 via `/api/health`; loopback binds unconditionally and first.
 
 ### 5.5 Pairing
+
+> **Reconciled with [ADR 0013](adr/0013-plain-http-over-the-tailnet.md) and built per
+> [ADR 0015](adr/0015-pairing-and-the-tailnet-bind.md).** Since there is no TLS (§5.4), the QR
+> carries **no SPKI pin** (`f=` is gone), the phone stores **one** token (scopes are deferred,
+> ADR 0014), and the "TLS, pin taken from the QR" / "computes the SPKI pin from the presented
+> certificate" steps below do not happen — there is no certificate. What still holds: the code is
+> the out-of-band secret, the manual path is short and case-insensitive, and the token identifies
+> the device afterwards. `API.md` §3 is the built contract and wins on wire shapes.
 
 ```
 Mac (board /pair, or --pair)              iPhone
@@ -1396,7 +1439,7 @@ as its only recovery story.
 | **6** | **The state bus + producer.** `cached_state()` becomes a read with `fresh=True`. `index.html` untouched and ~1000× faster per poll. Git split, `_gitdirs`, parallel fan-out, transcript memo, single-flight for `_topo`/`_limits`. | **`collect_state` re-measured**, `BASE_S` re-derived from the real number; the empty-patch test green; linked-worktree git cache test green |
 | **7** | **`/api/v1/state`** — snapshot envelope + `since=` delta + `wait=` long-poll + ETag. Tiers 2–3, fully testable through `urllib.request`. | conditional-request tests |
 | **8** | **Auth**: state dir, registry, tokens, scopes, rate limits, audit; loopback only; `board_auth: "open"`. All **four** HTML files get the meta tag and the shared `api()` helper (`guide.html:280` fetches `/api/state` too — omitting it silently breaks the user chip). | auth on, real token, `/api/state` without one → 401 |
-| **9** | **TLS**: key + cert generation, pin derivation, boot assertion. **Before pairing**, because the QR carries the pin. | pin stable across a reissue from the same key; `cert_pin()` raises rather than returning stale |
+| **9** | ~~**TLS**: key + cert generation, pin derivation, boot assertion~~ — **cut by [ADR 0013](adr/0013-plain-http-over-the-tailnet.md).** The tailnet ships plain HTTP; there is no cert, no pin, no `tls.py`. The step collapses to "bind the tailnet interface, plain HTTP, refuse `0.0.0.0`". | tailnet bind refuses `0.0.0.0` and refuses to start with no device registered (ADR 0015) |
 | **10** | **Pairing**, `qr.py`, `/pair` board view, tailnet supervisor. The phone connects. | QR syndrome test at v5 and v6; a 63-char hostname fits |
 | **11** | **Idempotency + ops + locks**, and **`/api/finish` jobified** to return immediately. **Ships before the phone can actuate anything.** | two concurrent auto-picks never share a worktree; restart → `indeterminate`, never re-execute |
 | **12** | **`/api/v1/stream`** — SSE. **Gated on step 8**: thread-per-connection + long-lived connections + zero auth is a trivial exhaustion vector. | 65 concurrent sockets → 65th gets 503 and the server keeps serving; no `Content-Encoding` |
@@ -1469,6 +1512,14 @@ it, or accept a 3,400-line module with the security boundary in the middle.
 
 **2. How TLS is terminated — three options, not two. This is `ROADMAP.md` D1 and it is open.**
 
+> **Resolved by [ADR 0013](adr/0013-plain-http-over-the-tailnet.md) (Accepted): none of the
+> three.** The decision was to ship **no TLS** — plain HTTP over the tailnet with a scoped ATS
+> exception — because WireGuard already supplies confidentiality and mutual authentication, and
+> the tailnet threat is device compromise, which no TLS option below addresses. The three options
+> are kept as the record of what was weighed; adding TLS later stays additive if the transport
+> assumption ever changes (e.g. a non-WireGuard exposure), at which point ADR 0013 says this must
+> be re-opened rather than drifted into. Options (a)/(b)/(c) below are therefore historical.
+
 - **(a) `tailscale cert` + MagicDNS**, wrapped in `ssl.SSLContext` in-process. A publicly
   trusted certificate on a real hostname, so the client ships **no trust delegate and no pin**.
   This is what `ROADMAP.md` D1 and `UX.md` §1.5 recommend, and this document's §9.3 previously
@@ -1522,7 +1573,7 @@ block of new code from the security work.
 | route table, guard, HTTP substrate | ~230 |
 | registry, tokens, scopes, pairing, CLI | ~200 |
 | QR encoder (v5 + v6, two renderers) | ~250 |
-| TLS, pin derivation, tailnet supervisor | ~130 |
+| ~~TLS, pin derivation~~ (cut, ADR 0013), tailnet supervisor only | ~40 |
 | idempotency, ops, locks, rate, audit | ~200 |
 | events, push (apns + ntfy + es256) | ~280 |
 | **new Python** | **~1,740**, against 2,302 today |
