@@ -14,14 +14,14 @@ one silently hit a usage limit an hour ago? Which worktree is free for the
 next feature — and on which account? orchestra answers all of it on one dark
 board, and (when you click) acts on it too.
 
-It's an agent **harness** with zero dependencies — one python3 stdlib file.
+It's an agent **harness** that installs nothing — python3 stdlib only.
 
 ```bash
 git clone https://github.com/acrdlph/orchestra && cd orchestra
-python3 orchestra.py --root ~/code        # → http://127.0.0.1:4242
+python3 -m orchestra --root ~/code        # → http://127.0.0.1:4242
 ```
 
-Try it with nothing running: `python3 orchestra.py --demo` serves fictional
+Try it with nothing running: `python3 -m orchestra --demo` serves fictional
 data.
 
 ---
@@ -36,7 +36,9 @@ A left rail navigates between them; all share one visual language:
 
 ![the orchestra dashboard](docs/screenshot.png)
 
-One card per worktree, attention-sorted, refreshed every 5 s. Each card:
+One card per worktree, attention-sorted, refreshed every 5 s — and the
+engine behind it re-reads the world within ~50 ms of an agent writing a line,
+rather than on a timer. Each card:
 branch, dirty count, ahead/behind, last commit, live processes, and every
 recent session tagged with its **account**, model, age, and three lines of
 context — `→` the last thing you told it, `⏎` the last thing it said, `⚙` the
@@ -219,8 +221,8 @@ that, with `/proc`-based process detection. Optional: `tmux` (dispatch),
 `claude` on PATH (dispatch router).
 
 ```bash
-python3 orchestra.py [--root DIR]... [--pattern REGEX] [--home DIR]...
-                      [--port N] [--window-h H] [--demo]
+python3 -m orchestra [--root DIR]... [--pattern REGEX] [--home DIR]...
+                      [--port N] [--window-h H] [--idle-s S] [--demo]
 ./start.sh            # restart + open browser (extra args passed through)
 ```
 
@@ -230,16 +232,157 @@ python3 orchestra.py [--root DIR]... [--pattern REGEX] [--home DIR]...
 | `--pattern REGEX` | all | only watch child dirs matching this (case-insensitive) |
 | `--home DIR` | auto | Claude home dirs; default finds `~/.claude*` |
 | `--port N` | 4242 | also `ORCHESTRA_PORT` env |
+| `--host ADDR` | 127.0.0.1 | bind address. Anything but loopback needs a registered device; `0.0.0.0` is refused outright |
+| `--tailnet` | — | detect the Tailscale address and bind it — the flag to reach the board from a phone |
+| `--bind-every-interface` | — | what `--host 0.0.0.0` was refused for, said deliberately. Still needs a registered device; a config file cannot set it |
+| `--add-device LABEL` | — | mint a device token, printed **once** — then exit |
+| `--list-devices` | — | every registered device, with `last_seen` — then exit |
+| `--revoke-device ID` | — | kill a token immediately, no restart needed — then exit |
 | `--window-h H` | 48 | ignore transcripts idle longer than this many hours |
+| `--idle-s S` | 30.0 | seconds between **safety-net** sweeps; changes arrive as events (see below) |
 | `--demo` | — | fictional data (screenshots, kicking the tires) |
 
 Persistent settings go in `orchestra.config.json` next to the script
-(gitignored):
+(gitignored). **Copy `orchestra.config.example.json` to start** — it lists every
+key with placeholder values, including the `apns_*` keys for iOS push:
 
 ```json
 { "roots": ["/Users/you/code"], "pattern": "myproject", "cclimits_cmd": null,
-  "exclude_accounts": [], "router_home": null, "reserve_percent": {"main": 20} }
+  "exclude_accounts": [], "router_home": null, "reserve_percent": {"main": 20},
+  "idle_s": 30.0, "git_s": 15.0 }
 ```
+
+**Secrets and where they live** — nothing sensitive is committed; each has a
+`.example` template so a fresh checkout knows the shape:
+
+| secret | real (gitignored) | template (committed) |
+|---|---|---|
+| server config | `orchestra.config.json` | `orchestra.config.example.json` |
+| iOS device-signing team | `ios/Signing.xcconfig` | `ios/Signing.xcconfig.example` |
+| APNs push key | `~/.orchestra/apns/AuthKey_*.p8` (outside the repo) | — see `docs/mobile/APNS-SETUP.md` |
+
+The `apns_*` keys (`apns_team_id`, `apns_key_id`, `apns_key_path`, `apns_topic`,
+`apns_environment`) are only needed for push to the iOS app;
+[`docs/mobile/APNS-SETUP.md`](docs/mobile/APNS-SETUP.md) is the ten-minute
+walk-through for creating the key. All three — the App ID, the key, and
+`apns_team_id` — must belong to the **same** Apple team, or Apple rejects the
+provider token with `403 InvalidProviderToken`.
+
+| key | default | meaning |
+|---|---|---|
+| `roots` | `[cwd]` | dirs whose git-repo children are watched |
+| `pattern` | `""` | regex filter on worktree dir names |
+| `homes` | `[]` | Claude home dirs; `[]` auto-discovers `~/.claude*` |
+| `host` / `port` | `127.0.0.1` / `4242` | the board serves your transcript text. Off loopback it refuses to start until a device is registered (`--add-device`), and refuses `0.0.0.0` outright |
+| `auth_trust_loopback` | `true` | requests from this machine need no token. Set false only if something proxies to the board — a proxy makes every peer look local |
+| `session_window_h` | `48` | ignore transcripts idle longer than this |
+| `quiet_s` | `45` | unexplained silence before a live agent stops reading WORKING |
+| `flicker_dwell_s` | `3.0` | a status must stand this long before it may quieten; escalation never waits |
+| `block_grace_s` | `60` | how long an unresolved tool_use is a tool **running** before it is you it is waiting for (■ BLOCKED) |
+| `orphan_grace_s` | `90` | how long a fresh write with **no** visible process is still WORKING rather than ○ ENDED — the dangerous one: ENDED makes a worktree FREE, and FREE is what dispatch aims at |
+| `delegated_s` | `600` | shelf life of a background launch that never reported back, as an explanation for a quiet session |
+| `subagent_grace_s` | `180` | how long after the last write under `<session-id>/` the card still shows **⚙ subagents running** |
+| `working_s` | `90` | the fallback the four keys above are `None`-defaulted to. Nothing on the board reaches it any more — every call site names the clock it means. Change one of those instead |
+| `max_sessions` | `6` | sessions shown per worktree card |
+| `exclude_accounts` | `[]` | account labels dispatch/router never **auto**-picks |
+| `reserve_percent` | `{}` | `{label: pct}` headroom kept free before AUTO-pick treats an account as full |
+| `cclimits_cmd` / `router_home` | `null` | override the limits binary / pin the router to one Claude home |
+| `resume_delay_s` | `60` | auto-resume fires this long after a limit reset |
+| `resume_message` | `"continue"` | what auto-resume types at the stalled agent |
+| **the sweep's cadences** | | *costs measured below; all are seconds* |
+| `idle_s` | `30.0` | between **safety-net** sweeps — see "how the board notices" below |
+| `idle_blind_s` | `3.0` | ceiling on that wait when there is no watcher (Linux, or one that died) |
+| `hot_s` | `0.15` | floor between sweeps after a **mutation**, so a burst can't spin the loop |
+| `git_s` | `15.0` | minimum between `git` fan-outs |
+| `reconcile_s` | `60.0` | how often a sweep goes cold: bypass every cache, count the disagreements |
+| `max_stale_s` | `45.0` | hard ceiling between sweeps — **keep this ≥ `idle_s`**, or it silently becomes the cadence |
+| **the watcher** (macOS) | | *what makes `idle_s` a safety net rather than the mechanism* |
+| `watch` | `true` | react to transcript writes instead of polling for them |
+| `watch_max_fds` | `2048` | hard cap on watched descriptors; over it the excess falls back to the timer |
+| `watch_debounce_s` | `0.05` | quiet period that ends a burst — an agent writing 50 lines is **one** sweep |
+| `watch_min_interval_s` | `1.0` | floor between event-driven sweeps (the rate limit; see below) |
+| `watch_max_window_s` | `2.0` | never defer a nudge longer than this, however busy the writer |
+| `watch_rebuild_s` | `30.0` | re-enumerate the watch set on this clock, as well as on every change |
+
+**How the board notices (macOS).** It does not go looking. A kqueue watcher
+holds a deliberately bounded set of file descriptors — the project directories
+that map to one of your worktrees, and the transcripts inside your session
+window — and the moment one of them is written to, the sweep runs. Measured on
+a nine-worktree fleet that is **228 descriptors**: 1 root, 8 `projects` roots,
+164 project and session directories, 55 in-window transcripts. Never the
+18,773 subagent files; over `watch_max_fds` the excess quietly falls back to
+the timer and says so once in the log.
+
+A burst is one sweep, not fifty: writes are debounced (`watch_debounce_s`) and
+then rate-limited (`watch_min_interval_s`), because events remove the sweep's
+floor *and* its ceiling, and the ceiling is the dangerous half — an agent
+writing continuously would otherwise sweep several times a second.
+
+Three things the watcher **cannot** see, which is what `idle_s` is now for:
+a `claude` process being **born** (kqueue has a filter for process death, none
+for birth), an append to a transcript that had already fallen out of the 48 h
+window, and a subagent file more than one directory deep. Those wait for a
+safety-net sweep. And on Linux — no stdlib inotify binding — the watcher never
+starts, one line is logged, and the loop falls back to `idle_blind_s` (3.0),
+which is exactly how this program behaved before.
+
+**What the cadences cost.** orchestra watches continuously, so the board hears
+that an agent needs you without anybody refreshing anything. That is a real,
+permanent CPU cost, which is why it is a setting and why here is the bill.
+Measured on a nine-worktree fleet (709 transcripts on disk, ~47 inside the
+48 h window), 120 s per row, with `getrusage(RUSAGE_SELF) + RUSAGE_CHILDREN` —
+wall time and `ps -o time` on the server process both understate this by ~2×,
+because the sweep is a parallel fan-out and most of its cost is billed to the
+`git` and `ps` children it spawns. One knob varies per row; the rest are at
+their defaults:
+
+**Nothing happening at all** — no agent writing anywhere, three interleaved
+repetitions per row so machine load cancels rather than favouring one:
+
+| | | CPU (1 core = 100 %) | sweeps / git runs | what you trade |
+|---|---|---|---|---|
+| `watch` + `idle_s` | **`true` + `30.0`** | **6 %** | 4 / 4 | the default |
+| | `true` + `60.0` | 3 % | 2 / 2 | 3 points, for twice the blind spot below |
+| | `false` + `3.0` | 14 % | 40 / 8 | the timer-only loop this replaces |
+| `git_s` | `5.0` | 29 % | 40 / 20 | branch/ahead/behind/dirty ≤5 s old |
+| | **`15.0`** | **17 %** | 40 / 8 | *(measured at the old `idle_s` 3.0)* |
+| | `60.0` | 9 % | 40 / 2 | a dirty count can be a minute stale |
+| `reconcile_s` | **`60.0`** | **17 %** | 40 / 8 | *(same)* |
+| | off | 16 % | 40 / 8 | saves ~1 point; nothing audits the caches |
+
+**And with one agent actually working**, which is the regime that decides
+`idle_s`, because idle it barely matters:
+
+| `idle_s` (watcher on) | CPU | sweeps | of which event-driven |
+|---|---|---|---|
+| **`30.0`** | **7 %** | 8 | 6 |
+| `15.0` | 10 % | 15 | 11 |
+| `5.0` | 15 % | 35 | 17 |
+
+Read the last column downward. Tightening `idle_s` from 30 to 5 buys 27 extra
+sweeps and 8 points of CPU, and **every one of those sweeps found something the
+events had already reported**. Before the watcher, that column did not exist
+and polling harder was the only dial there was.
+
+Two more things worth more than the numbers.
+
+**The watcher pays twice.** Idle cost falls **14 % → 6 %** *and* a transcript
+write reaches the board in **53 ms** instead of waiting out a cadence (median
+of ten writes; 212 ms through to a published version, since the sweep follows).
+Latency and battery usually trade against each other; this is the one change
+that moved both.
+
+**`git_s` is still the expensive knob, not `idle_s`.** The `git` fan-out is
+79 % of a sweep's cost, which is why tripling the git rate (15 → 5) costs 12
+points on its own. And note what a *watch* nudge deliberately does **not** do:
+it does not force git off its cadence. A mutation you performed does; an agent
+typing does not, or git would run at the speed of somebody's keyboard.
+
+Every budget above is for changes **nobody told the board about**. Every
+mutation you make (finish, dispatch, chat) nudges the sweep, which pulls the
+next one forward *and* forces git off its cadence, so you never wait out
+`git_s` for your own actions. And nothing is ever silently stale: each card
+publishes how old its git data is.
 
 `exclude_accounts` names accounts (by label) that dispatch/router will never
 **auto**-pick — useful for keeping a primary account (e.g. `main` = `~/.claude`)
@@ -298,6 +441,26 @@ headroom + reserve buffers, the reserve-persist round-trip, dispatch-log
 parsing, and an HTTP smoke test that boots the real server in `--demo` mode
 and hits every endpoint.
 
+**Auth tests** (`tests/test_auth.py`, `tests/test_pairing.py`) come in three
+shapes because the claims do: the decision (`auth.check` with an explicit peer,
+header and clock — every refusal in the design is one row), the wire (a real
+server on a real port whose handler believes its peer is on the tailnet, which
+is what proves the check is in the request path rather than merely in a
+function), and the routes — read back out of `server.py`'s own AST *and* out of
+the guard's own admin list, each required to be exempt-by-list or to refuse a
+stranger, so a route added later cannot start out unguarded and a hard-coded
+list cannot rot.
+
+The route tests also ask, **holding a valid token**, that no `/api/v1` route can
+be reached by gluing a character onto it. That one is not theoretical: the
+router matched the device subtree with `startswith("/api/v1/devices")` while the
+guard stopped at a segment boundary, so `GET /api/v1/devicesX` was refused at the
+exact path and served the whole device inventory one character to the right of
+it — and `POST /api/v1/devicesX/<id>/revoke` let any token holder revoke any
+device. Both halves had a test and neither could see the gap, because neither
+asked the other one anything. The router and the guard now call the same
+function.
+
 **Integration tests** (`tests/test_integration.py`) exercise the *real*
 pipeline against controlled fixtures — no dependency on your live fleet:
 
@@ -319,7 +482,50 @@ dispatch (kickoff → READY → instruction → DONE).
 ## Security & spending
 
 - **The board serves your prompts and your agents' replies.** It binds to
-  127.0.0.1 and should stay there; a warning prints if you bind wider.
+  127.0.0.1 by default. Loopback is trusted — a process that can open that
+  socket is already running as you and can read `~/.claude*` without asking
+  this server — so the browser needs no token. **Everything else must present
+  one:**
+
+  ```bash
+  python3 -m orchestra --add-device "iPhone"   # prints the token ONCE
+  python3 -m orchestra --list-devices
+  python3 -m orchestra --revoke-device 9f3ab21c
+  ```
+
+  The token goes in `Authorization: Bearer orc1_…` — never a query parameter,
+  never a cookie; both are refused. Exactly two routes need no token:
+  `GET /api/health`, which carries nothing that varies with your fleet, and
+  `POST /api/v1/pair`. Devices live in `devices.json` as sha256 hashes compared
+  with `hmac.compare_digest`, so a copy of that file is not a way in, and every
+  mutation and every refusal is appended to `audit.log.jsonl` — who, what, when,
+  never what was said, and never anything token-shaped, whichever field it
+  arrived in.
+
+- **To reach it from a phone, `--tailnet`.** The Tailscale address is detected
+  and then actually bound on port 0 to prove it, rather than pasted from a
+  stale document; if Tailscale is down you get one of three sentences saying
+  which failure it is, not `EADDRNOTAVAIL`. `--host 0.0.0.0` is refused and
+  names `--tailnet` in the refusal — the escape hatch is
+  `--bind-every-interface`, which cannot be typed by accident and which a
+  config file cannot set. **Nothing beyond loopback binds at all until a device
+  is registered**, including the wide one; it used to warn and bind anyway.
+  A tailnet bind also raises a second listener on 127.0.0.1, because device
+  management answers to this machine holding *no* token — and a request the Mac
+  sends to its own tailnet address does not arrive from loopback.
+
+- **Pairing a phone is a QR, and the QR is not the token.** `/pair` on the board
+  mints an 8-character Crockford code, valid 120 seconds, single use, which the
+  phone exchanges at `POST /api/v1/pair` for a fresh secret that was never on
+  screen — so a photograph of the code, or a screenshot in a bug report, is
+  worthless by the time it leaves the room. Device management (`/api/v1/devices`)
+  answers only to the Mac holding no token: **no token grants it, not even a
+  valid one**, because a device that could revoke devices could revoke the one
+  that would have revoked it.
+- **A website you visit cannot drive your fleet.** Mutations must be sent as
+  `Content-Type: application/json` and a cross-site `Origin` is refused, which
+  is what stops another page borrowing your browser's loopback trust to type
+  at an agent. If you script the API by hand, send that header.
 - **Actions type into your terminals.** Chat/resume literally keystroke the
   target terminal — same as you typing. They fire only on your click.
 - **Dispatch spends usage.** A launched agent runs
@@ -331,8 +537,14 @@ dispatch (kickoff → READY → instruction → DONE).
 
 - The transcript format is an undocumented Claude Code internal (tested
   against v2.1.x); statuses are honest heuristics, not ground truth.
-- BLOCKED / YOUR TURN are inferred — permission prompts aren't recorded in
-  transcripts.
+- BLOCKED / YOUR TURN are inferred **for agents orchestra did not launch** —
+  permission prompts aren't recorded in transcripts. Agents dispatched *by*
+  orchestra get a `--settings` fragment that POSTs Claude Code's own hooks to
+  the board, and their statuses are observed instead: a permission dialog reads
+  ■ BLOCKED within a couple of seconds of appearing rather than after
+  `block_grace_s`, and those sessions carry a dim `◦` on the board. orchestra
+  never writes your `settings.json`; an agent you started yourself has no hooks
+  and reads exactly as it always did.
 - Each clone's `origin/main` is only as fresh as its last `git fetch`; the
   map's trunk uses the freshest clone's view.
 - Handoff detection reads "fresher live session in the same worktree" as

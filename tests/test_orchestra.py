@@ -4,14 +4,16 @@
     python3 -m unittest discover -s tests        # from repo root
     python3 tests/test_orchestra.py             # or run directly
 
-orchestra.py is a script (guarded by `if __name__ == "__main__"`), so importing
-it here does NOT start the server. Data-driven functions read module globals
-(CFG, _limits, DEMO); tests set those and restore them.
+The server only starts from `python3 -m orchestra` (orchestra/__main__.py), so
+importing the package here does NOT start it. Data-driven functions read module
+globals (CFG, _limits, DEMO); tests set those and restore them.
 """
 
-import importlib.util
 import json
+import pathlib
 import shlex
+import shutil
+import sys
 import tempfile
 import threading
 import unittest
@@ -19,11 +21,10 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-# ---- load orchestra.py by path (it's a script, not a package) --------------
+# ---- import the orchestra package from the repo root ----------------------
 ROOT = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("orchestra", ROOT / "orchestra.py")
-fb = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(fb)
+sys.path.insert(0, str(ROOT))
+import orchestra as fb  # noqa: E402
 
 
 def acc(config_dir, ok=True, headroom=None, limits=None):
@@ -32,11 +33,32 @@ def acc(config_dir, ok=True, headroom=None, limits=None):
             "plan": "max", "headroom_percent": headroom, "limits": limits or []}
 
 
+FETCHED_AT = 1000    # default `fetched_at` for the hand-built _limits fixtures
+
+
 def lim(label, pct, model_scoped=False, exhausted=False, resets_in=None):
+    """A limit record as CCLIMITS emits it — countdown and all.
+
+    Raw on purpose: `limdata` below feeds it through the real fetch boundary,
+    so the fixtures carry whatever `cached_limits` would have left in the
+    cache rather than a hand-maintained second copy of that conversion."""
     return {"label": label, "group": "weekly" if label != "Session" else "session",
             "percent": pct, "remaining_percent": 100 - pct,
             "model_scoped": model_scoped, "exhausted_now": exhausted,
             "resets_in_seconds": resets_in}
+
+
+def limdata(accounts, fetched=FETCHED_AT):
+    """A `_limits["data"]` blob as `cached_limits` would have left it.
+
+    The countdown never survives the fetch boundary (ENGINE.md §3.4 — it goes
+    stale behind the 300s cache), so a fixture poked straight into
+    `_limits["data"]` must be post-conversion or it tests a shape production
+    never holds. Calling the real `_absolutise_resets` rather than restating
+    `fetched + resets_in` here means the two cannot drift apart."""
+    for a in accounts:
+        fb.limits._absolutise_resets(a, fetched)
+    return {"available": True, "fetched_at": fetched, "accounts": accounts}
 
 
 class ConfigGuard(unittest.TestCase):
@@ -44,14 +66,23 @@ class ConfigGuard(unittest.TestCase):
     def setUp(self):
         self._cfg = dict(fb.CFG)
         self._limits = dict(fb._limits)
-        self._demo = fb.DEMO
-        self._cpath = fb.CONFIG_PATH
+        self._demo = fb.config.DEMO
+        self._cpath = fb.config.CONFIG_PATH
+        # Every request through `Handler` now passes `auth.check`, and a
+        # mutation from loopback writes an audit line. Without this, running
+        # the suite appends to the developer's REAL audit log — a test that
+        # edits the machine it runs on.
+        self._audit = fb.auth.AUDIT_LOG
+        self._audit_dir = tempfile.mkdtemp(prefix="fb-audit-")
+        fb.auth.AUDIT_LOG = Path(self._audit_dir) / "audit.log.jsonl"
 
     def tearDown(self):
         fb.CFG.clear(); fb.CFG.update(self._cfg)
         fb._limits.clear(); fb._limits.update(self._limits)
-        fb.DEMO = self._demo
-        fb.CONFIG_PATH = self._cpath
+        fb.config.DEMO = self._demo
+        fb.config.CONFIG_PATH = self._cpath
+        fb.auth.AUDIT_LOG = self._audit
+        shutil.rmtree(self._audit_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- text utils
@@ -172,6 +203,235 @@ class TestClassifySession(unittest.TestCase):
     def test_pending_question_outranks_live_shell(self):
         st, _ = fb.classify_session(200, True, ["AskUserQuestion"], 0, False, self.W, shells=1)
         self.assertEqual(st, "needs_input")
+
+
+class TestTurnEndedBeatsTheClock(unittest.TestCase):
+    """The CLI's own end-of-turn marker, wired at last. Until now `turn_ended`
+    defaulted to False and NOTHING passed it, so this branch had never once
+    executed — and a session that stopped kept reporting ● WORKING for the rest
+    of the 90 s window. Measured on the real corpus: 66 of 79 in-window
+    sessions (84 %) carry the marker, so this is the majority path, not an
+    edge case.
+
+    Every test below fixes age_s at 5 s — deep inside `working_s`, where the
+    clock alone would say WORKING — so each one is only ever about the marker.
+    """
+    W = 90
+
+    def test_an_ended_turn_is_the_users_turn_immediately(self):
+        st, tool = fb.classify_session(5, True, [], 0, False, self.W, turn_ended=True)
+        self.assertEqual(st, "waiting")      # would be "working" for 85 s more
+        self.assertFalse(tool)
+
+    def test_without_the_marker_the_clock_still_rules(self):
+        # the control: same inputs, no marker → the old 90 s hysteresis
+        self.assertEqual(fb.classify_session(5, True, [], 0, False, self.W)[0], "working")
+
+    def test_an_ended_turn_awaiting_a_background_agent_is_still_working(self):
+        # the ConfidAi8 case a previous commit fixed: the turn DID end, and the
+        # marker says so, but the harness resumes the session when the agent
+        # reports back. Calling that "needs you" is the regression this pins.
+        st, _ = fb.classify_session(5, True, [], 1, False, self.W, turn_ended=True)
+        self.assertEqual(st, "working")
+
+    def test_an_ended_turn_with_a_live_background_shell_is_still_working(self):
+        # the ConfidAI-ci-cleanup case: "1 shell still running" IS a turn that
+        # ended, so this is the pairing that actually occurs on disk.
+        st, tool = fb.classify_session(5, True, [], 0, False, self.W,
+                                       shells=1, turn_ended=True)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+
+    def test_an_ended_turn_with_an_unresolved_tool_is_not_the_users_turn(self):
+        # an interrupted turn leaves a tool_use with no tool_result and then a
+        # turn_duration. Positive evidence of work outranks the marker.
+        st, tool = fb.classify_session(5, True, ["Bash"], 0, True, self.W, turn_ended=True)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+        st, _ = fb.classify_session(200, True, ["Bash"], 0, False, self.W, turn_ended=True)
+        self.assertEqual(st, "blocked")
+
+    def test_a_pending_question_outranks_an_ended_turn(self):
+        st, _ = fb.classify_session(5, True, ["AskUserQuestion"], 0, False, self.W,
+                                    turn_ended=True)
+        self.assertEqual(st, "needs_input")
+
+    def test_an_ended_turn_never_revives_a_dead_session(self):
+        st, _ = fb.classify_session(200, False, [], 0, False, self.W, turn_ended=True)
+        self.assertEqual(st, "ended")
+
+
+class TestQuietTimerCoversOnlyTheUnexplained(unittest.TestCase):
+    """`quiet_s` — what is left of the 90 s lie once the CLI's own marker has
+    taken 84 % of sessions off the clock. The residual 16 % have no marker, so
+    a timer is the only answer for them, and it is the LAST branch: it may only
+    ever decide a silence NOTHING else explains.
+
+    Every test fixes `working_s` at 90 and `quiet_s` at 45, so a failure names
+    which of the three jobs the old single number was doing has moved.
+    """
+    W, Q = 90, 45
+
+    def _c(self, *a, **kw):
+        kw.setdefault("quiet_s", self.Q)
+        return fb.classify_session(*a, **kw)
+
+    def test_a_quiet_agent_is_the_users_turn_at_quiet_s_not_working_s(self):
+        self.assertEqual(self._c(44, True, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(45, True, [], 0, False, self.W)[0], "waiting")
+        # the control: without quiet_s the same silence is WORKING for 45 s more
+        self.assertEqual(fb.classify_session(45, True, [], 0, False, self.W)[0],
+                         "working")
+
+    def test_delegated_work_is_an_explanation_and_outlasts_any_quiet_timer(self):
+        self.assertEqual(self._c(3600, True, [], 1, False, self.W)[0], "working")
+
+    def test_a_live_shell_is_an_explanation(self):
+        st, tool = self._c(3600, True, [], 0, False, self.W, shells=1)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+
+    def test_a_running_tool_is_an_explanation(self):
+        st, tool = self._c(3600, True, ["Bash"], 0, True, self.W)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+
+    def test_a_pending_question_still_beats_it(self):
+        self.assertEqual(self._c(3600, True, ["AskUserQuestion"], 0, False, self.W)[0],
+                         "needs_input")
+
+    def test_it_does_not_shorten_the_approval_grace(self):
+        # `working_s` still backs block_grace_s: an unresolved tool_use without
+        # --dangerously-skip-permissions is a long tool for 90 s, not BLOCKED
+        # at 45. Tightening THAT is a different question with a different cost.
+        self.assertEqual(self._c(50, True, ["Bash"], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(90, True, ["Bash"], 0, False, self.W)[0], "blocked")
+
+    def test_it_does_not_shorten_the_orphan_grace(self):
+        # ENDED feeds worktree-FREE feeds dispatch targeting. A fresh write with
+        # no observed process must keep reading WORKING for the full
+        # orphan_grace_s (= working_s), or a live-but-unpaired agent would make
+        # its worktree look free and a dispatch could land on top of it.
+        self.assertEqual(self._c(50, False, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(90, False, [], 0, False, self.W)[0], "ended")
+
+    def test_a_wholesale_proc_failure_still_wins_over_the_clock(self):
+        self.assertEqual(self._c(3600, True, [], 0, False, self.W,
+                                 procs_known=False)[0], "unknown")
+
+
+class TestTheThreeClocksAreIndependent(unittest.TestCase):
+    """`block_grace_s`, `orphan_grace_s` and `quiet_s` answer three different
+    questions, and until now two of them were `working_s` wearing a name.
+
+    Every test here gives the three DIFFERENT values and an age that lands
+    between them, so a call site that collapsed any two — or that let
+    `working_s` back in — fails on exactly the pair it collapsed. The values
+    are deliberately not the shipped ones: what is pinned is that each branch
+    reads its own argument, not what today's config happens to say.
+    """
+    W, B, O, Q = 90, 60, 30, 45
+
+    def _c(self, *a, **kw):
+        kw.setdefault("block_grace_s", self.B)
+        kw.setdefault("orphan_grace_s", self.O)
+        kw.setdefault("quiet_s", self.Q)
+        return fb.classify_session(*a, **kw)
+
+    def test_the_block_grace_decides_blocked_and_nothing_else_does(self):
+        # an unresolved tool_use, no --dangerously-skip-permissions
+        self.assertEqual(self._c(59, True, ["Read"], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(60, True, ["Read"], 0, False, self.W)[0], "blocked")
+        # not quiet_s (45) and not orphan_grace_s (30) — both already passed
+        self.assertEqual(self._c(46, True, ["Read"], 0, False, self.W)[0], "working")
+        # and not working_s: the control is the old collapsed number
+        self.assertEqual(fb.classify_session(60, True, ["Read"], 0, False,
+                                             self.W)[0], "working")
+
+    def test_a_running_bash_never_reaches_the_block_grace(self):
+        # the Bash tool wraps every command in a live child shell, so `shells`
+        # answers a RUNNING one an entire branch earlier. A Bash awaiting
+        # APPROVAL has no wrapper shell — that is the case block_grace_s is
+        # measured against, and the pair below is the whole asymmetry.
+        st, tool = self._c(3600, True, ["Bash"], 0, False, self.W, shells=1)
+        self.assertEqual(st, "working")
+        self.assertTrue(tool)
+        self.assertEqual(self._c(3600, True, ["Bash"], 0, False, self.W,
+                                 shells=0)[0], "blocked")
+
+    def test_the_orphan_grace_decides_ended_and_nothing_else_does(self):
+        self.assertEqual(self._c(29, False, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(30, False, [], 0, False, self.W)[0], "ended")
+        # the control: collapsed onto working_s it would still be WORKING here
+        self.assertEqual(fb.classify_session(30, False, [], 0, False,
+                                             self.W)[0], "working")
+
+    def test_the_orphan_grace_outranks_every_other_clock_for_a_dead_session(self):
+        # `alive` is False, so neither the block grace nor the quiet timer may
+        # speak — a session with no process is over, or not yet seen, and
+        # nothing else. Pending tools must not turn it into ■ BLOCKED.
+        self.assertEqual(self._c(3600, False, ["Read"], 0, False, self.W)[0], "ended")
+        self.assertEqual(self._c(3600, False, [], 3, False, self.W)[0], "ended")
+
+    def test_the_quiet_timer_still_owns_the_unexplained_silence_alone(self):
+        self.assertEqual(self._c(44, True, [], 0, False, self.W)[0], "working")
+        self.assertEqual(self._c(45, True, [], 0, False, self.W)[0], "waiting")
+
+
+class TestSettleIsAsymmetric(unittest.TestCase):
+    """Anti-flicker (ENGINE.md §6.3(a)). Escalation toward more attention is
+    published on the sweep that sees it; de-escalation must dwell. The rule can
+    only ever delay GOOD news, which is what makes it safe."""
+    D = 3.0
+
+    def test_first_sighting_publishes_at_once(self):
+        self.assertEqual(fb.settle(None, "waiting", 100.0, 0.0, self.D),
+                         ("waiting", 100.0))
+
+    def test_escalation_ignores_the_dwell_entirely(self):
+        # adopted a millisecond ago, and still the louder status goes out
+        for prev, nxt in (("waiting", "needs_input"), ("working", "blocked"),
+                          ("working", "limit"), ("ended", "working")):
+            self.assertEqual(fb.settle(prev, nxt, 100.001, 100.0, self.D),
+                             (nxt, 100.001), f"{prev} -> {nxt}")
+
+    def test_de_escalation_inside_the_dwell_holds_and_keeps_its_clock(self):
+        self.assertEqual(fb.settle("working", "waiting", 102.9, 100.0, self.D),
+                         ("working", 100.0))
+
+    def test_de_escalation_publishes_once_the_status_has_stood_long_enough(self):
+        self.assertEqual(fb.settle("working", "waiting", 103.0, 100.0, self.D),
+                         ("waiting", 103.0))
+
+    def test_an_unchanged_status_never_restamps_its_clock(self):
+        # ENGINE.md's sketch falls through to the final `return proposed, now`
+        # here, which re-stamps `since` on every sweep that agrees. Under the
+        # hot cadence (0.15 s) that turns the dwell into a 0-3 s sawtooth and
+        # the wait for a real de-escalation becomes a function of where in the
+        # cycle it lands. Nothing was adopted, so nothing moves.
+        self.assertEqual(fb.settle("working", "working", 1000.0, 100.0, self.D),
+                         ("working", 100.0))
+
+    def test_the_dwell_does_not_stack_on_top_of_the_quiet_timer(self):
+        # the number the user actually waits. A session WORKING since its last
+        # write crosses `quiet_s` with `now - since == quiet_s`, which is far
+        # past the dwell — so the board says YOUR TURN at 45 s, not 48.
+        st, _ = fb.settle("working", "waiting", 100.0 + 45, 100.0, self.D)
+        self.assertEqual(st, "waiting")
+
+    def test_a_status_the_table_does_not_rank_is_never_suppressed(self):
+        # a wholesale ps/lsof failure yields "unknown", which is not in LOUDER.
+        # Publish it at once; holding back a status we cannot reason about is
+        # the one thing worse than showing it.
+        self.assertEqual(fb.settle("working", "unknown", 100.001, 100.0, self.D),
+                         ("unknown", 100.001))
+        # …and leaving it is a de-escalation like any other
+        self.assertEqual(fb.settle("unknown", "waiting", 100.001, 100.0, self.D),
+                         ("unknown", 100.0))
+
+    def test_the_ranking_is_the_one_the_board_sorts_by(self):
+        self.assertEqual(fb.LOUDER, {"needs_input": 0, "limit": 1, "blocked": 2,
+                                     "working": 3, "waiting": 4, "ended": 5})
 
 
 class TestCloseoutStep(unittest.TestCase):
@@ -317,7 +577,12 @@ class TestPairSessionsWithProcs(unittest.TestCase):
     """Which terminal belongs to which chat, for a worktree running several."""
 
     def _s(self, sid, account, age):
-        return {"sid": sid, "account": account, "age_s": age}
+        # Freshest-first is the CONTRACT (see the function's docstring); the
+        # pairing itself never reads a clock, so what decides these tests is
+        # list order. The stamp is still spelled the way the wire spells it —
+        # `last_write_at`, absolute, bigger is NEWER — so the fixture stays
+        # consistent for a reader that one day does consult it.
+        return {"sid": sid, "account": account, "last_write_at": 10_000.0 - age}
 
     def _p(self, pid, account):
         return {"pid": pid, "account": account}
@@ -385,14 +650,14 @@ class TestModelHeadroom(ConfigGuard):
         self.assertIsNone(fb._model_remaining(acc("/h/.claude", ok=False), "opus"))
 
     def test_model_candidates_respects_reserve_and_exclude(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {"account3": 20}
-        fb._limits["data"] = {"available": True, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude", headroom=90, limits=[lim("Weekly", 10)]),          # main: excluded
             acc("/h/.claude-account3", headroom=15, limits=[lim("Weekly", 85)]),  # 15% < 20 reserve → not ok
             acc("/h/.claude-account4", headroom=50, limits=[lim("Weekly", 50)]),  # ok
-        ]}
+        ])
         cands = {c["label"]: c for c in fb.model_candidates("opus")}
         self.assertNotIn("main", cands)                 # excluded
         self.assertFalse(cands["account3"]["ok"])       # below reserve
@@ -401,11 +666,11 @@ class TestModelHeadroom(ConfigGuard):
         self.assertEqual(fb.model_candidates("opus")[0]["label"], "account4")
 
     def test_model_candidates_only_account_ignores_exclude(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "accounts": [
-            acc("/h/.claude", headroom=90, limits=[lim("Weekly", 10)])]}
+        fb._limits["data"] = limdata([
+            acc("/h/.claude", headroom=90, limits=[lim("Weekly", 10)])])
         cands = fb.model_candidates("opus", only_account="main")
         self.assertEqual(len(cands), 1)                 # explicit choice honored
         self.assertTrue(cands[0]["ok"])
@@ -415,14 +680,14 @@ class TestModelHeadroom(ConfigGuard):
 
 class TestLimitsByAccount(ConfigGuard):
     def test_reserve_blocked_and_available(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {"main": 20}
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude", headroom=15, limits=[lim("Weekly", 85)]),           # 15 < 20 → blocked
             acc("/h/.claude-account2", headroom=50, limits=[lim("Weekly", 50)]),  # available
             acc("/h/.claude-account5", headroom=0,
                 limits=[lim("Weekly", 100, exhausted=True, resets_in=3600)]),     # exhausted
-        ]}
+        ])
         out = fb.limits_by_account()
         self.assertTrue(out["main"]["reserve_blocked"])
         self.assertFalse(out["main"]["available"])
@@ -432,9 +697,9 @@ class TestLimitsByAccount(ConfigGuard):
         self.assertEqual(out["account5"]["worst"], "Weekly")
 
     def test_skips_not_ok_accounts(self):
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "accounts": [acc("/h/.claude", ok=False)]}
+        fb._limits["data"] = limdata([acc("/h/.claude", ok=False)])
         self.assertEqual(fb.limits_by_account(), {})
 
     def test_model_scoped_exhaustion_does_not_block_account(self):
@@ -443,14 +708,14 @@ class TestLimitsByAccount(ConfigGuard):
         account stays available for an Opus/Sonnet mission. Regression: the
         model-blind exhausted flag wrote account8 (41% left, only Fable gone)
         off wholesale, so the router reported it exhausted."""
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude-account8", headroom=41, limits=[
                 lim("Session", 0),
                 lim("Weekly", 59),
                 lim("Fable", 100, model_scoped=True, exhausted=True, resets_in=144748)]),
-        ]}
+        ])
         out = fb.limits_by_account()["account8"]
         self.assertFalse(out["exhausted"])       # Fable-only exhaustion ≠ account-wide
         self.assertTrue(out["available"])        # still pickable
@@ -462,13 +727,13 @@ class TestLimitsByAccount(ConfigGuard):
     def test_account_wide_exhaustion_still_blocks(self):
         """The umbrella Weekly (non-model-scoped) being gone DOES take the whole
         account out — every model shares that cap."""
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["reserve_percent"] = {}
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude-account5", headroom=0, limits=[
                 lim("Weekly", 100, exhausted=True, resets_in=3600),
                 lim("Fable", 84, model_scoped=True)]),
-        ]}
+        ])
         out = fb.limits_by_account()["account5"]
         self.assertTrue(out["exhausted"])
         self.assertFalse(out["available"])
@@ -480,7 +745,7 @@ class TestLimitsByAccount(ConfigGuard):
         Accounts that only lost Fable must stay available; only the
         umbrella-Weekly ones drop out — and an Opus mission routes to the
         most-headroom survivor rather than failing outright."""
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb.CFG["exclude_accounts"] = ["main"]
         fb.CFG["reserve_percent"] = {}
 
@@ -495,12 +760,12 @@ class TestLimitsByAccount(ConfigGuard):
                 lim("Weekly", 100, exhausted=True, resets_in=1),
                 lim("Fable", 84, model_scoped=True)])
 
-        fb._limits["data"] = {"available": True, "fetched_at": 1000, "accounts": [
+        fb._limits["data"] = limdata([
             weekly_gone("/h/.claude"),                  # main — excluded + umbrella gone
             fable_gone("/h/.claude-account8", 41, 59),
             fable_gone("/h/.claude-account4", 15, 85),
             weekly_gone("/h/.claude-account5"),
-        ]}
+        ])
         lba = fb.limits_by_account()
         avail = sorted(a for a, d in lba.items()
                        if d["available"] and a not in fb.CFG["exclude_accounts"])
@@ -512,6 +777,108 @@ class TestLimitsByAccount(ConfigGuard):
         self.assertTrue(best["ok"])
 
 
+# ------------------------------------------------ §3.4: nothing counts down
+
+class TestResetsAreAbsoluteAtTheBoundary(ConfigGuard):
+    """cclimits answers in `resets_in_seconds`: a countdown measured the moment
+    it ran. `cached_limits` then serves that same answer for LIMITS_TTL_S =
+    300s, so anything counting down from it is up to five minutes wrong and
+    nothing on the payload says so. ENGINE.md §3.4 — convert once, on the way
+    in, and let the client subtract from its own clock."""
+
+    RAW = {"accounts": [{"slug": "default", "config_dir": "/h/.claude", "ok": True,
+                         "headroom_percent": 40.0, "limits": [
+                             {"label": "Session", "exhausted_now": True,
+                              "resets_at": None, "resets_in_seconds": 3600},
+                             {"label": "Weekly", "exhausted_now": False,
+                              "resets_in_seconds": None}]}]}
+
+    def setUp(self):
+        super().setUp()
+        fb.config.DEMO = False
+        fb.CFG["cclimits_cmd"] = "/usr/bin/true"
+        fb.CFG["reserve_percent"] = {}
+        fb._limits["data"], fb._limits["t"] = None, 0.0
+        self._run = fb.shell.run
+        fb.shell.run = lambda *a, **k: (0, json.dumps(self.RAW))
+
+    def tearDown(self):
+        fb.shell.run = self._run
+        super().tearDown()
+
+    def test_the_countdown_becomes_an_absolute_instant(self):
+        data = fb.cached_limits(refresh=True)
+        session = data["accounts"][0]["limits"][0]
+        self.assertAlmostEqual(session["resets_at"], data["fetched_at"] + 3600, places=3)
+
+    def test_the_countdown_never_reaches_the_wire(self):
+        data = fb.cached_limits(refresh=True)
+        for l in data["accounts"][0]["limits"]:
+            self.assertNotIn("resets_in_seconds", l)
+
+    def test_no_countdown_means_no_reset_time_rather_than_a_wrong_one(self):
+        data = fb.cached_limits(refresh=True)
+        self.assertIsNone(data["accounts"][0]["limits"][1]["resets_at"])
+
+    def test_an_unparseable_upstream_resets_at_is_dropped_not_forwarded(self):
+        # cclimits' own `resets_at` is passthrough from a tool whose schema is
+        # not pinned here — usually null, and not guaranteed to be an epoch. A
+        # client doing arithmetic on an ISO string gets NaN, silently.
+        self.RAW = {"accounts": [{"slug": "default", "config_dir": "/h/.claude",
+                                  "ok": True, "headroom_percent": 40.0, "limits": [
+                                      {"label": "Weekly", "exhausted_now": True,
+                                       "resets_at": "2026-07-22T09:00:00Z"}]}]}
+        l = fb.cached_limits(refresh=True)["accounts"][0]["limits"][0]
+        self.assertIsNone(l["resets_at"])
+
+
+class TestNoCountdownOnTheWire(ConfigGuard):
+    """ENGINE.md §3.4 is a schema rule, so it gets a schema test: walk every
+    payload this server composes and fail on any field that is a duration
+    counted from the server's own `now`. Named fields rather than a heuristic —
+    a heuristic on the NAME would have to guess about `session_window_h`,
+    `sweep_ms` and `durationMs`, none of which are countdowns.
+
+    `age_s` joined the list when it came off the wire. It is the only entry
+    here that ever shipped, so it is the only one a regression could plausibly
+    re-add — which is exactly why it is named."""
+
+    BANNED = {"resets_in", "resets_in_seconds", "resets_in_s", "age_s"}
+
+    def _walk(self, obj, path="$"):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                self.assertNotIn(k, self.BANNED, f"{path}.{k} is a countdown")
+                self._walk(v, f"{path}.{k}")
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                self._walk(v, f"{path}[{i}]")
+
+    def test_api_limits_under_demo(self):
+        fb.config.DEMO = True
+        self._walk(fb.demo_limits())
+
+    def test_api_state_under_demo(self):
+        # reaches the hand-written `session.limit` in demo_state, which no
+        # other test composes and which drifts from the real one if unwatched
+        fb.config.DEMO = True
+        self._walk(fb.demo_state())
+
+    def test_the_account_summary_that_feeds_session_limit(self):
+        # observer copies these three keys straight onto `session.limit`; the
+        # countdown cannot come back here without the copy raising KeyError
+        fb.config.DEMO = False
+        fb.CFG["reserve_percent"] = {}
+        fb._limits["data"] = limdata([
+            acc("/h/.claude", headroom=0, limits=[
+                lim("Weekly", 100, exhausted=True, resets_in=3600),
+                lim("Fable", 100, model_scoped=True, exhausted=True, resets_in=99)])])
+        out = fb.limits_by_account()
+        self._walk(out)
+        self.assertEqual(out["main"]["resets_at"], FETCHED_AT + 3600)
+        self.assertEqual(out["main"]["scoped_exhausted"][0]["resets_at"], FETCHED_AT + 99)
+
+
 # ---------------------------------------------------------- reserve persist
 
 class TestSetReserve(ConfigGuard):
@@ -520,7 +887,7 @@ class TestSetReserve(ConfigGuard):
         self.tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump({"pattern": "confid", "reserve_percent": {}}, self.tmp)
         self.tmp.close()
-        fb.CONFIG_PATH = Path(self.tmp.name)
+        fb.config.CONFIG_PATH = Path(self.tmp.name)
         fb.CFG["reserve_percent"] = {}
         fb._limits["data"] = None
 
@@ -561,12 +928,12 @@ class TestDispatchLog(ConfigGuard):
                 "worktree": f"W{i}", "account": "account2",
                 "mission_original": f"do thing {i}"}) + "\n")
         self.tmp.close()
-        fb.DISPATCH_LOG = Path(self.tmp.name)
-        self._run = fb.run
-        fb.run = lambda *a, **k: (0, "mission-s2")   # only s2 is "live" in tmux
+        fb.dispatch.DISPATCH_LOG = Path(self.tmp.name)
+        self._run = fb.shell.run
+        fb.shell.run = lambda *a, **k: (0, "mission-s2")   # only s2 is "live" in tmux
 
     def tearDown(self):
-        fb.run = self._run
+        fb.shell.run = self._run
         Path(self.tmp.name).unlink(missing_ok=True)
         super().tearDown()
 
@@ -579,6 +946,52 @@ class TestDispatchLog(ConfigGuard):
     def test_limit(self):
         self.assertEqual(len(fb.read_dispatch_log(limit=2)["entries"]), 2)
 
+    def test_rows_written_before_the_epoch_existed_still_read(self):
+        # every line in this fixture predates `ts_epoch`; the reader must hand
+        # them over untouched so the board can fall back to the naive string
+        entries = fb.read_dispatch_log()["entries"]
+        self.assertNotIn("ts_epoch", entries[0])
+        self.assertEqual(entries[0]["ts"], "2026-07-19T02:00:00")
+
+
+class TestDispatchLogStamp(unittest.TestCase):
+    """`ts` is `%Y-%m-%dT%H:%M:%S` in the server's local zone with no offset
+    written on it. Readable when you `tail` the file on the box; silently hours
+    wrong on a phone reading it over the tailnet from another zone. The epoch
+    beside it is the one a client should format."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        self.tmp.close()
+        self._saved = fb.dispatch.DISPATCH_LOG
+        fb.dispatch.DISPATCH_LOG = Path(self.tmp.name)
+
+    def tearDown(self):
+        fb.dispatch.DISPATCH_LOG = self._saved
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_an_appended_row_carries_an_unambiguous_epoch(self):
+        import time as _t
+        before = _t.time()
+        fb.dispatch._append_log(session="s1", worktree="w")
+        after = _t.time()
+        row = json.loads(Path(self.tmp.name).read_text().splitlines()[-1])
+        self.assertTrue(before <= row["ts_epoch"] <= after)
+        self.assertEqual(row["session"], "s1")
+
+    def test_the_two_forms_describe_the_same_instant(self):
+        import time as _t
+        fb.dispatch._append_log(session="s1")
+        row = json.loads(Path(self.tmp.name).read_text().splitlines()[-1])
+        self.assertEqual(row["ts"], _t.strftime("%Y-%m-%dT%H:%M:%S",
+                                                _t.localtime(row["ts_epoch"])))
+
+    def test_the_log_has_exactly_one_writer(self):
+        # the stamp can only be forgotten at a call site that opens the file
+        # itself; there is meant to be no such call site left
+        src = (ROOT / "orchestra" / "dispatch.py").read_text()
+        self.assertEqual(src.count("open(DISPATCH_LOG"), 1)
+
 
 # ------------------------------------------------------ deterministic dispatch
 
@@ -586,7 +999,7 @@ class TestDispatchContract(ConfigGuard):
     """Routing is deterministic and model + effort are the caller's job."""
     def setUp(self):
         super().setUp()
-        fb.DEMO = True   # a refusal must come back before any thread launches
+        fb.config.DEMO = True   # a refusal must come back before any thread launches
 
     def test_missing_model_or_effort_is_refused_cleanly(self):
         for kw in ({}, {"model": "opus"}, {"effort": "high"}):
@@ -604,7 +1017,7 @@ class TestDispatchContract(ConfigGuard):
 # ------------------------------------------------------------ finish tiers
 
 class FakeGit:
-    """Stand-in for fb.run that answers the git calls start_finish makes."""
+    """Stand-in for fb.shell.run that answers the git calls start_finish makes."""
     def __init__(self, landed=True, porcelain="", branch="feat/x",
                  switch_rc=0, pull_rc=0):
         self.landed, self.porcelain, self.branch = landed, porcelain, branch
@@ -637,37 +1050,50 @@ class TestStartFinish(ConfigGuard):
 
     def setUp(self):
         super().setUp()
-        fb.DEMO = False
+        fb.config.DEMO = False
         fb._closeouts.clear()
-        self._saved = {n: getattr(fb, n) for n in
-                       ("run", "discover_worktrees", "claude_processes",
-                        "send_to_process", "_base_ref", "start_dispatch",
-                        "scan_sessions")}
-        fb.discover_worktrees = lambda: [
+        self._saved = {n: getattr(fb.shell, n) for n in ("run",)}
+        self._saved_dispatch = fb.dispatch.start_dispatch
+        self._saved_git = {n: getattr(fb.gitrepo, n) for n in
+                           ("discover_worktrees", "_base_ref")}
+        self._saved_procs = fb.procs.claude_processes
+        self._saved_scan = fb.transcripts.scan_sessions
+        self._saved_send = fb.terminal.send_to_process
+        fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
-        fb._base_ref = lambda root: "origin/main"
-        fb.claude_processes = lambda: []
-        self.sent = []
-        fb.send_to_process = lambda pid, text: (
-            self.sent.append(text) or {"ok": True})
+        fb.gitrepo._base_ref = lambda root: "origin/main"
+        fb.procs.claude_processes = lambda **_: []
+        self.sent, self.addressed = [], []
+        # `**ident` because every actuator call is identity-addressed now
+        # (ADR 0008) — a stub with the old two-arg shape would make finish
+        # look broken rather than the send look unaddressed.
+        fb.terminal.send_to_process = lambda pid, text, **ident: (
+            self.sent.append(text) or self.addressed.append(ident) or {"ok": True})
         self.dispatched = []
-        fb.start_dispatch = lambda brief, **kw: (
+        fb.dispatch.start_dispatch = lambda brief, **kw: (
             self.dispatched.append((brief, kw)) or {"ok": True, "job": "j1"})
 
     def tearDown(self):
+        fb._closeouts.clear()   # nothing reaps these for us any more
         for n, f in self._saved.items():
-            setattr(fb, n, f)
+            setattr(fb.shell, n, f)
+        fb.dispatch.start_dispatch = self._saved_dispatch
+        for n, f in self._saved_git.items():
+            setattr(fb.gitrepo, n, f)
+        fb.procs.claude_processes = self._saved_procs
+        fb.transcripts.scan_sessions = self._saved_scan
+        fb.terminal.send_to_process = self._saved_send
         super().tearDown()
 
     def live(self):
         # a realistic proc: real claude_processes() always carries "cmd", which
         # scan_sessions reads when start_finish classifies the live session
-        fb.claude_processes = lambda: [
+        fb.procs.claude_processes = lambda **_: [
             {"pid": 1, "cwd": "/w/wt", "tmux_target": "s:0",
              "cmd": "claude --dangerously-skip-permissions"}]
 
     def finish(self, **git):
-        fb.run = self.git = FakeGit(**git)
+        fb.shell.run = self.git = FakeGit(**git)
         return fb.start_finish("wt")
 
     # -- live terminal ------------------------------------------------------
@@ -689,6 +1115,23 @@ class TestStartFinish(ConfigGuard):
         out = self.finish(landed=False)
         self.assertEqual(out["mode"], "brief")
         self.assertIn("merge-base --is-ancestor", self.sent[0])
+
+    def test_every_brief_is_addressed_by_worktree_not_by_pid(self):
+        # ADR 0008. Between the scan that found this pid and the keystroke sit
+        # a git fetch, a merge-base and a status — seconds in which the pid can
+        # become somebody else's. The worktree and the pane travel with it so
+        # the send re-resolves rather than trusting the number.
+        self.live()
+        for git in ({"landed": True},                        # /exit
+                    {"landed": True, "porcelain": "?? s\n"},  # slim brief
+                    {"landed": False}):                       # full brief
+            with self.subTest(**git):
+                fb._closeouts.clear()      # each run is a first press
+                self.addressed.clear()
+                self.finish(**git)
+                self.assertEqual(len(self.addressed), 1)
+                self.assertEqual(self.addressed[0]["worktree"], "wt")
+                self.assertEqual(self.addressed[0]["tmux"], "s:0")
 
     # -- two-step: brief sent, then ✕ close ---------------------------------
     def test_brief_send_marks_the_card_for_step_two(self):
@@ -722,7 +1165,7 @@ class TestStartFinish(ConfigGuard):
         # instead of refusing forever
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
         self.finish(landed=True, porcelain=" M keep.py\n")   # arms _closeouts
         fb._closeouts["wt"] = _t.time() - 120                 # briefed 2m ago
@@ -737,7 +1180,7 @@ class TestStartFinish(ConfigGuard):
     def test_nudge_lists_porcelain_and_truncates_past_five(self):
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
         porc = "".join(f"?? f{i}.tmp\n" for i in range(7))
         self.finish(landed=True, porcelain=porc)
@@ -754,7 +1197,7 @@ class TestStartFinish(ConfigGuard):
         # a nudge would collide with the open question dialog — refuse to chat
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "needs_input"}]}
         self.finish(landed=False)
         fb._closeouts["wt"] = _t.time() - 120                 # past the guard
@@ -765,11 +1208,28 @@ class TestStartFinish(ConfigGuard):
         self.assertEqual(out["left"], "branch not landed on origin/main")
         self.assertEqual(len(self.sent), 1)                   # no nudge typed
 
+    def test_the_refusal_states_no_elapsed_time_only_the_instant(self):
+        # it used to end "…went to the agent 4m ago", computed here and then
+        # read off a toast — or a card reloaded much later — long after it
+        # stopped being true. ENGINE.md §3.4: ship `sent`, an absolute epoch,
+        # and let the board subtract from its own clock.
+        import re as _re
+        import time as _t
+        self.live()
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
+            "/w/wt": [{"sid": "s1", "pid": 1, "status": "working"}]}
+        self.finish(landed=False)
+        fb._closeouts["wt"] = _t.time() - 600          # briefed 10 minutes ago
+        out = self.finish(landed=False)
+        self.assertEqual(out["mode"], "pending")
+        self.assertIsNone(_re.search(r"\d+m ago|under a minute ago", out["message"]))
+        self.assertAlmostEqual(out["sent"], fb._closeouts["wt"], places=3)
+
     def test_working_session_refuses_close_even_past_the_guard(self):
         # the agent may be mid-closeout — refuse regardless of the clock
         import time as _t
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "working"}]}
         self.finish(landed=False)
         fb._closeouts["wt"] = _t.time() - 120
@@ -780,7 +1240,7 @@ class TestStartFinish(ConfigGuard):
     def test_pending_refusal_carries_structured_fields(self):
         # under the 60s guard: refuse, but the frontend gets left/files/sent
         self.live()
-        fb.scan_sessions = lambda wts, procs, now: {
+        fb.transcripts.scan_sessions = lambda wts, procs, now: {
             "/w/wt": [{"sid": "s1", "pid": 1, "status": "waiting"}]}
         self.finish(landed=True, porcelain=" M a.py\n?? b\n")  # sent = now
         out = self.finish(landed=True, porcelain=" M a.py\n?? b\n")
@@ -803,10 +1263,21 @@ class TestStartFinish(ConfigGuard):
         # finish drops to the normal no-terminal tiers, not a stale "pending"
         self.live()
         self.finish(landed=False)
-        fb.claude_processes = lambda: []
+        fb.procs.claude_processes = lambda **_: []
         out = self.finish(landed=False)
         self.assertEqual(out["mode"], "dispatch")
         self.assertNotIn("wt", fb._closeouts)
+
+    def test_a_press_prunes_the_stale_flags_the_observer_no_longer_reaps(self):
+        # collect_state used to drop these as a side effect of being looked at.
+        # Under a perpetual sweep that is a write nobody asked for, so reaping
+        # moved here — to the mutation path that owns the map.
+        import time as _t
+        fb._closeouts["other-wt"] = _t.time() - 10 * fb.CLOSEOUT_TTL_S
+        fb._closeouts["fresh-wt"] = _t.time()
+        self.finish(landed=True, branch="feat/x")
+        self.assertNotIn("other-wt", fb._closeouts)
+        self.assertIn("fresh-wt", fb._closeouts)
 
     # -- no terminal, landed ------------------------------------------------
     def test_landed_clean_on_feature_branch_parks_without_agent(self):
@@ -815,6 +1286,22 @@ class TestStartFinish(ConfigGuard):
         self.assertTrue(self.git.ran("switch"))
         self.assertTrue(self.git.ran("pull"))
         self.assertEqual(self.dispatched, [])   # no agent, no account usage
+
+    def test_parking_on_the_trunk_pulls_git_forward(self):
+        """The one mutation the board performs on git itself (switch + pull).
+        It knows the branch changed, so it must say so — otherwise the card
+        keeps serving the old branch until git's own clock comes round."""
+        saved, saved_t = fb.observer._observer, fb._cache["t"]
+        o = fb.Observer(git_s=600.0)
+        o._git._forced = False                   # as if git had just been probed
+        fb.observer._observer = o
+        try:
+            out = self.finish(landed=True, branch="feat/x")
+        finally:
+            fb.observer._observer, fb._cache["t"] = saved, saved_t
+        self.assertEqual(out["mode"], "parked")
+        self.assertEqual(o.stats()["nudges"], 1)
+        self.assertTrue(o._git._forced)          # the next sweep re-probes git
 
     def test_landed_untracked_scratch_goes_to_the_slim_agent(self):
         # cleaning is a judgment call — an agent decides what's droppable
@@ -901,23 +1388,264 @@ class TestCloseoutShell(unittest.TestCase):
         self.assertNotIn("--model", resume[0])
 
 
+# ------------------------------------------------- identity-addressed mutations
+
+class IdentityGuard(ConfigGuard):
+    """A fake fleet for the actuator: two worktrees, two agents, one shell.
+
+    The bug under test cannot be reproduced honestly — a real pid recycle is not
+    something a test can make the kernel do. What CAN be reproduced exactly is
+    its observable signature: the process table hands the same pid number back,
+    and the session that number used to serve is now served by somebody else (or
+    by nobody). `recycle()` does precisely that and nothing more.
+
+    Everything is patched at the module the actuator imports (ADR 0010), so the
+    resolver runs for real end to end — `identity.resolve` -> `gitrepo`,
+    `procs`, `transcripts` — and only the world underneath is fake. `shell.run`
+    is the ground truth for "was a keystroke delivered": if a refusal ever
+    leaked past, `self.typed` would be non-empty.
+    """
+
+    WTS = [{"name": "alpha", "path": "/w/alpha", "git": "/w/alpha"},
+           {"name": "beta", "path": "/w/beta", "git": "/w/beta"}]
+
+    def setUp(self):
+        super().setUp()
+        fb.config.DEMO = False
+        self._saved = {"run": fb.shell.run,
+                       "procs": fb.procs.claude_processes,
+                       "wts": fb.gitrepo.discover_worktrees,
+                       "scan": fb.transcripts.scan_sessions}
+        self.typed = []
+        fb.shell.run = lambda cmd, **kw: (self.typed.append(cmd), (0, "true"))[1]
+        fb.gitrepo.discover_worktrees = lambda: list(self.WTS)
+        # the world before the recycle: pid 4242 is alpha's agent, serving
+        # session s-alpha; pid 7777 is beta's, serving s-beta.
+        self.procs = {4242: "/w/alpha", 7777: "/w/beta"}
+        self.owners = {"s-alpha": 4242, "s-beta": 7777}
+        fb.procs.claude_processes = lambda **kw: [
+            {"pid": pid, "cwd": cwd, "cpu": 0.0, "etime": "1:00", "cmd": "claude",
+             "tty": f"ttys{pid % 1000:03d}", "host": "Terminal",
+             "host_kind": "app", "shells": 0, "account": "main",
+             "tmux_sock": None, "tmux_target": f"sess:0.{pid % 10}"}
+            for pid, cwd in sorted(self.procs.items())]
+        fb.transcripts.scan_sessions = lambda wts, live, now, cold=False: {
+            w["path"]: [{"sid": sid, "account": "main",
+                         "pid": self.owners.get(sid), "cwd": w["path"]}
+                        for sid, wt in (("s-alpha", "alpha"), ("s-beta", "beta"))
+                        if wt == w["name"] and sid in self.owners]
+            for w in wts}
+
+    def tearDown(self):
+        fb.shell.run = self._saved["run"]
+        fb.procs.claude_processes = self._saved["procs"]
+        fb.gitrepo.discover_worktrees = self._saved["wts"]
+        fb.transcripts.scan_sessions = self._saved["scan"]
+        super().tearDown()
+
+    def recycle(self):
+        """alpha's agent exited; the kernel handed 4242 to a beta agent.
+
+        The pid number is unchanged — that is the whole point — but it now runs
+        in a different worktree and serves a different conversation, and the
+        session that used to own it owns nothing.
+        """
+        self.procs = {4242: "/w/beta", 7777: "/w/beta"}
+        self.owners = {"s-beta": 7777}
+
+
+class TestSendIsIdentityAddressed(IdentityGuard):
+    """ADR 0008: /api/send names a session, never a pid slot."""
+
+    def test_the_happy_path_still_types(self):
+        res = fb.send_to_process(4242, "hello", sid="s-alpha", account="main",
+                                 worktree="alpha")
+        self.assertTrue(res["ok"], res)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.2", "-l", "--", "hello"],
+                      self.typed)
+
+    def test_a_recycled_pid_is_refused_not_delivered(self):
+        # THE BUG. The drawer captured 4242 for s-alpha; by the time the user
+        # hits send, 4242 is a different agent in a different worktree.
+        self.recycle()
+        res = fb.send_to_process(4242, "rm -rf the wrong thing",
+                                 sid="s-alpha", account="main", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertIn("gone", res["message"])
+        self.assertEqual(self.typed, [])       # nobody was typed at
+
+    def test_a_pid_reassigned_within_the_session_is_refused(self):
+        # the harder half: 4242 still runs in alpha, but s-alpha is served by a
+        # different process now. Worktree containment alone would pass this.
+        self.procs = {4242: "/w/alpha", 9999: "/w/alpha"}
+        self.owners = {"s-alpha": 9999}
+        res = fb.send_to_process(4242, "hi", sid="s-alpha", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertIn("9999", res["message"])   # says who it is now
+        self.assertEqual(self.typed, [])
+
+    def test_no_pid_hint_resolves_the_session_to_its_current_process(self):
+        # the sid is the address; with no hint to contradict, the send follows
+        # the session to whatever process serves it now
+        self.procs = {9999: "/w/alpha"}
+        self.owners = {"s-alpha": 9999}
+        res = fb.send_to_process(None, "hi", sid="s-alpha")
+        self.assertTrue(res["ok"], res)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.9", "-l", "--", "hi"], self.typed)
+
+    def test_a_vanished_session_is_refused(self):
+        self.owners = {}
+        res = fb.send_to_process(4242, "hi", sid="s-alpha", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_session_with_no_terminal_says_so(self):
+        # ADR 0008 asks for an error the client can SURFACE, not merely one it
+        # can count: "this conversation has no terminal any more" and "it had
+        # one and lost it mid-request" are different things to tell a user, and
+        # asserting only on the code cannot tell them apart — verified by
+        # mutation, where deleting this branch left the test green.
+        self.owners = {"s-alpha": None, "s-beta": 7777}
+        res = fb.send_to_process(None, "hi", sid="s-alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertIn("no live terminal", res["message"])
+        self.assertEqual(self.typed, [])
+
+    def test_a_bare_pid_is_refused_rather_than_guessed(self):
+        # the legacy wire form is still callable and no longer guesses
+        res = fb.send_to_process(4242, "hi")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.UNADDRESSED)
+        self.assertEqual(self.typed, [])
+
+    def test_a_place_addressed_send_refuses_a_pid_that_left(self):
+        # the drawer's other-terminal picker: addressed by worktree, and the
+        # recycled pid is in beta now
+        self.recycle()
+        res = fb.send_to_process(4242, "hi", worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_place_addressed_send_types_when_the_pid_stayed(self):
+        res = fb.send_to_process(7777, "hi", worktree="beta")
+        self.assertTrue(res["ok"], res)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.7", "-l", "--", "hi"], self.typed)
+
+    def test_a_stale_tmux_pane_is_refused(self):
+        # the corroborator: same pid, same worktree, different pane
+        res = fb.send_to_process(7777, "hi", worktree="beta", tmux="sess:0.4")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_stale_tty_is_refused(self):
+        res = fb.send_to_process(7777, "hi", worktree="beta", tty="ttys001")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_a_dead_worktree_is_refused(self):
+        fb.gitrepo.discover_worktrees = lambda: []
+        res = fb.send_to_process(7777, "hi", worktree="beta")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+        self.assertEqual(self.typed, [])
+
+    def test_an_empty_message_never_costs_a_resolve(self):
+        # ordering: normalise, refuse empty, THEN resolve — an empty send must
+        # not shell out to ps, and must not report itself as a stale identity
+        called = []
+        saved = fb.procs.claude_processes
+        fb.procs.claude_processes = lambda **kw: called.append(1) or []
+        try:
+            res = fb.send_to_process(4242, "   \n  ", sid="s-alpha")
+        finally:
+            fb.procs.claude_processes = saved
+        self.assertEqual(res["message"], "empty message")
+        self.assertEqual(called, [])
+
+
+class TestFocusIsIdentityAddressed(IdentityGuard):
+    """Focus types nothing, but it is addressed the same way — an exception
+    is a rule somebody will copy."""
+
+    def test_focus_follows_the_worktree(self):
+        res = fb.focus_process(7777, worktree="beta")
+        self.assertTrue(res["ok"], res)
+
+    def test_focus_refuses_a_recycled_pid(self):
+        self.recycle()
+        res = fb.focus_process(4242, worktree="alpha")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.GONE)
+
+    def test_focus_refuses_a_bare_pid(self):
+        res = fb.focus_process(4242)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], fb.UNADDRESSED)
+
+    def test_a_loose_process_is_addressed_by_its_cwd(self):
+        # the "other processes" strip has no worktree to name — the cwd the
+        # board displayed is its durable address
+        self.assertTrue(fb.focus_process(7777, cwd="/w/beta")["ok"])
+        gone = fb.focus_process(7777, cwd="/w/alpha")
+        self.assertFalse(gone["ok"])
+        self.assertEqual(gone["error"], fb.GONE)
+
+
+class TestResolveContract(IdentityGuard):
+    """The resolver's own surface, for the callers that are not `terminal`."""
+
+    def test_an_account_that_moved_is_refused(self):
+        res = fb.identity.resolve(4242, sid="s-alpha", account="work")
+        self.assertIsNone(res[0])
+        self.assertEqual(res[1]["error"], fb.GONE)
+
+    def test_a_sid_in_another_worktree_is_refused(self):
+        res = fb.identity.resolve(4242, sid="s-alpha", worktree="beta")
+        self.assertIsNone(res[0])
+        self.assertEqual(res[1]["error"], fb.GONE)
+
+    def test_a_place_with_no_pid_is_unaddressed(self):
+        res = fb.identity.resolve(None, worktree="alpha")
+        self.assertIsNone(res[0])
+        self.assertEqual(res[1]["error"], fb.UNADDRESSED)
+
+    def test_resolving_by_sid_reads_the_process_table_now(self):
+        # never the observer snapshot: `Snapshot` is advisory and one sweep is
+        # long enough for a pid to die and come back as somebody else
+        reads = []
+        saved = fb.procs.claude_processes
+        fb.procs.claude_processes = lambda **kw: reads.append(1) or saved(**kw)
+        try:
+            fb.identity.resolve(4242, sid="s-alpha")
+        finally:
+            fb.procs.claude_processes = saved
+        self.assertEqual(len(reads), 1)
+
+
 # --------------------------------------------------------- scheduled resumes
 
 class ResumeGuard(ConfigGuard):
     """Isolate the auto-resume registry and its on-disk state file."""
     def setUp(self):
         super().setUp()
-        fb.DEMO = False
+        fb.config.DEMO = False
         self.tmpdir = tempfile.mkdtemp(prefix="fb-resume-")
-        self._state_path = fb.RESUME_STATE
-        fb.RESUME_STATE = Path(self.tmpdir) / "resume.schedule.json"
+        self._state_path = fb.resume.RESUME_STATE
+        fb.resume.RESUME_STATE = Path(self.tmpdir) / "resume.schedule.json"
         self._resumes = dict(fb._resumes)
         fb._resumes.clear()
 
     def tearDown(self):
         fb._resumes.clear()
         fb._resumes.update(self._resumes)
-        fb.RESUME_STATE = self._state_path
+        fb.resume.RESUME_STATE = self._state_path
         import shutil as _sh
         _sh.rmtree(self.tmpdir, ignore_errors=True)
         super().tearDown()
@@ -932,7 +1660,7 @@ class TestScheduleResume(ResumeGuard):
         self.assertAlmostEqual(out["due_at"], reset + 60, delta=1)
         r = fb._resumes["wt|s1"]
         self.assertEqual(r["status"], "pending")
-        self.assertTrue(fb.RESUME_STATE.exists())     # persisted at once
+        self.assertTrue(fb.resume.RESUME_STATE.exists())     # persisted at once
 
     def test_custom_delay_and_exact_time(self):
         import time as _t
@@ -970,15 +1698,15 @@ class TestScheduleResume(ResumeGuard):
         # client sent no resets_at, but the limits cache knows the account
         import time as _t
         now = _t.time()
-        fb._limits["data"] = {"available": True, "fetched_at": now, "accounts": [
+        fb._limits["data"] = limdata([
             acc("/h/.claude-account2", headroom=0,
-                limits=[lim("Session", 100, exhausted=True, resets_in=3600)])]}
+                limits=[lim("Session", 100, exhausted=True, resets_in=3600)])], now)
         out = fb.schedule_resume("wt", "s1", "account2")
         self.assertTrue(out["ok"])
         self.assertAlmostEqual(out["due_at"], now + 3600 + 60, delta=2)
 
     def test_demo_refuses(self):
-        fb.DEMO = True
+        fb.config.DEMO = True
         self.assertFalse(fb.schedule_resume("wt", "s1", "a")["ok"])
 
     def test_cancel(self):
@@ -1004,17 +1732,16 @@ class TestLimitActiveUntil(ResumeGuard):
 
     def setUp(self):
         super().setUp()
-        self._cl = fb.cached_limits
-        fb.cached_limits = lambda refresh=False: fb._limits["data"]
+        self._cl = fb.limits.cached_limits
+        fb.limits.cached_limits = lambda refresh=False: fb._limits["data"]
 
     def tearDown(self):
-        fb.cached_limits = self._cl
+        fb.limits.cached_limits = self._cl
         super().tearDown()
 
     def _data(self, limits, fetched):
-        fb._limits["data"] = {"available": True, "fetched_at": fetched,
-                              "accounts": [acc("/h/.claude-account2",
-                                               headroom=0, limits=limits)]}
+        fb._limits["data"] = limdata([acc("/h/.claude-account2", headroom=0,
+                                      limits=limits)], fetched)
 
     def test_account_wide_block_returns_future_reset(self):
         import time as _t
@@ -1063,49 +1790,94 @@ class TestFireResume(ResumeGuard):
 
     def setUp(self):
         super().setUp()
-        self._saved = {n: getattr(fb, n) for n in
-                       ("cached_state", "send_to_process", "_tmux_resume",
-                        "_limit_active_until", "discover_worktrees",
-                        "claude_homes")}
-        fb.discover_worktrees = lambda: [
+        self._saved = {n: getattr(fb.resume, n) for n in ("_tmux_resume",)}
+        self._saved_state = fb.observer.cached_state
+        self._saved_git = {"discover_worktrees": fb.gitrepo.discover_worktrees}
+        self._saved_homes = fb.transcripts.claude_homes
+        self._saved_lau = fb.limits._limit_active_until
+        self._saved_send = fb.terminal.send_to_process
+        fb.gitrepo.discover_worktrees = lambda: [
             {"name": "wt", "path": "/w/wt", "git": "/w/wt"}]
-        fb.claude_homes = lambda: [Path("/h/.claude-account2")]
-        fb._limit_active_until = lambda account, model, now: None
-        self.sent, self.tmuxed = [], []
-        fb.send_to_process = lambda pid, text: (
-            self.sent.append((pid, text)) or {"ok": True, "message": "sent via tmux"})
-        fb._tmux_resume = lambda wt, cwd, home, sid: (
+        fb.transcripts.claude_homes = lambda: [Path("/h/.claude-account2")]
+        fb.limits._limit_active_until = lambda account, model, now: None
+        self.sent, self.tmuxed, self.addressed = [], [], []
+        fb.terminal.send_to_process = lambda pid, text, **ident: (
+            self.sent.append((pid, text)) or self.addressed.append(ident)
+            or {"ok": True, "message": "sent via tmux"})
+        fb.resume._tmux_resume = lambda wt, cwd, home, sid: (
             self.tmuxed.append((wt, cwd, str(home), sid))
             or {"ok": True, "message": "resumed in tmux"})
 
     def tearDown(self):
         for n, f in self._saved.items():
-            setattr(fb, n, f)
+            setattr(fb.resume, n, f)
+        for n, f in self._saved_git.items():
+            setattr(fb.gitrepo, n, f)
+        fb.observer.cached_state = self._saved_state
+        fb.transcripts.claude_homes = self._saved_homes
+        fb.limits._limit_active_until = self._saved_lau
+        fb.terminal.send_to_process = self._saved_send
         super().tearDown()
 
     def board(self, status="limit", pid=None, reachable=True, handed=None,
-              present=True, loose_pid=None):
+              present=True, loose_pid=None, wrote_ago_s=7200):
+        # The board carries `last_write_at`, an ABSOLUTE stamp — `age_s` is off
+        # the wire — so the fixture takes an age and turns it into one here.
+        # It defaults to "wrote two hours ago", what a limit-hit session looks
+        # like; tests that mean "the agent moved on" pass a small age.
+        import time as _t
         sess = {"sid": "s1", "status": status, "pid": pid, "cwd": "/w/wt/sub",
-                "handed_to": handed}
+                "handed_to": handed, "last_write_at": _t.time() - wrote_ago_s}
         procs = [{"pid": pid, "reachable": reachable}] if pid else []
         if loose_pid:   # someone ELSE's live terminal in the same worktree
             procs.append({"pid": loose_pid, "reachable": True})
-        fb.cached_state = lambda: {"worktrees": [
+        fb.observer.cached_state = lambda: {"worktrees": [
             {"name": "wt", "sessions": [sess] if present else [],
              "live_procs": procs}]}
 
-    def arm(self):
+    def arm(self, armed_ago_s=3600):
+        """Arm as it really happens: hours before the reset, not microseconds.
+        Backdating created_at is what makes 'has it written since we armed?'
+        a meaningful question at all."""
         import time as _t
         fb.schedule_resume("wt", "s1", "account2", model="opus-4-8",
                            resets_at=_t.time() - 100)
+        fb._resumes["wt|s1"]["created_at"] = _t.time() - armed_ago_s
         return "wt|s1"
 
     def test_already_resumed_session_is_left_alone(self):
-        self.board(status="working", pid=9)
+        self.board(status="working", pid=9, wrote_ago_s=5)
         fb.fire_resume(self.arm())
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
         self.assertEqual(self.sent, [])
         self.assertEqual(self.tmuxed, [])
+
+    def test_cold_limits_cache_does_not_cancel_the_resume(self):
+        """3am, no browser has hit /api/limits, so the limit join never ran and
+        the parked session reads 'waiting' instead of 'limit'. The old guard
+        (status != "limit" -> done) cancelled the very resume it was armed for."""
+        self.board(status="waiting", pid=42, wrote_ago_s=7200)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.sent, [(42, "continue")])
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+
+    def test_session_that_wrote_since_arming_is_left_alone(self):
+        """Movement is proven by a write after we armed — not by the status
+        string, which the cold cache makes unreliable."""
+        self.board(status="waiting", pid=42, wrote_ago_s=1)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
+
+    def test_mid_turn_agent_is_never_interrupted(self):
+        """'continue' typed at a working agent is an injected instruction."""
+        for st in ("working", "blocked", "needs_input"):
+            with self.subTest(status=st):
+                fb._resumes.clear()
+                self.sent.clear()
+                self.board(status=st, pid=42, wrote_ago_s=7200)
+                fb.fire_resume(self.arm())
+                self.assertEqual(self.sent, [])
 
     def test_handed_off_session_is_left_alone(self):
         self.board(handed="account5")
@@ -1118,7 +1890,7 @@ class TestFireResume(ResumeGuard):
         import time as _t
         self.board()
         until = _t.time() + 5000
-        fb._limit_active_until = lambda account, model, now: until
+        fb.limits._limit_active_until = lambda account, model, now: until
         key = self.arm()
         fb.fire_resume(key)
         r = fb._resumes[key]
@@ -1130,7 +1902,7 @@ class TestFireResume(ResumeGuard):
     def test_rearm_gives_up_after_max_attempts(self):
         import time as _t
         self.board()
-        fb._limit_active_until = lambda account, model, now: _t.time() + 5000
+        fb.limits._limit_active_until = lambda account, model, now: _t.time() + 5000
         key = self.arm()
         fb._resumes[key]["attempts"] = fb.RESUME_MAX_ATTEMPTS - 1
         fb.fire_resume(key)
@@ -1142,6 +1914,28 @@ class TestFireResume(ResumeGuard):
         self.assertEqual(self.sent, [(42, "continue")])
         self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
         self.assertEqual(self.tmuxed, [])
+
+    def test_the_unattended_send_is_addressed_by_sid_not_by_snapshot_pid(self):
+        # `proc` here came out of observer.cached_state() — advisory, up to a
+        # sweep old, and older still once the limit check has run. ADR 0008
+        # says the pid is a hint: the sid, the account and the worktree the
+        # schedule was armed for are the address, and the pane/tty the
+        # snapshot saw ride along so a recycled pid has to reproduce them too.
+        self.board(pid=42)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.addressed, [{"sid": "s1", "account": "account2",
+                                           "worktree": "wt", "tmux": None,
+                                           "tty": None}])
+
+    def test_a_refused_send_falls_through_to_the_sid_exact_tmux_path(self):
+        # the identity no longer resolves — the resume must NOT be abandoned
+        # and must NOT be retargeted; it reopens the sid itself
+        fb.terminal.send_to_process = lambda pid, text, **ident: {
+            "ok": False, "error": fb.GONE, "message": "that agent is gone"}
+        self.board(pid=42)
+        fb.fire_resume(self.arm())
+        self.assertEqual(self.tmuxed[0][3], "s1")
+        self.assertEqual(fb._resumes["wt|s1"]["status"], "done")
 
     def test_never_borrows_another_sessions_terminal(self):
         # unlike the manual button, the unattended path must not type
@@ -1167,7 +1961,7 @@ class TestFireResume(ResumeGuard):
         self.assertIn("stale view", fb._resumes["wt|s1"]["message"])
 
     def test_failed_send_falls_back_to_tmux_resume(self):
-        fb.send_to_process = lambda pid, text: {"ok": False, "message": "no automation"}
+        fb.terminal.send_to_process = lambda pid, text, **ident: {"ok": False, "message": "no automation"}
         self.board(pid=42)
         fb.fire_resume(self.arm())
         self.assertEqual(len(self.tmuxed), 1)
@@ -1181,7 +1975,7 @@ class TestFireResume(ResumeGuard):
         self.assertEqual(self.tmuxed[0][1], "/w/wt")   # falls back to the worktree path
 
     def test_tmux_failure_is_reported_not_swallowed(self):
-        fb._tmux_resume = lambda *a: {"ok": False, "message": "tmux failed"}
+        fb.resume._tmux_resume = lambda *a: {"ok": False, "message": "tmux failed"}
         self.board()
         fb.fire_resume(self.arm())
         self.assertEqual(fb._resumes["wt|s1"]["status"], "failed")
@@ -1199,7 +1993,7 @@ class TestDeliverText(unittest.TestCase):
     """Enter is pressed until the send is proven, then stops."""
 
     def setUp(self):
-        self._run, self._sleep = fb.run, fb.time.sleep
+        self._run, self._sleep = fb.shell.run, fb.time.sleep
         fb.time.sleep = lambda s: None
         self.calls = []
         self.panes = ["❯ [Pasted text #1] still in the composer", "❯ \n"]
@@ -1209,10 +2003,10 @@ class TestDeliverText(unittest.TestCase):
             if "capture-pane" in cmd:
                 return 0, self.panes.pop(0)
             return 0, ""
-        fb.run = fake_run
+        fb.shell.run = fake_run
 
     def tearDown(self):
-        fb.run, fb.time.sleep = self._run, self._sleep
+        fb.shell.run, fb.time.sleep = self._run, self._sleep
 
     def test_enters_until_sent(self):
         self.assertTrue(fb.deliver_text("sess", "continue"))
@@ -1252,6 +2046,41 @@ class TestComposerIdle(unittest.TestCase):
         self.assertFalse(fb.composer_idle(""))
 
 
+class TestMachineTextFilter(unittest.TestCase):
+    """Every string here was observed in the user's real transcript corpus:
+    27 of 654 sessions were quoting the harness back as '→ the last thing you
+    told it'."""
+
+    MACHINE = [
+        "This session is being continued from a previous conversation that ran "
+        "out of context. The summary below covers the earlier portion",
+        '<teammate-message teammate_id="team-lead" summary="Please send your '
+        'L2-8 audit report"> Your idle notification arrived',
+        "<64;58;44M58;44M/exit",
+        "<system-reminder>noise</system-reminder>",
+        "<local-command-stdout>output</local-command-stdout>",
+    ]
+
+    REAL = [
+        # contains "summarize" but is unmistakably a person asking
+        "Okay, can you summarize what we did here in this entire session? I "
+        "think it went on far beyond what we had originally intended",
+        "fix the flaky test in tests/test_integration.py",
+        "why is the board showing WORKING when the agent stopped?",
+        "continue",
+    ]
+
+    def test_machine_text_is_filtered(self):
+        for s in self.MACHINE:
+            with self.subTest(text=s[:48]):
+                self.assertIsNone(fb._real_prompt(s))
+
+    def test_real_prompts_survive(self):
+        for s in self.REAL:
+            with self.subTest(text=s[:48]):
+                self.assertIsNotNone(fb._real_prompt(s))
+
+
 class TestProvenInTranscript(unittest.TestCase):
     """The only accepted receipt for a resume send: the session file itself."""
 
@@ -1282,6 +2111,47 @@ class TestProvenInTranscript(unittest.TestCase):
         self.assertFalse(fb._proven_in_transcript(
             self.fp, self.offset, "continue", timeout_s=0.1))
 
+    def test_truncated_transcript_still_proves_delivery(self):
+        """Compaction rewrites the file shorter. seek(stale_offset) lands past
+        EOF and read() returns b'' — which the old code scored as 'not
+        delivered', so _tmux_resume re-sent. Unattended that is 3x the usage
+        for one resume, which is why a false negative here costs more than a
+        false positive."""
+        st = self.fp.stat()
+        big = self.offset + 10_000
+        self.fp.write_text(json.dumps(
+            {"type": "user", "message": {"content": "continue"}}) + "\n")
+        self.assertLess(self.fp.stat().st_size, big)
+        self.assertTrue(fb._proven_in_transcript(
+            self.fp, big, "continue", timeout_s=0.1,
+            ident=(st.st_dev, st.st_ino)))
+
+    def test_replaced_file_still_proves_delivery(self):
+        """Same path, new inode. Sized so the offset still lands INSIDE the new
+        file — only the identity check can catch this one, which is why it is
+        separate from the truncation case."""
+        self.fp.write_text(json.dumps(
+            {"type": "user", "message": {"content": "pad " * 400}}) + "\n")
+        st = self.fp.stat()
+        offset = st.st_size                       # ~1.6 KB into the OLD file
+        self.fp.unlink()                          # new inode from here on
+        self.fp.write_text(
+            json.dumps({"type": "user", "message": {"content": "continue"}}) + "\n"
+            + json.dumps({"type": "user", "message": {"content": "tail " * 500}}) + "\n")
+        self.assertGreater(self.fp.stat().st_size, offset)   # offset lands inside
+        self.assertNotEqual(self.fp.stat().st_ino, st.st_ino)
+        self.assertTrue(fb._proven_in_transcript(
+            self.fp, offset, "continue", timeout_s=0.1,
+            ident=(st.st_dev, st.st_ino)))
+
+    def test_intact_file_still_honours_the_offset(self):
+        """The rotation fallback must not become 'always read everything' —
+        a pre-offset 'continue' must still fail to prove."""
+        st = self.fp.stat()
+        self.assertFalse(fb._proven_in_transcript(
+            self.fp, self.offset, "continue", timeout_s=0.1,
+            ident=(st.st_dev, st.st_ino)))
+
     def test_assistant_text_does_not_prove(self):
         self.append({"type": "assistant", "message":
                      {"content": [{"type": "text", "text": "continue"}]}})
@@ -1303,9 +2173,10 @@ class TestTmuxResume(unittest.TestCase):
     """The fallback resume believes nothing but the transcript."""
 
     def setUp(self):
-        self._saved = {n: getattr(fb, n) for n in
-                       ("run", "deliver_text", "_wait_composer_idle",
-                        "_proven_in_transcript")}
+        self._saved = {n: getattr(fb.resume, n) for n in
+                       ("_wait_composer_idle", "_proven_in_transcript")}
+        self._saved_deliver = fb.dispatch.deliver_text
+        self._saved_run = fb.shell.run
         self._sleep = fb.time.sleep
         fb.time.sleep = lambda s: None
         self.home = Path(tempfile.mkdtemp(prefix="fb-tmuxres-"))
@@ -1313,14 +2184,17 @@ class TestTmuxResume(unittest.TestCase):
         proj.mkdir(parents=True)
         (proj / "s1.jsonl").write_text("")
         self.waits, self.delivered = [], []
-        fb.run = lambda cmd, **kw: (0, "")
-        fb._wait_composer_idle = lambda name, t: self.waits.append(t) or True
-        fb.deliver_text = lambda name, text: self.delivered.append(text) or True
-        fb._proven_in_transcript = lambda fp, off, text, timeout_s=20.0: True
+        fb.shell.run = lambda cmd, **kw: (0, "")
+        fb.resume._wait_composer_idle = lambda name, t: self.waits.append(t) or True
+        fb.dispatch.deliver_text = lambda name, text: (
+            self.delivered.append(text) or True)
+        fb.resume._proven_in_transcript = lambda *a, **kw: True
 
     def tearDown(self):
         for n, f in self._saved.items():
-            setattr(fb, n, f)
+            setattr(fb.resume, n, f)
+        fb.dispatch.deliver_text = self._saved_deliver
+        fb.shell.run = self._saved_run
         fb.time.sleep = self._sleep
 
     def test_waits_out_reload_before_pasting(self):
@@ -1331,7 +2205,7 @@ class TestTmuxResume(unittest.TestCase):
         self.assertIn("attach", out["message"])
 
     def test_vanished_paste_retries_then_fails_honestly(self):
-        fb._proven_in_transcript = lambda *a, **kw: False
+        fb.resume._proven_in_transcript = lambda *a, **kw: False
         out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
         self.assertFalse(out["ok"])
         self.assertEqual(len(self.delivered), 3)           # three real attempts
@@ -1346,7 +2220,7 @@ class TestTmuxResume(unittest.TestCase):
         self.assertIn("unproven", out["message"])
 
     def test_tmux_failure_reports(self):
-        fb.run = lambda cmd, **kw: (1, "boom")
+        fb.shell.run = lambda cmd, **kw: (1, "boom")
         out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
         self.assertFalse(out["ok"])
         self.assertIn("tmux failed", out["message"])
@@ -1357,7 +2231,7 @@ class TestTmuxResume(unittest.TestCase):
 class TestDemoState(ConfigGuard):
     def setUp(self):
         super().setUp()
-        fb.DEMO = True
+        fb.config.DEMO = True
 
     def test_demo_state_shape(self):
         st = fb.cached_state()
@@ -1374,7 +2248,7 @@ class TestHTTPSmoke(ConfigGuard):
     """Spin the real server in DEMO mode (no subprocess) and hit it."""
     def setUp(self):
         super().setUp()
-        fb.DEMO = True
+        fb.config.DEMO = True
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), fb.Handler)
         self.port = self.srv.server_address[1]
         self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
@@ -1438,11 +2312,352 @@ class TestHTTPSmoke(ConfigGuard):
         self.assertFalse(d["ok"])
         self.assertIn("demo", d["message"])
 
+    def _post(self, path, payload):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+
+    def test_send_on_the_wire_refuses_a_bare_pid(self):
+        # {pid, text} was the whole request once, and a recycled pid delivered
+        # it to a stranger (ADR 0008). The legacy form stays callable and now
+        # refuses — distinguishably, so a client can say what went wrong.
+        fb.config.DEMO = False          # ConfigGuard restores it
+        d = self._post("/api/send", {"pid": 999999, "text": "hi"})
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["error"], fb.UNADDRESSED)
+
+    def test_focus_on_the_wire_refuses_a_bare_pid(self):
+        d = json.loads(self._get("/api/focus?pid=999999")[1])
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["error"], fb.UNADDRESSED)
+
+    def test_the_router_carries_the_whole_identity(self):
+        # worktree names and tmux targets contain slashes and colons; the
+        # focus route used to pluck one integer out of the raw path with a
+        # regex, which cannot carry any of this
+        seen = {}
+        saved = fb.terminal.focus_process, fb.terminal.send_to_process
+        fb.terminal.focus_process = lambda pid, **kw: seen.setdefault(
+            "focus", (pid, kw)) or {"ok": True, "message": ""}
+        fb.terminal.send_to_process = lambda pid, text, **kw: seen.setdefault(
+            "send", (pid, text, kw)) or {"ok": True, "message": ""}
+        try:
+            self._get("/api/focus?pid=7&wt=feat%2Fx&tmux=sess%3A0.1&tty=ttys003")
+            self._post("/api/send", {"pid": 8, "text": "hi", "sid": "s1",
+                                     "account": "work", "worktree": "feat/x",
+                                     "tmux": "sess:0.1", "tty": "ttys003"})
+        finally:
+            fb.terminal.focus_process, fb.terminal.send_to_process = saved
+        self.assertEqual(seen["focus"][0], 7)
+        self.assertEqual(seen["focus"][1]["worktree"], "feat/x")
+        self.assertEqual(seen["focus"][1]["tmux"], "sess:0.1")
+        self.assertEqual(seen["focus"][1]["tty"], "ttys003")
+        self.assertEqual(seen["send"][0], 8)
+        self.assertEqual(seen["send"][2]["sid"], "s1")
+        self.assertEqual(seen["send"][2]["account"], "work")
+        self.assertEqual(seen["send"][2]["worktree"], "feat/x")
+        self.assertEqual(seen["send"][2]["tmux"], "sess:0.1")
+
     def test_unknown_path_404(self):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self._get("/nope")
         self.assertEqual(cm.exception.code, 404)
         cm.exception.close()
+
+
+# --------------------------------------------------------------- the stat memo
+
+class TestStatMemo(unittest.TestCase):
+    """The cache underneath the transcript scan. Two properties, and the whole
+    safety of the sweep rests on them: a key that contains everything which can
+    change the answer, and a bound that survives a multi-day uptime (§4.7)."""
+
+    def test_a_key_that_moves_is_a_miss(self):
+        m = fb.StatMemo(cap=8)
+        m.put(("/t", 1, 2), (10, 100), "old", 0.0)
+        self.assertEqual(m.get(("/t", 1, 2), (10, 100), 1.0), "old")
+        self.assertIsNone(m.get(("/t", 1, 2), (11, 100), 1.0))   # appended
+        self.assertIsNone(m.get(("/t", 1, 2), (10, 101), 1.0))   # touched
+
+    def test_identity_is_in_the_ident_not_just_the_path(self):
+        """The Step-0 trap: a transcript replaced under its own name, with the
+        same size and the same mtime, must not serve the old file's parse."""
+        m = fb.StatMemo(cap=8)
+        m.put(("/t", 1, 2), (10, 100), "old", 0.0)
+        self.assertIsNone(m.get(("/t", 1, 999), (10, 100), 1.0))  # new inode
+        self.assertIsNone(m.get(("/t", 9, 2), (10, 100), 1.0))    # new device
+
+    def test_the_cap_is_a_hard_bound_and_evicts_the_least_recently_seen(self):
+        m = fb.StatMemo(cap=3)
+        for i in range(3):
+            m.put((f"/{i}", 0, i), (0, 0), i, float(i))
+        m.get(("/0", 0, 0), (0, 0), 10.0)          # 0 is now the freshest
+        m.put(("/3", 0, 3), (0, 0), 3, 11.0)
+        self.assertEqual(len(m), 3)
+        self.assertEqual(m.evictions, 1)
+        self.assertIsNone(m.get(("/1", 0, 1), (0, 0), 12.0))   # 1 was oldest
+        self.assertEqual(m.get(("/0", 0, 0), (0, 0), 12.0), 0)
+
+    def test_an_entry_nobody_has_looked_at_expires(self):
+        m = fb.StatMemo(cap=99, idle_s=10.0)
+        m.put(("/old", 0, 1), (0, 0), "a", 0.0)
+        m.put(("/new", 0, 2), (0, 0), "b", 100.0)
+        m.expire(105.0)
+        self.assertIsNone(m.get(("/old", 0, 1), (0, 0), 105.0))
+        self.assertEqual(m.get(("/new", 0, 2), (0, 0), 105.0), "b")
+
+    def test_an_entry_replaces_itself_rather_than_accumulating(self):
+        """A transcript appended to 500 times is one entry, not 500 — the file
+        corpus grows ~982 .jsonl/day and the sweep is perpetual."""
+        m = fb.StatMemo(cap=1024)
+        for size in range(500):
+            m.put(("/t", 1, 2), (size, size), size, float(size))
+        self.assertEqual(len(m), 1)
+        self.assertEqual(m.evictions, 0)
+
+    def test_two_threads_cannot_tear_it(self):
+        """`scan_sessions` runs on the sweep thread AND on the HTTP thread of
+        any request that arrives with the cache parked — which is every request
+        right after a mutation, by design. Unlocked, `expire`'s
+        `next(iter(_d))`/`del` pair raises RuntimeError and `get`'s
+        `_d.get`/`move_to_end` pair raises KeyError; both did, within seconds."""
+        import time
+        m = fb.StatMemo(cap=64, idle_s=0.001)
+        errs, stop = [], threading.Event()
+
+        def hammer():
+            i = 0
+            try:
+                while not stop.is_set():
+                    i += 1
+                    ident, key = (f"/f{i % 80}", 1, i % 80), (i, i)
+                    if m.get(ident, key, time.time()) is None:
+                        m.put(ident, key, i, time.time())
+                    if i % 7 == 0:
+                        m.expire(time.time())
+            except Exception as e:                      # noqa: BLE001
+                errs.append(f"{type(e).__name__}: {e}")
+
+        ts = [threading.Thread(target=hammer, daemon=True) for _ in range(4)]
+        [t.start() for t in ts]
+        time.sleep(1.5)
+        stop.set()
+        [t.join(5) for t in ts]
+        self.assertEqual(errs, [])
+
+
+# ------------------------------------------------- the per-generation memo
+
+class TestProcMemo(unittest.TestCase):
+    """The cache underneath the pid->cwd and pid->account lookups.
+
+    Its whole safety argument is the key. A memo on bare pid would put a dead
+    agent's cwd on a stranger's card and hand the act layer the wrong process
+    to type at — ADR 0008's bug in a new place."""
+
+    def test_a_recycled_pid_is_a_miss(self):
+        m = fb.ProcMemo()
+        m.put(4242, "Mon Jul 20 07:08:52 2026", "/work/alpha")
+        self.assertEqual(m.get(4242, "Mon Jul 20 07:08:52 2026"), "/work/alpha")
+        # same pid, a process that started later — a different agent entirely
+        self.assertIs(m.get(4242, "Tue Jul 21 11:00:00 2026"), fb.procs._MISS)
+
+    def test_a_process_with_no_generation_is_never_memoised(self):
+        """A `ps` that cannot report lstart leaves the sweep exactly as slow as
+        it was — never as fast and wrong."""
+        m = fb.ProcMemo()
+        m.put(4242, None, "/work/alpha")
+        self.assertEqual(len(m), 0)
+        self.assertIs(m.get(4242, None), fb.procs._MISS)
+
+    def test_none_is_a_held_value_not_an_absence(self):
+        """`ps eww` proving a process has no CLAUDE_CONFIG_DIR is an answer,
+        and re-asking every sweep would keep the subprocess in the loop."""
+        m = fb.ProcMemo()
+        m.put(7, "g", None)
+        self.assertIsNone(m.get(7, "g"))
+        self.assertIs(m.get(8, "g"), fb.procs._MISS)
+
+    def test_retain_is_the_bound_and_it_is_exact(self):
+        m = fb.ProcMemo()
+        for pid in range(10):
+            m.put(pid, "g", f"/w/{pid}")
+        m.retain({3, 4})
+        self.assertEqual(len(m), 2)
+        self.assertEqual(m.evictions, 0)      # turnover is not overflow
+        self.assertIs(m.get(9, "g"), fb.procs._MISS)
+
+    def test_the_cap_is_a_hard_bound(self):
+        m = fb.ProcMemo(cap=3)
+        for pid in range(5):
+            m.put(pid, "g", pid)
+        self.assertEqual(len(m), 3)
+        self.assertEqual(m.evictions, 2)
+
+
+class TestProcResolve(unittest.TestCase):
+    """`_resolve`: what actually gets probed, and what a cold sweep catches."""
+
+    def setUp(self):
+        self.memo = fb.ProcMemo()
+        self.asked = []
+
+    def probe(self, answers):
+        def _p(pids):
+            self.asked.append(list(pids))
+            return {p: answers[p] for p in pids if p in answers}
+        return _p
+
+    def _resolve(self, pids, gens, answers, cold=False, keep_absent=False):
+        return fb.procs._resolve(self.memo, pids, gens, self.probe(answers),
+                                 cold, keep_absent)
+
+    def test_a_second_sweep_probes_nothing(self):
+        gens = {1: "a", 2: "b"}
+        ans = {1: "/w/one", 2: "/w/two"}
+        self.assertEqual(self._resolve([1, 2], gens, ans), ans)
+        self.assertEqual(self._resolve([1, 2], gens, ans), ans)
+        self.assertEqual(self.asked, [[1, 2]])          # once, not twice
+
+    def test_only_the_new_pid_costs_anything(self):
+        gens = {1: "a", 2: "b"}
+        self._resolve([1], gens, {1: "/w/one"})
+        self._resolve([1, 2], gens, {1: "/w/one", 2: "/w/two"})
+        self.assertEqual(self.asked, [[1], [2]])
+
+    def test_a_recycled_pid_re_probes_rather_than_serving_the_dead_agent(self):
+        """The bug this memo must not become: pid 1 dies, the number is reused,
+        and the board files the new agent under the old one's worktree."""
+        self._resolve([1], {1: "a"}, {1: "/w/old"})
+        got = self._resolve([1], {1: "b"}, {1: "/w/new"})
+        self.assertEqual(got, {1: "/w/new"})
+        self.assertEqual(self.asked, [[1], [1]])
+
+    def test_the_cold_reconcile_counts_a_memo_that_lies(self):
+        """LAW: a memo nobody audits is worse than a slow sweep (§4.3 #1/#4).
+        A stale cwd looks exactly like a correct one on the board."""
+        self._resolve([1], {1: "a"}, {1: "/w/old"})
+        self.memo.put(1, "a", "/w/poisoned")
+        got = self._resolve([1], {1: "a"}, {1: "/w/old"}, cold=True)
+        self.assertEqual(got, {1: "/w/old"})            # the truth is served
+        self.assertEqual(self.memo.drift, 1)            # …and it is counted
+
+    def test_a_cold_sweep_that_agrees_is_not_drift(self):
+        self._resolve([1], {1: "a"}, {1: "/w/one"})
+        self._resolve([1], {1: "a"}, {1: "/w/one"}, cold=True)
+        self.assertEqual(self.memo.drift, 0)
+
+    def test_a_failed_lookup_is_never_remembered(self):
+        """Every live process has a cwd, so an unanswered pid is a broken
+        `lsof`, not a fact. Caching it would strand that agent for its life."""
+        self.assertEqual(self._resolve([1], {1: "a"}, {}), {})
+        self.assertEqual(self._resolve([1], {1: "a"}, {1: "/w/one"}), {1: "/w/one"})
+        self.assertEqual(self.asked, [[1], [1]])
+
+    def test_an_absent_environment_is_a_fact_when_the_probe_answered(self):
+        """A bare `claude` has no CLAUDE_CONFIG_DIR. `ps eww` answering for its
+        neighbour proves the mechanism works, so the absence is real."""
+        got = self._resolve([1, 2], {1: "a", 2: "b"}, {2: "/home/.claude-x"},
+                            keep_absent=True)
+        self.assertEqual(got, {2: "/home/.claude-x"})
+        self._resolve([1, 2], {1: "a", 2: "b"}, {2: "/home/.claude-x"},
+                      keep_absent=True)
+        self.assertEqual(self.asked, [[1, 2]])          # neither re-probed
+
+    def test_an_environment_probe_that_failed_outright_is_not_a_fact(self):
+        self._resolve([1], {1: "a"}, {}, keep_absent=True)
+        self._resolve([1], {1: "a"}, {}, keep_absent=True)
+        self.assertEqual(self.asked, [[1], [1]])
+
+    def test_a_cold_probe_that_answers_nothing_keeps_the_board_up(self):
+        """One denied `lsof` used to blank every cwd and report the whole
+        fleet FREE. An unanswered probe proves nothing — and is not a lie."""
+        self._resolve([1], {1: "a"}, {1: "/w/one"})
+        got = self._resolve([1], {1: "a"}, {}, cold=True)
+        self.assertEqual(got, {1: "/w/one"})
+        self.assertEqual(self.memo.drift, 0)
+
+
+class TestClaudeProcessesMemo(unittest.TestCase):
+    """`claude_processes` end to end against a fabricated process table."""
+
+    LSTART = "Mon Jul 20 07:08:52 2026"
+
+    def _ps(self, lstart=None):
+        lstart = lstart or self.LSTART
+        return ("  100     1 ??       0.0 01:00:00 Tue Jul 14 03:47:57 2026 /sbin/launchd\n"
+                f"  200   100 s001     1.5 00:10 {lstart} claude --resume abc\n")
+
+    def setUp(self):
+        self.saved = (fb.shell.run, fb.procs._pid_cwds, fb.procs._pid_config_dirs)
+        fb.proc_memo_clear()
+        self.ps_out, self.cwd_calls, self.env_calls = self._ps(), [], []
+
+        self.plain = False           # stand in for a ps that refuses `lstart`
+
+        def run(cmd, cwd=None, timeout=6, env=None):
+            if cmd[:2] == ["ps", "-axo"]:
+                if self.plain and "lstart=" in cmd[2]:
+                    return 1, ""
+                return 0, self.ps_out
+            return 1, ""
+        fb.shell.run = run
+        fb.procs._pid_cwds = lambda pids: (self.cwd_calls.append(list(pids))
+                                           or {p: "/w/alpha" for p in pids})
+        fb.procs._pid_config_dirs = lambda pids: (
+            self.env_calls.append(list(pids)) or {p: "/home/.claude-a2" for p in pids})
+
+    def tearDown(self):
+        fb.shell.run, fb.procs._pid_cwds, fb.procs._pid_config_dirs = self.saved
+        fb.proc_memo_clear()
+
+    def test_the_ps_row_parses_with_a_start_time_and_the_command_survives(self):
+        p, = fb.claude_processes()
+        self.assertEqual((p["pid"], p["cmd"], p["tty"]), (200, "claude --resume abc", "s001"))
+        self.assertEqual(p["cwd"], "/w/alpha")
+        self.assertEqual(p["account"], "a2")
+
+    def test_a_stable_fleet_stops_shelling_out(self):
+        fb.claude_processes()
+        for _ in range(4):
+            fb.claude_processes()
+        self.assertEqual(self.cwd_calls, [[200]])
+        self.assertEqual(self.env_calls, [[200]])
+
+    def test_a_cold_sweep_re_probes_everything(self):
+        fb.claude_processes()
+        fb.claude_processes(cold=True)
+        self.assertEqual(self.cwd_calls, [[200], [200]])
+        self.assertEqual(fb.proc_memo_drift(), 0)
+
+    def test_a_recycled_pid_does_not_inherit_the_dead_agents_worktree(self):
+        fb.claude_processes()
+        self.ps_out = self._ps("Tue Jul 21 11:00:00 2026")
+        fb.procs._pid_cwds = lambda pids: {p: "/w/beta" for p in pids}
+        p, = fb.claude_processes()
+        self.assertEqual(p["cwd"], "/w/beta")
+
+    def test_a_ps_without_lstart_still_builds_the_board(self):
+        """The fallback: no generation, so nothing is memoised and the sweep
+        costs what it always did — never fast and wrong."""
+        self.plain = True
+        self.ps_out = ("  100     1 ??       0.0 01:00:00 /sbin/launchd\n"
+                       "  200   100 s001     1.5 00:10 claude --resume abc\n")
+        p, = fb.claude_processes()
+        self.assertEqual((p["pid"], p["cmd"], p["cwd"]), (200, "claude --resume abc", "/w/alpha"))
+        fb.claude_processes()
+        self.assertEqual(self.cwd_calls, [[200], [200]])
+        self.assertEqual(fb.proc_memo_stats()["cwd_entries"], 0)
+
+    def test_a_process_that_exits_leaves_nothing_behind(self):
+        fb.claude_processes()
+        self.assertEqual(fb.proc_memo_stats()["cwd_entries"], 1)
+        self.ps_out = "  100     1 ??       0.0 01:00:00 Tue Jul 14 03:47:57 2026 /sbin/launchd\n"
+        fb.claude_processes()
+        self.assertEqual(fb.proc_memo_stats()["cwd_entries"], 0)
 
 
 if __name__ == "__main__":

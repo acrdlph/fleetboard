@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>orchestra</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string></string>
+	</dict>
+	<key>UIUserInterfaceStyle</key>
+	<string>Dark</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+
+	<!--
+	  `remote-notification` so a `content-available: 1` push (every one
+	  `notify.compose` sends sets it) can wake the app to refresh its cached
+	  board while backgrounded. It is the only background mode this app claims;
+	  it does not run code on a timer and does not need `fetch`.
+	-->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
+
+	<!--
+	  App Transport Security — ADR 0013.
+
+	  The server speaks PLAIN HTTP over the tailnet, deliberately: WireGuard
+	  already gives mutual authentication and confidentiality between devices,
+	  so TLS on top would secure a channel that is already secure, in exchange
+	  for a certificate lifecycle and pinning logic that fails closed and
+	  strands the user. Security comes from Tailscale, the per-device bearer
+	  token, and a server that binds loopback until you opt in.
+
+	  So an ATS exception is needed, and it is SCOPED. `NSAllowsArbitraryLoads`
+	  is never set: it would disable ATS process-wide rather than for one host,
+	  and this dictionary is meant to say what is actually intended.
+
+	  `NSAllowsLocalNetworking` does NOT help, and this is the trap ADR 0013
+	  names: it covers `.local` and link-local, not the `100.64/10` CGNAT range
+	  Tailscale hands out.
+
+	  TWO entries, because there are two ways to name the same Mac:
+
+	  * `ts.net` with subdomains — the MagicDNS name
+	    (`achills-macbook-pro.tail1205d9.ts.net`), which is the canonical form
+	    and the one that generalises to any tailnet.
+	  * the raw tailnet IP — because **ATS domain exceptions do not apply to
+	    URLs whose host is an IP literal**, and the server's own pairing QR
+	    advertises `h=100.113.110.31`: `pairing._server_facts` reports the
+	    address the server is BOUND to, which is an address, not a name. Without
+	    this entry the address the QR hands the phone is the one address the app
+	    cannot load.
+
+	  That second entry is per-tailnet and it is the one line of this project
+	  that has to change when the Mac's tailnet address does.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>ts.net</key>
+			<dict>
+				<key>NSIncludesSubdomains</key>
+				<true/>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+			<key>100.113.110.31</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+
+	<key>NSCameraUsageDescription</key>
+	<string>orchestra scans the pairing code shown on your Mac.</string>
+	<!--
+	  Included DEFENSIVELY. Whether iOS's local-network gate fires for a
+	  `utun`-routed 100.64/10 destination is unverified (IOS-APP.md §11 lists it
+	  as a day-one empirical task). Including the key costs one plist entry;
+	  omitting it and being wrong costs a silent connection failure with no
+	  diagnosable cause.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>orchestra connects to your Mac over your Tailscale network.</string>
+
+	<!--
+	  The scheme the pairing QR uses: `orc://p?h=<host>[&p=<port>]&c=<code>`.
+	  Registered now so a scan from the system camera can hand the ticket
+	  straight to the app later; the in-app scanner does not need it.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>sh.orchestra.pair</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>orc</string>
+				<string>orchestra</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

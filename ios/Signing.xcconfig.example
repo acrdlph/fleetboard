@@ -1,0 +1,15 @@
+// Copy this to ios/Signing.xcconfig (gitignored) and set your team.
+//
+// A DEVICE build needs a real Apple Development Team — the one that owns the
+// bundle id `sh.orchestra.app` and (for push) the APNs key. The simulator does
+// not need this file; it builds with ad-hoc signing (CODE_SIGN_IDENTITY = "-").
+//
+// Find your Team ID at https://developer.apple.com/account (top right), or run
+//   security find-identity -p codesigning -v
+// and read the (XXXXXXXXXX) after your name on an "Apple Development" cert.
+
+DEVELOPMENT_TEAM = XXXXXXXXXX
+CODE_SIGN_STYLE = Automatic
+CODE_SIGN_IDENTITY = Apple Development
+CODE_SIGNING_ALLOWED = YES
+CODE_SIGNING_REQUIRED = YES

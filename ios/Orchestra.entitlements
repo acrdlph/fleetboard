@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  This file exists because of a defect that was found by LOOKING, not by
+	  reading: the app paired against the real server, drew the real board, and
+	  then came back to the pairing screen on the next launch.
+
+	  The cause is that a target built with `CODE_SIGNING_ALLOWED = NO` carries
+	  no entitlements at all, so it has no keychain access group — and
+	  `SecItemAdd` answers `errSecMissingEntitlement` (-34018). The token was
+	  never written. Every screen looked correct; only the SECOND launch could
+	  see it, which is exactly the shape of failure this project keeps finding.
+
+	  Ad-hoc signing (`CODE_SIGN_IDENTITY = "-"`) gives the simulator build the
+	  `application-identifier` it needs and costs nothing — no team, no
+	  provisioning profile, no Apple ID. A device build needs a real team in a
+	  gitignored `Signing.xcconfig` (DEVELOPMENT_TEAM = 4K738RNZAA, the team that
+	  owns the bundle id and the APNs key).
+
+	  The identifiers below MUST be team-prefixed via `$(AppIdentifierPrefix)`,
+	  not hardcoded: a real provisioning profile's application-identifier is
+	  `<TEAMID>.sh.orchestra.app`, and a bare `sh.orchestra.app` fails a device
+	  build with "profile doesn't match the entitlements file's values". The
+	  variable resolves to `4K738RNZAA.` for the signed device build and to
+	  empty for the ad-hoc simulator build — so `$(AppIdentifierPrefix)$(...)`
+	  is `4K738RNZAA.sh.orchestra.app` on the phone and `sh.orchestra.app` on the
+	  simulator, and BOTH keep their keychain access group. The Keychain code
+	  names a service, never an access group, so it adapts to whichever is
+	  granted and the -34018 token-persistence bug stays fixed on both.
+	-->
+	<key>application-identifier</key>
+	<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	</array>
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>
