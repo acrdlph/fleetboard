@@ -1,0 +1,15 @@
+{
+  "_readme": "Copy this to orchestra.config.json (gitignored) and fill in your values. Every key is optional; delete what you do not use. The apns_* keys are only needed for push to the iOS app — see docs/mobile/APNS-SETUP.md.",
+
+  "roots": ["/Users/YOU/code"],
+  "pattern": "",
+  "exclude_accounts": [],
+  "reserve_percent": {"main": 20},
+  "router_home": null,
+
+  "apns_team_id": "XXXXXXXXXX",
+  "apns_topic": "sh.orchestra.app",
+  "apns_environment": "sandbox",
+  "apns_key_id": "XXXXXXXXXX",
+  "apns_key_path": "/Users/YOU/.orchestra/apns/AuthKey_XXXXXXXXXX.p8"
+}

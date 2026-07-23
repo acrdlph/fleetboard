@@ -243,13 +243,30 @@ python3 -m orchestra [--root DIR]... [--pattern REGEX] [--home DIR]...
 | `--demo` | — | fictional data (screenshots, kicking the tires) |
 
 Persistent settings go in `orchestra.config.json` next to the script
-(gitignored):
+(gitignored). **Copy `orchestra.config.example.json` to start** — it lists every
+key with placeholder values, including the `apns_*` keys for iOS push:
 
 ```json
 { "roots": ["/Users/you/code"], "pattern": "myproject", "cclimits_cmd": null,
   "exclude_accounts": [], "router_home": null, "reserve_percent": {"main": 20},
   "idle_s": 30.0, "git_s": 15.0 }
 ```
+
+**Secrets and where they live** — nothing sensitive is committed; each has a
+`.example` template so a fresh checkout knows the shape:
+
+| secret | real (gitignored) | template (committed) |
+|---|---|---|
+| server config | `orchestra.config.json` | `orchestra.config.example.json` |
+| iOS device-signing team | `ios/Signing.xcconfig` | `ios/Signing.xcconfig.example` |
+| APNs push key | `~/.orchestra/apns/AuthKey_*.p8` (outside the repo) | — see `docs/mobile/APNS-SETUP.md` |
+
+The `apns_*` keys (`apns_team_id`, `apns_key_id`, `apns_key_path`, `apns_topic`,
+`apns_environment`) are only needed for push to the iOS app;
+[`docs/mobile/APNS-SETUP.md`](docs/mobile/APNS-SETUP.md) is the ten-minute
+walk-through for creating the key. All three — the App ID, the key, and
+`apns_team_id` — must belong to the **same** Apple team, or Apple rejects the
+provider token with `403 InvalidProviderToken`.
 
 | key | default | meaning |
 |---|---|---|
