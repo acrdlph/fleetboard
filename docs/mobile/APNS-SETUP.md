@@ -186,7 +186,8 @@ Two things measured while building this, recorded here because
    defensive rather than load-bearing. The conversion and its tests handle it;
    the doc's table understates the risk it warns about.
 
-2. **The bundle id is inconsistent across the docs.** `IOS-APP.md` and
-   `ARCHITECTURE.md` use `sh.orchestra.app`; `API.md` §9.23's request example
-   uses `com.acrdlph.orchestra`. Whichever you register in step 1 must match
-   the Xcode project exactly — pick one and make all three agree.
+2. **The bundle id was inconsistent across the docs** — now resolved. The
+   Xcode project builds **`sh.orchestra.app`** (verified in
+   `project.pbxproj`), and the server config and this guide match it. Three
+   stray `com.acrdlph.orchestra` examples in `API.md` and `UX.md` were
+   corrected to agree. Register `sh.orchestra.app` in step 1.

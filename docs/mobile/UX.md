@@ -2141,7 +2141,7 @@ The `silent` state distinguishes "quiet fleet" from "broken pipeline", which is 
 ```jsonc
 // POST /api/devices   (authenticated; idempotent on `token`)
 { "token": "a1b2…", "kind": "apns", "name": "achill's iPhone",
-  "bundle_id": "com.acrdlph.orchestra", "tz": "Europe/Berlin",
+  "bundle_id": "sh.orchestra.app", "tz": "Europe/Berlin",
   "prefs": {"needs_input": true, "blocked": true, "waiting": false,
             "limit": true, "dispatch": true, "resume": true, "freed": false},
   "quiet_hours": {"from": "22:00", "to": "08:00"},

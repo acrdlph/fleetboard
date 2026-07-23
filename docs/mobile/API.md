@@ -224,7 +224,7 @@ Every device is issued **two** tokens at pairing: one `read`, one `act`. Scopes 
 
 | Scope | Grants | iOS storage |
 |---|---|---|
-| `read` | all reads, the SSE stream, self-service device endpoints | Keychain, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, access group `com.acrdlph.orchestra.shared` (the notification-service extension needs it while the device is locked), **no biometric ACL** |
+| `read` | all reads, the SSE stream, self-service device endpoints | Keychain, `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, access group `sh.orchestra.shared` (the notification-service extension needs it while the device is locked), **no biometric ACL** |
 | `act` | everything that types at, launches, or kills an agent | Keychain, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` + `SecAccessControl([.biometryCurrentSet, .or, .devicePasscode])`, **not** in the access group |
 | `admin` | device management, reserve edits, config-adjacent writes | **the desktop board only. Phones are never issued `admin`** — a stolen phone must not be able to revoke the Mac's ability to revoke it. |
 
@@ -3001,7 +3001,7 @@ Request:
   "backend": "apns",
   "token": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
   "environment": "production",
-  "topic": "com.acrdlph.orchestra",
+  "topic": "sh.orchestra.app",
   "app_version": "1.0 (14)",
   "tz": "America/Los_Angeles",
   "tz_offset_min": -420,
