@@ -284,7 +284,8 @@ def sign_es256(key_path, signing_input, timeout=SIGN_TIMEOUT_S):
                 f"'BEGIN PRIVATE KEY' block); a .cer, a .p12 or a re-wrapped "
                 f"key will not work (openssl exit {rc})")
         try:
-            der = open(sig, "rb").read()
+            with open(sig, "rb") as f:
+                der = f.read()
         except OSError as e:
             raise SigningError(f"openssl reported success but wrote no "
                                f"signature: {e}") from None
@@ -657,7 +658,8 @@ def post(device_token, payload, creds, jwt, environment=None,
 def _read_headers(path):
     """`dump-header` output -> a lower-cased dict. Never raises."""
     try:
-        raw = open(path, "r", errors="replace").read()
+        with open(path, "r", errors="replace") as f:
+            raw = f.read()
     except OSError:
         return {}
     out = {}
@@ -676,7 +678,8 @@ def _read_reason(path):
     unparseable returns None and the status carries the meaning.
     """
     try:
-        raw = open(path, "rb").read()
+        with open(path, "rb") as f:
+            raw = f.read()
     except OSError:
         return None
     if not raw.strip():
