@@ -66,9 +66,10 @@ another before they were measured:
 """
 
 import json
+import os
 import re
 import shlex
-import stat
+import tempfile
 import threading
 import time
 
@@ -409,21 +410,56 @@ def settings_fragment(port=None, script=None, events=INSTALLED_EVENTS):
                       for e in events}}
 
 
+def _atomic_write(path, content, executable=False):
+    """Write `content` to `path` via a temp file in the SAME directory, then
+    `os.replace` — atomic on one filesystem. `install()` reruns on every
+    dispatch while already-running hooked agents fork `post-hook.sh` several
+    times a turn; a plain truncate-then-write hands a hook that execs inside the
+    window an empty or half-written script — an `sh` syntax error, a non-zero
+    exit, and on a PreToolUse that BLOCKS the agent's tool call (the one thing
+    this module swears it never does). The replace never exposes a partial file,
+    and the executable bit is set on the temp BEFORE the rename so there is no
+    non-executable window either.
+
+    Skips the write entirely when the content already matches, which stops mtime
+    churn on the common idempotent rerun.
+    """
+    try:
+        if path.read_text() == content:
+            return
+    except (OSError, ValueError):
+        pass
+    fd, tmpname = tempfile.mkstemp(dir=str(path.parent),
+                                   prefix="." + path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmpname, 0o755 if executable else 0o644)
+        os.replace(tmpname, str(path))
+    except OSError:
+        try:
+            os.unlink(tmpname)
+        except OSError:
+            pass
+        raise
+
+
 def install(port=None, dirpath=None):
     """Write the fragment and the script. Returns the settings path.
 
     Idempotent, and it rewrites both files every time on purpose: the port can
     change between runs, and a fragment pointing at a port nothing is listening
-    on is the silent-degradation case this whole module is trying to avoid.
+    on is the silent-degradation case this whole module is trying to avoid. The
+    rewrite is ATOMIC (see `_atomic_write`) because the script it replaces may be
+    executing in another agent's hook at the same instant.
     """
     port = config.CFG["port"] if port is None else int(port)
     d = HOOK_DIR if dirpath is None else dirpath
     d.mkdir(parents=True, exist_ok=True)
     sh = d / SCRIPT_PATH.name
     js = d / SETTINGS_PATH.name
-    sh.write_text(SCRIPT % {"port": port})
-    sh.chmod(sh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    js.write_text(json.dumps(settings_fragment(port, str(sh)), indent=2) + "\n")
+    _atomic_write(sh, SCRIPT % {"port": port}, executable=True)
+    _atomic_write(js, json.dumps(settings_fragment(port, str(sh)), indent=2) + "\n")
     return js
 
 

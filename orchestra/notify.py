@@ -135,6 +135,13 @@ EVENT_TYPES = {
 # The statuses that COUNT as attention for card-level and account-level rules.
 _ALIVE = ("working", "waiting", "needs_input", "blocked")
 
+# The statuses a session must have been in RECENTLY for its disappearance to be
+# a death worth a push (API.md §9.23): a session that was idle/ended already is
+# not a crash. Edge-triggering supplies the "≤ 300 s ago" bound — `derive` diffs
+# against the immediately preceding projection, which the cadence sweep keeps
+# under a minute old.
+_DIED_FROM = {"working", "needs_input", "blocked"}
+
 
 def project(snapshot=None, resumes=None, dispatch_jobs=None, accounts=None):
     """The live world, flattened to what a notification can turn on.
@@ -159,6 +166,14 @@ def project(snapshot=None, resumes=None, dispatch_jobs=None, accounts=None):
             cards = {c["name"]: c for c in snapshot.get("worktrees", [])}
         for name, card in (cards or {}).items():
             worktrees[name] = card.get("availability")
+            git = card.get("git") or {}
+            # dirty/unlanded at the worktree grain, stamped onto each of its
+            # sessions so `derive` can gate `session.died` on it AFTER the
+            # session is gone (API.md §9.23): an agent that vanished with clean,
+            # landed work is not a crash worth a push. A count (not a stopwatch),
+            # reduced to a bool so a saved file that changes the dirty COUNT does
+            # not itself read as a session edge.
+            dirty = bool(git.get("dirty")) or bool(git.get("ahead"))
             for s in card.get("sessions", []):
                 sessions[s["sid"]] = {
                     "status": s.get("status"),
@@ -170,6 +185,7 @@ def project(snapshot=None, resumes=None, dispatch_jobs=None, accounts=None):
                     # work already continued elsewhere, which is precisely the
                     # classic false positive (ARCHITECTURE.md §6.3).
                     "handed_to": s.get("handed_to"),
+                    "dirty": dirty,
                 }
 
     acct = {}
@@ -257,6 +273,14 @@ def _gen(prev_status, cur_status, prev_gen):
 # The set of statuses that mean "the user can act on this at the Mac", so the
 # event is `open` and the phone must withdraw it on resolution.
 _OPEN_STATUSES = {"needs_input", "blocked", "waiting"}
+
+# The status each session-scoped pending arm ASSERTS, keyed by its dedupe-base
+# type. A pending is cancelled the moment its session stops holding exactly this
+# — not merely when it leaves every open status — so a `blocked` arm does not
+# survive the block becoming a question.
+_EXPECTED_STATUS = {"session.needs_answer": "needs_input",
+                    "session.blocked": "blocked",
+                    "session.your_turn": "waiting"}
 
 
 def derive(prev, cur, now=None, gens=None):
@@ -363,6 +387,22 @@ def derive(prev, cur, now=None, gens=None):
         if avail == "free" and pw.get(name) not in (None, "free"):
             emit("worktree.free", f"worktree.free|{name}", worktree=name)
 
+    # ---- a recently-live session vanished with uncommitted / unlanded work -
+    # The one edge that is triggered by an ABSENCE rather than a transition: a
+    # session that was working/blocked/needs_input in `prev` and is now gone (or
+    # `ended`) with a dirty or unlanded branch is an agent that crashed on work
+    # nobody has saved (API.md §9.23). The dirty gate is what keeps a clean,
+    # landed exit — the normal end of a turn — silent; the 30 s dwell (its
+    # EVENT_TYPES entry) damps a session a single sweep merely missed.
+    for sid, old_s in ps.items():
+        if old_s.get("status") not in _DIED_FROM or not old_s.get("dirty"):
+            continue
+        cur_s = cs.get(sid)
+        if cur_s is None or cur_s.get("status") == "ended":
+            emit("session.died", f"session.died|{sid}",
+                 worktree=old_s.get("worktree"), session_id=sid,
+                 account=old_s.get("account"), model=old_s.get("model"))
+
     return out
 
 
@@ -417,7 +457,15 @@ class EventLog:
                            "events": [e.public() for e in self._events]})
         try:
             tmp = str(self.path) + ".tmp"
-            with open(tmp, "w") as f:
+            # 0o600 on CREATE, exactly as audit.log.jsonl and devices.json in
+            # this same (often Dropbox/iCloud-synced) directory: the events log
+            # carries topics — the first line of what the user typed — resume and
+            # dispatch messages, worktree names and session ids, none of which a
+            # second local account or a synced copy should read. os.replace
+            # carries the tmp's mode onto the destination, so the live file is
+            # 0o600 too and not just the temp.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(blob)
             os.replace(tmp, self.path)
         except OSError:
@@ -734,6 +782,11 @@ class Notifier:
         self._lock = threading.Lock()
         self.pushed = 0
         self.suppressed = 0
+        # the last `Response` from an ACTUAL wire send (None when `_deliver`
+        # short-circuited before the wire, or the sink was a no-op). The Service
+        # reads it to record `note_push` on every attempt and to prune a token
+        # Apple says is gone — outcomes the return bool (pushed / not) hides.
+        self.last_response = None
 
     # -- the entry point ----------------------------------------------------
 
@@ -760,14 +813,31 @@ class Notifier:
     # -- the four gates -----------------------------------------------------
 
     def _select(self, events, cur_sessions, now):
-        # Resolving edges first: a session that LEFT an open status cancels any
-        # arm still dwelling for it, so a flap fires nothing.
-        open_sids = {sid for sid, s in cur_sessions.items()
-                     if s["status"] in _OPEN_STATUSES}
+        # Resolving edges first: an arm still dwelling for a session that no
+        # longer holds the SPECIFIC status the arm asserts is cancelled, so a
+        # flap fires nothing. Checking merely "left every open status" was wrong:
+        # a `blocked` arm survived the dialog turning into a QUESTION
+        # (blocked → needs_input, still an open status), and then fired a second,
+        # mislabelled P1 for a condition that had already pushed as needs_answer.
         for base in list(self._pending):
             sid = _sid_of(base)
-            if sid is not None and sid not in open_sids:
+            if sid is None:
+                continue
+            expected = _EXPECTED_STATUS.get(base.split("|", 1)[0])
+            if expected is not None and \
+                    cur_sessions.get(sid, {}).get("status") != expected:
                 del self._pending[base]
+        # A death arm is cancelled if the session came back alive: a sweep that
+        # briefly missed a session must not summon the user to a crash that did
+        # not happen. (`_sid_of` deliberately does NOT match `session.died`, so
+        # the loop above never cancels a death arm for the session being ABSENT
+        # — which is exactly the condition it is dwelling on.)
+        for base in list(self._pending):
+            if base.startswith("session.died|"):
+                sid = base.split("|", 1)[1]
+                s = cur_sessions.get(sid)
+                if s is not None and s.get("status") in _ALIVE:
+                    del self._pending[base]
 
         for e in events:
             spec = EVENT_TYPES.get(e.type)
@@ -819,8 +889,15 @@ class Notifier:
             out.append(head)
         return out
 
-    def _deliver(self, event, device_token, now):
-        """Gate 5 (budget/quiet) then the wire. Returns True if pushed."""
+    def _deliver(self, event, device_token, now, environment=None):
+        """Gate 5 (budget/quiet) then the wire. Returns True if pushed.
+
+        `environment` is the device's own registered APNs environment
+        (production/sandbox); threaded to the sink so a sandbox build's push
+        goes to the sandbox host on the FIRST try rather than eating a
+        BadDeviceToken and a heal-retry every single time.
+        """
+        self.last_response = None
         if quiet_now(self.prefs, now):            # quiet hours
             level = EVENT_TYPES[event.type]["level"]
             if not (level == "P1" and self.prefs.quiet_allow_p1):
@@ -832,11 +909,16 @@ class Notifier:
         if not self.budget.allow(EVENT_TYPES[event.type]["level"], now):
             self.suppressed += 1
             return False
-        if self.sink is None or device_token is None:
-            # the pipeline runs to completion with no sink — the event is
-            # logged, the decision is made, only the last hop is a no-op. This
-            # is the state the user is in until they create a key, and it must
-            # be indistinguishable from working to everything above.
+        if (self.sink is None or device_token is None
+                or getattr(self.sink, "name", None) == "none"):
+            # the pipeline runs to completion with no (working) sink — the event
+            # is logged, the decision is made, only the last hop is a no-op. This
+            # is the state the user is in until they create a key, and it must be
+            # indistinguishable from working to everything above. A NoopSink is
+            # this state, so it is EXEMPT from backoff and failure accounting: its
+            # Response(0) is retriable, and letting it feed the shared Backoff
+            # would silently throttle a fleet that has push perfectly configured
+            # the moment a key lands, and would skew pushed/suppressed.
             self.pushed += 1
             return True
         if self.backoff.blocked(now):
@@ -846,7 +928,9 @@ class Notifier:
                 (event.counts or {}).get("blocked", 0)
         wire = compose(event, privacy=self.prefs.rules.get("_privacy",
                        "structural"), server=self.server, badge=badge or None)
-        r = self.sink.send(device_token, wire["payload"], **wire["headers"])
+        r = self.sink.send(device_token, wire["payload"],
+                           environment=environment, **wire["headers"])
+        self.last_response = r
         if r.retriable:
             self.backoff.note(r, now)
         elif r.ok:
@@ -905,11 +989,16 @@ class Service:
     triple the git work or the log, and why turning your_turn on for one phone
     does not turn it on for another.
 
-    The sink is BUILT FRESH from config on each fan-out (`push.sink()`), so the
-    moment the user drops a real `.p8` into place the very next event is a real
-    push with no restart — and until then every phone gets a `NoopSink` that
-    runs the whole pipeline and reports `no key`, which is exactly the state
-    this project ships in.
+    The sink is held LONG-LIVED and rebuilt only when the credentials in config
+    change, so the moment the user drops a real `.p8` into place the very next
+    event is a real push with no restart — and until then every phone gets a
+    `NoopSink` that runs the whole pipeline and reports `no key`, which is
+    exactly the state this project ships in. Rebuilding it every sweep, as an
+    earlier cut did, threw away the sink's `healed_environment`, `last` and JWT
+    warmth on every tick — a device on the wrong environment then paid two curl
+    round trips forever. One shared `Backoff` lives here too, not per device: a
+    429/503 is Apple's word about the SERVICE, and backing off one device while
+    the others keep hammering earns a longer ban (push.Backoff's own docstring).
     """
 
     def __init__(self, log_path=None, server="orchestra"):
@@ -917,8 +1006,11 @@ class Service:
         self.server = server
         self._prev = EMPTY_PROJECTION
         self._gens = {}
-        self._pending = {}
+        self._baselined = False   # first observe after start re-baselines silently
         self._per_device = {}     # devid -> Notifier (holds that device's QC)
+        self._sink = None         # long-lived; rebuilt only when creds change
+        self._sink_creds = None
+        self._backoff = None      # one shared Backoff, injected into every device
         self._lock = threading.Lock()
         self.cursor = 0           # last observer version consumed
 
@@ -928,12 +1020,29 @@ class Service:
             n = Notifier(sink=None, log=self.log, server=self.server)
             # the durable log and the world-derive state are SHARED, so this
             # per-device notifier only owns the device's own QC — its dwell
-            # bookkeeping, budget and backoff. It never derives or logs; the
-            # Service does that once. We drive it through `_deliver`-shaped
-            # calls below rather than `observe`.
+            # bookkeeping and budget. The sink and the Backoff are the Service's,
+            # injected each sweep (a 429 is the service's word, not a device's).
+            # It never derives or logs; the Service does that once. We drive it
+            # through `_deliver`-shaped calls below rather than `observe`.
             self._per_device[devid] = n
         n.prefs = prefs_from_device(push)
         return n
+
+    def _sink_for(self, pushmod):
+        """The long-lived sink, rebuilt only when the config credentials change.
+
+        A fresh sink every sweep would discard `healed_environment`, `last` and
+        the warm JWT; keying the rebuild on `Credentials.from_config()` (a frozen
+        dataclass, so `==` is by value) means the drop-in of a real `.p8` swaps
+        the NoopSink for an APNsSink on the very next sweep, and nothing else
+        does. A rebuild also resets the shared Backoff — a hold earned against
+        the old backend says nothing about the new one."""
+        creds = pushmod.Credentials.from_config()
+        if self._sink is None or creds != self._sink_creds:
+            self._sink = pushmod.sink(creds)
+            self._sink_creds = creds
+            self._backoff = pushmod.Backoff()
+        return self._sink
 
     def observe(self, projection, now=None, counts=None):
         """One sweep. Derive + log once; deliver per push device. Returns the
@@ -941,25 +1050,44 @@ class Service:
         from . import auth, push as pushmod
         now = time.time() if now is None else now
         with self._lock:
+            # The FIRST observe after construction is a silent baseline: derive
+            # to advance the generation counters and seed `_prev`, but append
+            # nothing and push nothing. Without it, every process restart diffs
+            # empty→world and re-fires a P1 for every standing question, a P2 for
+            # every exhausted account, and — worst — a `resume.failed` for every
+            # failed schedule still on disk (they persist 24 h), all carrying the
+            # SAME dedupe keys as the pre-restart originals. The persisted log
+            # already holds those events; re-emitting them re-buzzes the phone for
+            # questions it was already told about (ARCHITECTURE.md §6.5's "re-
+            # baseline without emitting", here for restart rather than wake).
             events = derive(self._prev, projection, now=now, gens=self._gens)
             self._prev = projection
+            if not self._baselined:
+                self._baselined = True
+                return 0
             for e in events:
                 e.counts = counts or {}
             self.log.append(events)
 
-            # world-level QC: preference is per-device, so it is applied inside
-            # the per-device loop; dwell/flap/coalesce is world-level and runs
-            # here, once, against a scratch notifier that owns the shared
-            # `_pending`.
+            # world-level derive/log done once (above). The per-device gates —
+            # preference, dwell/flap/coalesce, quiet/budget/mute — run per device
+            # against that device's own Notifier.
             sent = 0
             devices = auth.push_devices()
             if not devices:
                 return 0
-            sink = pushmod.sink()          # fresh from config every sweep
+            sink = self._sink_for(pushmod)     # long-lived; shared Backoff too
             cur_sessions = projection["sessions"]
             for d in devices:
                 n = self._notifier_for(d["id"], d.get("push"))
                 n.sink = sink
+                n.backoff = self._backoff      # one hold for the whole fleet
+                environment = (d.get("push") or {}).get("environment")
+                if sink.name == "apns":
+                    # per-device attribution of a heal: clear before this
+                    # device's sends so a value left by the previous device is
+                    # not persisted onto this one.
+                    sink.healed_environment = None
                 # reuse the device notifier's gates by handing it the already-
                 # derived events; its own `_select` applies this device's
                 # preference + dwell, `_coalesce`, then `_deliver` applies its
@@ -971,17 +1099,31 @@ class Service:
                 copies = [replace(e) for e in events]
                 ready = n._select(copies, cur_sessions, now)
                 token = (d.get("push") or {}).get("token")
+                dead = False
                 for e in ready:
-                    if n._deliver(e, token, now):
+                    if n._deliver(e, token, now, environment=environment):
                         sent += 1
-                        if sink.name == "apns":
-                            r = getattr(sink, "last", None)
-                            auth.note_push(d["id"], r.status if r else "?", now)
-                            # Apple says this token is gone (410 / BadDeviceToken):
-                            # forget it, or it costs a POST every notification and
-                            # a strike with Apple for pushing to a dead token.
-                            if r is not None and r.gone:
-                                auth.forget_push(d["id"])
+                    if sink.name != "apns":
+                        continue
+                    r = n.last_response       # the ACTUAL wire result, or None
+                    if r is None:
+                        continue
+                    # record EVERY attempt, success or failure — a push that
+                    # silently stopped after a restore is otherwise
+                    # indistinguishable from a quiet fleet (note_push's docstring).
+                    auth.note_push(d["id"], r.status, now)
+                    # Apple says this token is gone (410 / BadDeviceToken): forget
+                    # it, or it costs a POST every notification and a strike with
+                    # Apple for pushing to a dead token. Stop sending to it now.
+                    if r.gone:
+                        auth.forget_push(d["id"])
+                        dead = True
+                        break
+                # a 400→other-host heal means this device is registered against
+                # the wrong environment: persist the correction so every future
+                # push does not pay the same double round trip (push.APNsSink).
+                if not dead and sink.name == "apns" and sink.healed_environment:
+                    auth.set_push(d["id"], {"environment": sink.healed_environment})
             return sent
 
     def pump(self, observer_mod, timeout=25.0):
@@ -995,7 +1137,8 @@ class Service:
         if snap.v <= self.cursor:
             return 0
         self.cursor = snap.v
-        proj = project(snap, resumes=_safe_resumes(), accounts=_safe_accounts())
+        proj = project(snap, resumes=_safe_resumes(), accounts=_safe_accounts(),
+                       dispatch_jobs=_safe_dispatch())
         return self.observe(proj, now=time.time(), counts=snap.counts)
 
 
@@ -1011,6 +1154,19 @@ def _safe_accounts():
     try:
         from . import limits
         return limits.limits_by_account()
+    except Exception:
+        return {}
+
+
+def _safe_dispatch():
+    """The dispatch jobs, snapshotted under their lock. `dispatch.succeeded` /
+    `dispatch.failed` (P1, default on) can only fire if this source is threaded
+    into the projection — without it a dispatched mission that fails to launch,
+    the exact fire-and-forget the user walked away from, notifies nobody."""
+    try:
+        from . import dispatch
+        with dispatch._jobs_lock:
+            return {jid: dict(j) for jid, j in dispatch._jobs.items()}
     except Exception:
         return {}
 
@@ -1047,10 +1203,22 @@ def push_loop(observer_mod):
         try:
             snap = observer_mod.wait_for(svc.cursor, timeout=30.0)
             if snap is None:
-                continue
-            svc.cursor = snap.v
+                # No new snapshot version this interval — but the pipeline still
+                # has to run on a CADENCE, not only on a version bump. A dwell-
+                # held push (blocked 40 s, your_turn 20 s, limit_hit 20 s) is
+                # armed on one sweep and RELEASED by a later one, and the resume /
+                # account / dispatch sources change without ever bumping the
+                # snapshot version. Re-observe the current snapshot (same
+                # version) so those pending dwells fire and those edges derive,
+                # within 30 s, instead of starving until unrelated board activity.
+                snap = observer_mod.snapshot()
+                if snap is None:
+                    continue
+            else:
+                svc.cursor = snap.v
             proj = project(snap, resumes=_safe_resumes(),
-                           accounts=_safe_accounts())
+                           accounts=_safe_accounts(),
+                           dispatch_jobs=_safe_dispatch())
             svc.observe(proj, now=time.time(), counts=snap.counts)
         except Exception:
             # never let this thread die: a bad snapshot must cost one iteration,

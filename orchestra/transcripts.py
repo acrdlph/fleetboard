@@ -216,6 +216,17 @@ class StatMemo:
                 del self._d[ident]
                 self.evictions += 1
 
+    def bump_drift(self):
+        """Count one audited disagreement, under the lock. `drift += 1` is a
+        read-modify-write on state the sweep thread and every HTTP thread share
+        (a parked `cached_state()` runs the cold path too), so an unlocked bump
+        can be lost — the very race this class's docstring documents for its
+        other counters. A lost drift under-reports a real memo lie, which is
+        worse here than anywhere: `scan_drift` is the one counter that is a LIE
+        when non-zero and must be trusted absolutely."""
+        with self._lock:
+            self.drift += 1
+
     def clear(self):
         """Everything is suspect — after a wake, per §4.5."""
         with self._lock:
@@ -240,6 +251,11 @@ _TREES = StatMemo(MEMO_DIRS)      # subagent directory -> its entry names
 # reconciliation nobody can audit, and because the RATIO of it to `hook_live` is
 # how you tell a vocabulary mistake (every hook vetoed) from a healthy fleet.
 _HOOK_VETOES = [0]
+# Its own lock, for the same reason `StatMemo.bump_drift` has one: `scan_sessions`
+# runs on the sweep thread AND on any HTTP thread that found a parked cache, and
+# `_HOOK_VETOES[0] += 1` is a read-modify-write on shared state — an unlocked
+# bump is lost under contention and the veto ratio under-reports.
+_HOOK_VETOES_LOCK = threading.Lock()
 
 
 def memo_stats():
@@ -312,6 +328,12 @@ def _clean(text, limit=240):
 _MACHINE_TEXT = re.compile(
     r"<local-command-stdout>|<command-message>|<system-reminder>|"
     r"task-notification|\btoolu_[A-Za-z0-9]|\[SYSTEM NOTIFICATION|"
+    # The interrupt marker (FRESHNESS.md §4.2). The CLI writes it as a *user*
+    # entry when a running tool is cancelled, so without this the card and the
+    # chat drawer quote "you: [Request interrupted by user]" as the human's
+    # last words. It is also the signal `parse_session_tail` expires a pending
+    # tool_use on — matched there against the raw text, before this filter.
+    r"\[Request interrupted|"
     # The compaction preamble. The CLI writes it as a *user* entry, so without
     # this the board quotes the harness back to you as "the last thing you told
     # it" — on precisely the long-running sessions you most need to read.
@@ -464,6 +486,43 @@ _BG_LAUNCHED = re.compile(r"(?:will|'ll) be notified", re.I)
 _NOTIFIED_ID = re.compile(r"<tool-use-id>\s*(toolu_[A-Za-z0-9_-]+)\s*</tool-use-id>")
 _NOTIFIED_DONE = re.compile(r"<status>\s*(?:completed|failed|killed|stopped)\s*</status>")
 
+# The interrupt marker text (FRESHNESS.md §4.2), matched against the RAW user
+# text before `_MACHINE_TEXT` refuses it. A prefix rather than the full phrase
+# so variants ("[Request interrupted by user for tool use]") still expire the
+# tool_use they cut off.
+_INTERRUPT = "[Request interrupted"
+
+# F3: the launch RECEIPT is structural, not "will be notified" appearing
+# anywhere. A Read/Grep/WebFetch whose output merely QUOTES that promise — this
+# repo's own transcripts, a web page about notifications — is not a launch, and
+# with no notification ever pairing it, it pinned the session ● WORKING for a
+# `delegated_s` after every re-read. Three independent guards, matched over the
+# six real receipt shapes the module documents above; any one of them alone
+# would have excluded the quoted-phrase false positive.
+#
+#   Bash "Command running in background with ID: …"
+#   Bash "…was moved to the background (ID: …)"
+#   Workflow "Workflow launched in background. Task ID: …"
+#   Agent "The agent is working in the background."
+#   Monitor "Monitor started (task …, persistent…)."
+#   SendMessage "…resumed from transcript in the background with your message."
+_BG_RECEIPT = re.compile(
+    r"running in background with ID"
+    r"|moved to the background"
+    r"|launched in background"
+    r"|working in the background"
+    r"|Monitor started"
+    r"|in the background with your message", re.I)
+# All six measured receipts are short; a quoted file or web page is not. The
+# `_BG_LAUNCHED` promise plus a receipt-shaped phrase within this many chars is
+# what a genuine launch looks like — the phrases in a large blob are content.
+_BG_RECEIPT_MAX = 2048
+# Read-only tools produce arbitrary file/web content and never background, so a
+# receipt in their result is quoted content by construction. A denylist rather
+# than an allowlist keeps a future backgrounding tool working without an edit.
+_READONLY_TOOLS = frozenset(
+    {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "NotebookRead"})
+
 
 def _entry_ts(e):
     """An entry's epoch seconds, or None if it is not dated.
@@ -537,7 +596,13 @@ def parse_session_tail(fp):
 
     out = {"cwd": None, "branch": None, "model": None, "pending_tools": [],
            "last_assistant": None, "last_user": None, "pending_workflows": 0,
-           "pending_bg_agents": 0, "turn_ended": False, "bg_launched_at": ()}
+           "pending_bg_agents": 0, "turn_ended": False, "bg_launched_at": (),
+           # F5: the epoch of the turn_duration the two counts above ride, so
+           # `scan_sessions` can age them against `delegated_s` the way it ages
+           # `bg_launched_at`. None when the entry is undated (see there) or no
+           # turn_duration was in the tail. Pure function of the bytes, so the
+           # memo contract holds.
+           "delegated_at": None}
     pending = {}  # tool_use id -> tool name
     bg = {}       # tool_use id -> epoch of a background launch not yet reported
     for e in main:
@@ -559,6 +624,13 @@ def parse_session_tail(fp):
             # about the LATEST turn only, so a later `assistant` entry (the
             # agent speaking again) clears it below.
             out["turn_ended"] = True
+            # FRESHNESS.md §4.2: a tool_use cannot still be awaiting approval
+            # once the turn has closed — the harness would not have written this
+            # marker while a dialog was on screen. So a pending tool_use that
+            # outlived its turn (interrupted, and its `tool_result` never came)
+            # is expired here, positionally: anything still genuinely running is
+            # re-added by a later `tool_use` below.
+            pending.clear()
             # a turn that ended still awaiting workflows or background agents
             # ("✻ Waiting for 1 background agent to finish") is NOT the user's
             # turn — the harness resumes the session when they report back.
@@ -567,6 +639,7 @@ def parse_session_tail(fp):
             # stale one.
             out["pending_workflows"] = e.get("pendingWorkflowCount") or 0
             out["pending_bg_agents"] = e.get("pendingBackgroundAgentCount") or 0
+            out["delegated_at"] = _entry_ts(e)
         elif e.get("type") == "assistant":
             out["turn_ended"] = False    # the agent is talking again
         msg = e.get("message")
@@ -578,6 +651,13 @@ def parse_session_tail(fp):
                 b.get("text", "") for b in content
                 if isinstance(b, dict) and b.get("type") == "text"] if isinstance(content, list) else []
             for t in texts:
+                if _INTERRUPT in t:
+                    # FRESHNESS.md §4.2: an interrupted turn writes this marker
+                    # and NO `tool_result`, so the tool_use it cut off would sit
+                    # in `pending` for as long as the tail holds it — pinning
+                    # ● WORKING / ■ BLOCKED (or ▲ NEEDS ANSWER for an interrupted
+                    # AskUserQuestion) across every later turn. Expire it here.
+                    pending.clear()
                 prompt = _real_prompt(t)
                 if prompt:
                     out["last_user"] = prompt
@@ -606,7 +686,7 @@ def parse_session_tail(fp):
             for b in content:
                 if not isinstance(b, dict) or b.get("type") != "tool_result":
                     continue
-                pending.pop(b.get("tool_use_id"), None)
+                name = pending.pop(b.get("tool_use_id"), None)
                 # A background launch RESOLVES its tool_use immediately — the
                 # result is the harness's receipt, not the work — so it must be
                 # picked up here and not from `pending`, which is empty again
@@ -614,6 +694,15 @@ def parse_session_tail(fp):
                 # backgrounded agent looked idle.
                 text = _result_text(b)
                 if "<tool_use_error>" in text or not _BG_LAUNCHED.search(text):
+                    continue
+                # F3: the promise is necessary but not sufficient — a read-only
+                # tool's output that merely quotes it, or a launch-shaped phrase
+                # buried in a large blob, is content, not a receipt. Require a
+                # backgrounding tool AND a receipt-shaped phrase in a short
+                # result before this counts as a live delegation.
+                if name in _READONLY_TOOLS:
+                    continue
+                if len(text) > _BG_RECEIPT_MAX or not _BG_RECEIPT.search(text):
                     continue
                 launched = _entry_ts(e)
                 if launched is not None:
@@ -719,6 +808,30 @@ def _subagent_files(sub_dir, memo=None, now=0.0, read=True, write=True):
     return out
 
 
+def _tree_dir_keys(sub_dir):
+    """`{dir_path: (st_size, st_mtime_ns)}` for every directory in the tree.
+
+    A stat-only walk (no `.jsonl` mtimes, no memo) whose sole job is to say
+    whether the tree's DIRECTORY STRUCTURE moved across an audit — a file
+    created, removed or renamed bumps the holding directory's key. Cheap enough
+    to run twice on the 60 s cold lane; see `_subagent_files_audited`.
+    """
+    keys = {}
+    stack = [str(sub_dir)]
+    while stack:
+        d = stack.pop()
+        try:
+            st = os.stat(d)
+        except OSError:
+            continue
+        keys[d] = (st.st_size, st.st_mtime_ns)
+        ent = _dir_entries(d)
+        if ent is None:
+            continue
+        stack.extend(os.path.join(d, s) for s in ent[0])
+    return keys
+
+
 def _subagent_files_audited(sub_dir, now):
     """The cold path (§4.3 #1): re-read every directory for real, and count a
     disagreement with what the memo would have served into `_TREES.drift`.
@@ -726,11 +839,23 @@ def _subagent_files_audited(sub_dir, now):
     Only the SET OF FILES is compared, never their mtimes — the mtimes were
     never memoised, and the two walks stat them at two different instants, so
     an mtime that moved between them is a subagent writing, not a memo lying.
+
+    But the two walks are also taken at two different instants: a `*.jsonl`
+    created or removed BETWEEN them (the corpus grows ~1,000/day, peak 4,123)
+    makes `before != fresh` with no memo having lied — a false `tree_drift`
+    against the project's own alarm bell. So the comparison is gated on the
+    tree's directory structure being STABLE across the whole audit; if any
+    directory's stat key moved, the world moved under us and we do not judge
+    the memo on it. Skipping a real drift during a race is safe — a persistent
+    lie survives to the next clean sweep — but a false one is not (§80).
     """
+    keys_before = _tree_dir_keys(sub_dir)
     before = sorted(_tree_jsonl(sub_dir, _TREES, now, write=False))
     fresh = _subagent_files(sub_dir, memo=_TREES, now=now, read=False)
-    if before != sorted(str(p) for _, p in fresh):
-        _TREES.drift += 1
+    keys_after = _tree_dir_keys(sub_dir)
+    if (keys_before == keys_after
+            and before != sorted(str(p) for _, p in fresh)):
+        _TREES.bump_drift()
     return fresh
 
 
@@ -748,6 +873,7 @@ def _read_facts(fp):
             "pending_tools": tuple(tail["pending_tools"]),
             "pending_workflows": tail["pending_workflows"],
             "pending_bg_agents": tail["pending_bg_agents"],
+            "delegated_at": tail["delegated_at"],
             "bg_launched_at": tail["bg_launched_at"],
             "turn_ended": tail["turn_ended"],
             "last_assistant": tail["last_assistant"],
@@ -782,7 +908,7 @@ def _facts(fp, st, now, cold=False):
         after = None
     stable = after is not None and (after.st_size, after.st_mtime_ns) == key
     if stable and was is not None and was[0] == key and was[1] != val:
-        _FACTS.drift += 1
+        _FACTS.bump_drift()
     _FACTS.put(ident, key, val, now)
     return val
 
@@ -799,8 +925,19 @@ def _subagent_said(fp, st, now, cold=False):
         return val[0]
     was = _FACTS.peek(ident)
     val = (last_assistant_text(fp),)
-    if was is not None and was[0] == key and was[1] != val:
-        _FACTS.drift += 1
+    # Mirror `_facts`' post-read stability guard (F6): a subagent file is
+    # actively written during a workflow burst — exactly when the 60 s cold
+    # sweep is likeliest to interleave — so a size/mtime that moved between the
+    # read above and now means the file changed under us, and a difference is
+    # the world moving, not the memo lying. Without this re-stat, `was[0] == key`
+    # holds while `val` differs and a live append is counted as false drift.
+    try:
+        after = os.stat(fp)
+    except OSError:
+        after = None
+    stable = after is not None and (after.st_size, after.st_mtime_ns) == key
+    if stable and was is not None and was[0] == key and was[1] != val:
+        _FACTS.bump_drift()
     _FACTS.put(ident, key, val, now)
     return val[0]
 
@@ -875,6 +1012,21 @@ def scan_sessions(worktrees, all_procs, now, cold=False, hooks=None):
                     continue
                 tail = _facts(fp, st, now, cold)
                 cwd = tail["cwd"] or wt
+                # F5: the CLI's own end-of-turn counts get the SAME shelf life
+                # as a backgrounded tool_use. A turn that ended awaiting a
+                # workflow whose task was later killed or lost to a restart
+                # never gets a fresh turn_duration to zero the count, so trusting
+                # it unbounded pins the session ● WORKING for the life of the 48 h
+                # window — the failure `delegated_s` exists to prevent (§899).
+                # Applied here because here is where `now` is, exactly like
+                # `pending_bg_tools` below. An UNDATED turn_duration cannot be
+                # aged and degrades to the prior unbounded trust rather than
+                # silently dropping a live delegation.
+                deleg_at = tail["delegated_at"]
+                deleg_live = (deleg_at is None
+                              or now - deleg_at <= config.CFG["delegated_s"])
+                pend_wf = tail["pending_workflows"] if deleg_live else 0
+                pend_bg = tail["pending_bg_agents"] if deleg_live else 0
                 by_wt[wt].append({
                     "id": fp.stem[:8],
                     "sid": fp.stem,
@@ -898,8 +1050,8 @@ def scan_sessions(worktrees, all_procs, now, cold=False, hooks=None):
                     # value to every sweep that hits it, and a Snapshot is
                     # frozen — nothing on the wire may alias memo state.
                     "pending_tools": list(tail["pending_tools"]),
-                    "pending_workflows": tail["pending_workflows"],
-                    "pending_bg_agents": tail["pending_bg_agents"],
+                    "pending_workflows": pend_wf,
+                    "pending_bg_agents": pend_bg,
                     # The bound, applied here because here is where `now` is.
                     # An outstanding launch is evidence with a shelf life: 3.8 %
                     # of the 2,000 background launches on this corpus never
@@ -1008,13 +1160,21 @@ def scan_sessions(worktrees, all_procs, now, cold=False, hooks=None):
                     # The two sources disagreed and the better-ranked one did
                     # NOT win — §7.3 rule (2) fired, a veto. Counted, because
                     # that section promises a disagreement is VISIBLE; see
-                    # `_HOOK_VETOES`.
-                    _HOOK_VETOES[0] += 1
+                    # `_HOOK_VETOES`. Under its lock: this runs on the sweep
+                    # thread and on HTTP threads, and an unlocked bump is lost.
+                    with _HOOK_VETOES_LOCK:
+                        _HOOK_VETOES[0] += 1
             if tool_running:
                 s["tool_running"] = True
                 if shell_n and not s["pending_tools"]:
                     s["bg_shell"] = True     # transcript idle, shell alive
-        # severity, then freshest first — same inversion as the sort above
-        sessions.sort(key=lambda s: (rank[s["status"]], -s["last_write_at"]))
+        # severity, then freshest first — same inversion as the sort above.
+        # `rank.get`, not `rank[...]`: `classify_session` returns "unknown" when
+        # `procs_known=False` (a wholesale ps/lsof failure — the documented plan
+        # for that probe), and it is not in `rank`. An unranked status sorts
+        # LAST here (it cannot be reasoned about, so it is not urgent); `settle`
+        # in status.py handles the same vocabulary the other way for the bell.
+        sessions.sort(key=lambda s: (rank.get(s["status"], len(rank)),
+                                     -s["last_write_at"]))
         by_wt[wt] = sessions[: config.CFG["max_sessions"]]
     return by_wt
