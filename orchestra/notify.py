@@ -977,6 +977,11 @@ class Service:
                         if sink.name == "apns":
                             r = getattr(sink, "last", None)
                             auth.note_push(d["id"], r.status if r else "?", now)
+                            # Apple says this token is gone (410 / BadDeviceToken):
+                            # forget it, or it costs a POST every notification and
+                            # a strike with Apple for pushing to a dead token.
+                            if r is not None and r.gone:
+                                auth.forget_push(d["id"])
             return sent
 
     def pump(self, observer_mod, timeout=25.0):
@@ -1082,6 +1087,8 @@ def send_test(devid=None, now=None):
     wire = compose(ev, privacy="detail", server=service().server)
     r = sink.send(token, wire["payload"], environment=env, **wire["headers"])
     auth.note_push(d["id"], r.status, now)
+    if r.gone:
+        auth.forget_push(d["id"])       # a dead token never becomes live again
     health = sink.health() if hasattr(sink, "health") else {}
     return {"ok": r.ok, "backend": sink.name, "status": r.status,
             "apns_id": r.apns_id, "reason": r.reason,

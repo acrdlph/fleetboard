@@ -531,6 +531,31 @@ def note_push(devid, status, now=None):
             pass
 
 
+def forget_push(devid):
+    """Drop a device's push endpoint after APNs says the token is gone —
+    `410 Unregistered`, `BadDeviceToken`, `DeviceTokenNotForTopic` (`push.Result.
+    is_gone`). The DEVICE stays paired (its bearer token is untouched); only the
+    dead push token is removed, so it falls out of `push_devices()` and the
+    fan-out stops wasting a POST on it every notification — and Apple stops
+    seeing a client that repeatedly pushes to a token it already rejected.
+
+    Without this the registry only grows: a reinstalled app, a wiped simulator,
+    a stale token all linger forever. The app re-registers a fresh token on its
+    next launch, which lands as a new endpoint on the same device.
+    """
+    with _lock:
+        known, error = load_registry()
+        if error or devid not in known or not known[devid].get("push"):
+            return False
+        devices_ = {k: dict(v) for k, v in known.items()}
+        devices_[devid].pop("push", None)
+        try:
+            _write_registry(devices_)
+            return True
+        except OSError:
+            return False
+
+
 def push_devices():
     """Every registered device that has a push endpoint, hashes stripped —
     the fan-out set for the notifier."""

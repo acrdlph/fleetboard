@@ -988,3 +988,21 @@ class TestFacade(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestGoneTokenIsForgotten(unittest.TestCase):
+    """A token Apple rejects as gone (410 / BadDeviceToken) must be removed, or
+    the fan-out wastes a POST on it forever and strikes with Apple. Regression
+    guard for the day the registry filled with dead simulator/test tokens and
+    send_test kept hitting one instead of the real phone."""
+
+    def test_gone_reasons_are_recognised(self):
+        import orchestra.push as push
+        for reason in ("Unregistered", "BadDeviceToken", "DeviceTokenNotForTopic"):
+            r = push.Response(status=400, reason=reason, apns_id="x")
+            self.assertTrue(r.gone, f"{reason} should count as gone")
+        self.assertTrue(push.Response(status=410, reason="Unregistered", apns_id="x").gone)
+        self.assertFalse(push.Response(status=200, reason=None, apns_id="x").gone,
+                         "a delivered push is not gone")
+        self.assertFalse(push.Response(status=400, reason="PayloadTooLarge", apns_id="x").gone,
+                         "a fixable 400 is not gone")
