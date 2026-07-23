@@ -194,7 +194,10 @@ def send_to_process(pid, text, **ident):
         return refusal
     if proc.get("tmux_target"):
         sock = ["-L", proc["tmux_sock"]] if proc["tmux_sock"] else []
-        rc1, _ = shell.run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "-l", text])
+        # `--` ends option parsing: without it a dash-leading message ('-l ok',
+        # '-N 30 y') is read as more send-keys flags — the send errors out, or
+        # types something else entirely. tmux flag injection, not shell.
+        rc1, _ = shell.run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "-l", "--", text])
         rc2, _ = shell.run(["tmux"] + sock + ["send-keys", "-t", proc["tmux_target"], "Enter"])
         ok = rc1 == 0 and rc2 == 0
         return {"ok": ok, "message": "sent via tmux" if ok else "tmux send-keys failed"}

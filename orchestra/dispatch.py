@@ -30,6 +30,7 @@ deliberately NOT re-exported by the facade — reach it as `dispatch.DISPATCH_LO
 """
 
 import json
+import os
 import re
 import shlex
 import threading
@@ -96,17 +97,68 @@ def read_dispatch_log(limit=25):
     return {"entries": rows[-limit:][::-1]}
 
 
-def _pick_defaults(model=None):
+# ---- resource locks (ARCHITECTURE.md §5.6) -----------------------------
+# Idempotency stops a retry; these stop a double-tap. `_wt_reservations`
+# holds a worktree for one in-flight dispatch: the picker subtracts every
+# live hold from the free list, an explicitly named worktree takes the same
+# hold synchronously in the accept path, and the TTL is the crash net — a
+# launched agent registers as busy well within it, a worker that died
+# without settling frees the worktree by itself.
+_pick_lock = threading.Lock()      # guards _wt_reservations; held microseconds
+_wt_reservations = {}              # worktree name -> epoch when the hold expires
+WT_RESERVE_TTL_S = 60.0
+
+# Any tmux paste holds this lock and names a per-op buffer. With one shared
+# buffer name and no lock, A sets, B overwrites, and A pastes B's brief into
+# an agent running --dangerously-skip-permissions — §5.6 calls that hazard
+# 'subtle and severe', and it is the cross-agent one.
+_tmux_buf_lock = threading.Lock()
+_buf_seq = [0]
+
+
+def _reserve_worktree(name, now=None):
+    """Hold `name` against every other in-flight dispatch (§5.6). Non-blocking:
+    False means someone else's hold is still live and the caller must refuse
+    cleanly rather than launch a second agent into the same worktree."""
+    now = time.time() if now is None else now
+    with _pick_lock:
+        if _wt_reservations.get(name, 0) > now:
+            return False
+        _wt_reservations[name] = now + WT_RESERVE_TTL_S
+    return True
+
+
+def _release_worktree(name):
+    with _pick_lock:
+        _wt_reservations.pop(name, None)
+
+
+def _pick_defaults(model=None, pick_worktree=True):
     """Deterministic auto-picks, no AI in the loop: the cleanest FREE worktree,
     and the account with the most headroom that can actually run `model`
     (falling back to overall headroom when none clears its reserve — that only
-    happens on a forced model, where the user already chose to push through)."""
+    happens on a forced model, where the user already chose to push through).
+
+    The worktree pick is the §5.6 race that must not be missed: a freshly
+    dispatched agent takes ~30 s to register as busy, so two auto-picks off
+    the same snapshot would both choose the same cleanest-free worktree. The
+    pick therefore happens under the global pick lock, subtracts every live
+    reservation from the free list, and reserves its choice before releasing;
+    the caller releases the hold on failure and the TTL covers success."""
     state = observer.cached_state()
     limits.cached_limits()  # ensure the account picker isn't working from a cold cache
     by_acct = limits.limits_by_account()   # local rename: `limits` is a module now
-    free = [w for w in state["worktrees"] if w["availability"] == "free"]
-    free.sort(key=lambda w: (w["git"]["dirty"] or 0))
-    wt = free[0]["name"] if free else None
+    wt = None
+    if pick_worktree:
+        now = time.time()
+        with _pick_lock:
+            reserved = {n for n, exp in _wt_reservations.items() if exp > now}
+            free = [w for w in state["worktrees"]
+                    if w["availability"] == "free" and w["name"] not in reserved]
+            free.sort(key=lambda w: (w["git"]["dirty"] or 0))
+            wt = free[0]["name"] if free else None
+            if wt:
+                _wt_reservations[wt] = now + WT_RESERVE_TTL_S
     acct = None
     if model:
         acct = next((c["label"] for c in limits.model_candidates(model) if c["ok"]), None)
@@ -166,6 +218,15 @@ def start_dispatch(mission, worktree=None, account=None,
                     "can_opus": bool(best_opus),
                     "opus_account": best_opus["label"] if best_opus else None,
                     "opus_left": best_opus["remaining"] if best_opus else None}
+    # §5.6: the worktree lock, taken synchronously in the accept path — a
+    # second dispatch (or ✓ finish's headless fallback) aimed at the same
+    # worktree gets a clean refusal here, not a second agent thirty seconds
+    # later. Auto-picks (worktree=None) reserve inside _pick_defaults instead,
+    # under the same lock.
+    if worktree and not _reserve_worktree(worktree):
+        return {"ok": False, "message":
+                f"a dispatch is already in flight for {worktree} — "
+                "wait for it to settle, then retry"}
     _job_seq[0] += 1
     job_id = "job-" + time.strftime("%H%M%S") + f"-{_job_seq[0]}"
     job = {"progress": [], "done": False, "result": None}
@@ -205,10 +266,23 @@ def deliver_text(name, text):
     """Put `text` into a fleet tmux session's claude composer and press Enter
     until the send is proven (see kickoff_sent). Pasting atomically (bracketed,
     via a tmux buffer) sidesteps the CLI's paste heuristic, which chops a rapid
-    send-keys burst into '[Pasted text #N]' chips that swallow the Enter."""
-    shell.run(["tmux", "-L", FLEET_SOCK, "set-buffer", "-b", "orchestra-kickoff", text])
-    shell.run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
-               "-b", "orchestra-kickoff", "-t", name])
+    send-keys burst into '[Pasted text #N]' chips that swallow the Enter.
+
+    The buffer is per-op-named and set+paste happen under one global lock
+    (§5.6): with the old shared name and no lock, dispatch A set the buffer,
+    dispatch B overwrote it, and A pasted B's brief into A's agent. The `--`
+    stops tmux reading a dash-leading brief as more flags, and a failed paste
+    returns False — pressing Enter on a composer the text never reached would
+    submit whatever IS there."""
+    with _tmux_buf_lock:
+        _buf_seq[0] += 1
+        buf = f"orc-{os.getpid()}-{_buf_seq[0]}"
+        rc_set, _ = shell.run(["tmux", "-L", FLEET_SOCK, "set-buffer",
+                               "-b", buf, "--", text])
+        rc_paste, _ = shell.run(["tmux", "-L", FLEET_SOCK, "paste-buffer", "-p", "-d",
+                                 "-b", buf, "-t", name])
+    if rc_set != 0 or rc_paste != 0:
+        return False
     time.sleep(1)
     for _ in range(3):
         shell.run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name, "Enter"])
@@ -273,115 +347,128 @@ def closeout_shell(home, model, brief, trunk):
 def _run_dispatch(job, mission, worktree, account, model, effort,
                   closeout_trunk=None):
     def finish(result):
+        # §5.6: a dispatch that failed releases its worktree hold; one that
+        # launched leaves the TTL to lapse — by then the agent reads as busy.
+        # `worktree` is the closure's live binding, so an auto-picked (and
+        # reserved) worktree is released the same as an explicitly named one.
+        if worktree and not result.get("ok"):
+            _release_worktree(worktree)
         with _jobs_lock:
             job["result"] = result
             job["done"] = True
 
-    if config.DEMO:
-        return finish({"ok": False, "message": "demo mode — dispatch disabled"})
-    mission = (mission or "").strip()
-    if not mission:
-        return finish({"ok": False, "message": "empty mission"})
+    try:
+        if config.DEMO:
+            return finish({"ok": False, "message": "demo mode — dispatch disabled"})
+        mission = (mission or "").strip()
+        if not mission:
+            return finish({"ok": False, "message": "empty mission"})
 
-    if not (worktree and account):
-        dw, da = _pick_defaults(model)
-        worktree, account = worktree or dw, account or da
-        _log(job, f"① picked → {worktree} · [{account}] "
-                  "(cleanest free worktree · most model headroom)")
-    if not worktree:
-        return finish({"ok": False, "message": "no free worktree available"})
-    if not account:
-        return finish({"ok": False, "message": "every account is exhausted"})
-    wt = next((w for w in gitrepo.discover_worktrees() if w["name"] == worktree), None)
-    if not wt:
-        return finish({"ok": False, "message": f"unknown worktree {worktree}"})
-    home = next((h for h in transcripts.claude_homes()
-                 if config.account_label(h) == account), None)
-    if not home:
-        return finish({"ok": False, "message": f"unknown account {account}"})
+        if not (worktree and account):
+            dw, da = _pick_defaults(model, pick_worktree=not worktree)
+            worktree, account = worktree or dw, account or da
+            _log(job, f"① picked → {worktree} · [{account}] "
+                      "(cleanest free worktree · most model headroom)")
+        if not worktree:
+            return finish({"ok": False, "message": "no free worktree available"})
+        if not account:
+            return finish({"ok": False, "message": "every account is exhausted"})
+        wt = next((w for w in gitrepo.discover_worktrees() if w["name"] == worktree), None)
+        if not wt:
+            return finish({"ok": False, "message": f"unknown worktree {worktree}"})
+        home = next((h for h in transcripts.claude_homes()
+                     if config.account_label(h) == account), None)
+        if not home:
+            return finish({"ok": False, "message": f"unknown account {account}"})
 
-    if closeout_trunk:
-        # One-shot closeout: no branch header (the branch IS the mission), no
-        # effort dance (a headless run takes no slash commands). The wrapper
-        # verifies the landing itself — see closeout_shell.
-        name = ("closeout-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree)
-                .strip("-").lower() + time.strftime("-%H%M%S"))
-        _log(job, f"② launching one-shot closeout {name}…")
+        if closeout_trunk:
+            # One-shot closeout: no branch header (the branch IS the mission), no
+            # effort dance (a headless run takes no slash commands). The wrapper
+            # verifies the landing itself — see closeout_shell.
+            name = ("closeout-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree)
+                    .strip("-").lower() + time.strftime("-%H%M%S"))
+            _log(job, f"② launching one-shot closeout {name}…")
+            rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
+                                 "-c", wt["path"],
+                                 closeout_shell(home, model, mission, closeout_trunk)])
+            if rc != 0:
+                return finish({"ok": False,
+                               "message": f"tmux failed: {out or 'is tmux installed?'}"})
+            _append_log(session=name, worktree=worktree, account=account,
+                        model=model, closeout=True, mission_original=mission,
+                        kickoff=mission)
+            _log(job, "✓ launched")
+            return finish({"ok": True, "message":
+                           f"one-shot closeout running in {worktree} on [{account}] — "
+                           "the card frees itself once the landing verifies; if it "
+                           "can't land, the session stays open and needs you",
+                           "session": name, "worktree": worktree, "account": account,
+                           "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
+
+        # branch naming is the agent's call — it reads the mission and knows best
+        header = ("If this worktree's current branch is not the right home for this "
+                  "work, check out an appropriately named new branch from latest "
+                  "origin/main first. ")
+        kickoff = (header + "Commit as you go. Your mission, in the author's own "
+                   "words: " + mission)
+
+        name = "mission-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower() \
+               + time.strftime("-%H%M%S")
+        model_flag = f" --model {shlex.quote(model)}" if model else ""
+        shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
+                     f"exec claude --dangerously-skip-permissions"
+                     f"{model_flag}{_hook_flag()}")
+        _log(job, f"② creating tmux session {name}…")
         rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
-                             "-c", wt["path"],
-                             closeout_shell(home, model, mission, closeout_trunk)])
+                             "-c", wt["path"], shell_cmd])
         if rc != 0:
-            return finish({"ok": False,
-                           "message": f"tmux failed: {out or 'is tmux installed?'}"})
-        _append_log(session=name, worktree=worktree, account=account,
-                    model=model, closeout=True, mission_original=mission,
-                    kickoff=mission)
-        _log(job, "✓ launched")
-        return finish({"ok": True, "message":
-                       f"one-shot closeout running in {worktree} on [{account}] — "
-                       "the card frees itself once the landing verifies; if it "
-                       "can't land, the session stays open and needs you",
-                       "session": name, "worktree": worktree, "account": account,
-                       "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
+            return finish({"ok": False, "message": f"tmux failed: {out or 'is tmux installed?'}"})
+        brief = re.sub(r"\s*\n\s*", " ", kickoff).strip()
 
-    # branch naming is the agent's call — it reads the mission and knows best
-    header = ("If this worktree's current branch is not the right home for this "
-              "work, check out an appropriately named new branch from latest "
-              "origin/main first. ")
-    kickoff = (header + "Commit as you go. Your mission, in the author's own "
-               "words: " + mission)
+        def keys(*args):
+            shell.run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name] + list(args))
 
-    name = "mission-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower() \
-           + time.strftime("-%H%M%S")
-    model_flag = f" --model {shlex.quote(model)}" if model else ""
-    shell_cmd = (f"CLAUDE_CONFIG_DIR={shlex.quote(str(home))} "
-                 f"exec claude --dangerously-skip-permissions"
-                 f"{model_flag}{_hook_flag()}")
-    _log(job, f"② creating tmux session {name}…")
-    rc, out = shell.run(["tmux", "-L", FLEET_SOCK, "new-session", "-d", "-s", name,
-                         "-c", wt["path"], shell_cmd])
-    if rc != 0:
-        return finish({"ok": False, "message": f"tmux failed: {out or 'is tmux installed?'}"})
-    brief = re.sub(r"\s*\n\s*", " ", kickoff).strip()
+        _log(job, "③ booting claude…")
+        time.sleep(6)
+        effort_confirmed = None
+        if effort:
+            _log(job, f"④ setting effort {effort}…")
+            keys("-l", "--", f"/effort {effort}")
+            keys("Enter")
+            time.sleep(3)
+            _, pane = shell.run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
+            effort_confirmed = "set effort level" in pane.lower()
+            _log(job, "  effort " + ("confirmed ✓" if effort_confirmed else "UNCONFIRMED ⚠"))
+            if not effort_confirmed:
+                keys("Escape")
+                time.sleep(1)
+        _log(job, "⑤ sending kickoff brief…")
+        kick_sent = deliver_text(name, brief)
+        _log(job, "  kickoff " + ("sent ✓" if kick_sent
+                                  else "UNCONFIRMED ⚠ — attach and press Enter"))
 
-    def keys(*args):
-        shell.run(["tmux", "-L", FLEET_SOCK, "send-keys", "-t", name] + list(args))
-
-    _log(job, "③ booting claude…")
-    time.sleep(6)
-    effort_confirmed = None
-    if effort:
-        _log(job, f"④ setting effort {effort}…")
-        keys("-l", f"/effort {effort}")
-        keys("Enter")
-        time.sleep(3)
-        _, pane = shell.run(["tmux", "-L", FLEET_SOCK, "capture-pane", "-p", "-t", name])
-        effort_confirmed = "set effort level" in pane.lower()
-        _log(job, "  effort " + ("confirmed ✓" if effort_confirmed else "UNCONFIRMED ⚠"))
-        if not effort_confirmed:
-            keys("Escape")
-            time.sleep(1)
-    _log(job, "⑤ sending kickoff brief…")
-    kick_sent = deliver_text(name, brief)
-    _log(job, "  kickoff " + ("sent ✓" if kick_sent
-                              else "UNCONFIRMED ⚠ — attach and press Enter"))
-
-    # audit trail: every dispatch, with the author's original words
-    _append_log(session=name, worktree=worktree, account=account, model=model,
-                effort=effort, mission_original=mission, kickoff=kickoff)
-    effort_note = ""
-    if effort:
-        effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")
-    kick_note = "" if kick_sent else \
-        " · ⚠ kickoff UNCONFIRMED — attach and press Enter"
-    _log(job, "✓ launched" if kick_sent else "⚠ launched, kickoff unconfirmed")
-    finish({"ok": True,
-            "message": f"launched {name} in {worktree} on [{account}]"
-                       + (f" · {model}" if model else "") + effort_note + kick_note,
-            "session": name, "worktree": worktree, "account": account,
-            "model": model, "effort": effort, "effort_confirmed": effort_confirmed,
-            "kickoff_sent": kick_sent, "kickoff": kickoff,
-            "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
+        # audit trail: every dispatch, with the author's original words
+        _append_log(session=name, worktree=worktree, account=account, model=model,
+                    effort=effort, mission_original=mission, kickoff=kickoff)
+        effort_note = ""
+        if effort:
+            effort_note = f" · effort {effort} " + ("✓" if effort_confirmed else "UNCONFIRMED")
+        kick_note = "" if kick_sent else \
+            " · ⚠ kickoff UNCONFIRMED — attach and press Enter"
+        _log(job, "✓ launched" if kick_sent else "⚠ launched, kickoff unconfirmed")
+        finish({"ok": True,
+                "message": f"launched {name} in {worktree} on [{account}]"
+                           + (f" · {model}" if model else "") + effort_note + kick_note,
+                "session": name, "worktree": worktree, "account": account,
+                "model": model, "effort": effort, "effort_confirmed": effort_confirmed,
+                "kickoff_sent": kick_sent, "kickoff": kickoff,
+                "attach": f"tmux -L {FLEET_SOCK} attach -t {name}"})
+    except Exception as e:
+        # a dying worker must still settle the job — and, through finish's
+        # release, free the worktree hold — or the board polls forever and
+        # the worktree stays reserved until the TTL. §5.6: every lock
+        # released on every path.
+        finish({"ok": False, "message": f"dispatch failed: {e}"})
 
 
 def dispatch_status(job_id):

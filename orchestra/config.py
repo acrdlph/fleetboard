@@ -442,15 +442,24 @@ def load_config(argv=None):
     for p in candidates:
         if p.is_file():
             try:
-                CFG.update(json.loads(p.read_text()))
+                parsed = json.loads(p.read_text())
             except (ValueError, OSError) as e:
                 sys.exit(f"orchestra: bad config {p}: {e}")
+            # A top-level value that is not an object (`42`, `[...]`) would make
+            # `CFG.update` raise a raw TypeError at boot; refuse it with the
+            # same friendly message the syntax errors get.
+            if not isinstance(parsed, dict):
+                sys.exit(f"orchestra: bad config {p}: top-level value must be a JSON object")
+            CFG.update(parsed)
             CONFIG_PATH = p
             break
     if CONFIG_PATH is None:  # where a UI edit will create/persist config
         CONFIG_PATH = Path(args.config) if args.config else HERE / "orchestra.config.json"
     if os.environ.get("ORCHESTRA_PORT"):
-        CFG["port"] = int(os.environ["ORCHESTRA_PORT"])
+        try:
+            CFG["port"] = int(os.environ["ORCHESTRA_PORT"])
+        except ValueError:
+            sys.exit(f"orchestra: bad ORCHESTRA_PORT {os.environ['ORCHESTRA_PORT']!r}: not a number")
     if args.root: CFG["roots"] = args.root
     if args.pattern is not None: CFG["pattern"] = args.pattern
     if args.home: CFG["homes"] = args.home
@@ -469,6 +478,15 @@ def load_config(argv=None):
     # `is not None`, not truthiness: `--idle-s 0` is a spin loop and must reach
     # the loop as the mistake it is, not be silently ignored as a default.
     if args.idle_s is not None: CFG["idle_s"] = args.idle_s
+    # A bad `pattern` regex boots fine and then raises re.error inside
+    # discover_worktrees on every sweep — a permanently stale board with only a
+    # once-per-60s stderr line, a far worse failure than refusing to boot with a
+    # message. Compile it once here so the mistake surfaces at startup. The
+    # default "" and any valid regex compile silently.
+    try:
+        re.compile(CFG["pattern"])
+    except (re.error, TypeError) as e:
+        sys.exit(f"orchestra: bad pattern {CFG['pattern']!r}: {e}")
     return args
 
 

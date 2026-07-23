@@ -30,7 +30,9 @@ can be five minutes wrong with nothing on the payload to say so.
 """
 
 import json
+import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +43,19 @@ from . import config, shell
 
 LIMITS_TTL_S = 300.0           # cclimits --json (its own cache) at most this often
 _limits = {"t": 0.0, "data": None}
+
+# Single-flight + failure backoff for the cclimits cache. Shelling out to
+# cclimits "costs seconds" and must be rationed (module docstring): when the
+# TTL lapses, every concurrent /api/limits poll and dispatch preflight would
+# otherwise spawn its own 30 s subprocess. `_limits_lock` serialises the
+# check-then-fill; `_limits_flight["busy"]` lets the first caller fetch while
+# everyone else is served the stale value at once; `fail_t` records the last
+# failed fetch so a broken/offline cclimits is not re-spawned on every call.
+# The flight is separate from `_limits` because tests poke `_limits` directly.
+_limits_lock = threading.Lock()
+_limits_flight = {"busy": False, "fail_t": 0.0}
+_LIMITS_FAIL_BACKOFF_S = 30.0  # after a failed fetch, serve stale for this long
+_reserve_lock = threading.Lock()   # serialises set_reserve's read-merge-write
 
 
 def _cclimits_bin():
@@ -81,33 +96,82 @@ def _absolutise_resets(acc, fetched):
 
 def cached_limits(refresh=False):
     """Per-account usage limits via cclimits (github.com/acrdlph/cclimits).
-    Lazy + cached; a network refetch happens only on explicit refresh."""
+    Lazy + cached; a network refetch happens only on explicit refresh.
+
+    A TTL-lapse under load is single-flighted: the first stale caller shells
+    out while every concurrent caller is handed the stale payload immediately,
+    and a failed fetch is not retried for `_LIMITS_FAIL_BACKOFF_S`. An explicit
+    `refresh` bypasses both (the resume path needs the freshest word) and
+    fetches as it always did."""
     if config.DEMO:
         return demo_limits()
     now = time.time()
-    if not refresh and _limits["data"] is not None and now - _limits["t"] < LIMITS_TTL_S:
+    if refresh:
+        return _fetch_and_cache(refresh, now)
+    if _limits["data"] is not None and now - _limits["t"] < LIMITS_TTL_S:
         return _limits["data"]
+    with _limits_lock:
+        # Re-check under the lock: a flight that finished while we waited may
+        # have refreshed the cache or just failed, and either answer is served
+        # without a second subprocess.
+        if _limits["data"] is not None and now - _limits["t"] < LIMITS_TTL_S:
+            return _limits["data"]
+        if _limits_flight["busy"]:
+            return _limits["data"] or {"available": False, "error": "cclimits fetch in progress"}
+        if now - _limits_flight["fail_t"] < _LIMITS_FAIL_BACKOFF_S:
+            return _limits["data"] or {"available": False, "error": "cclimits failed (see terminal)"}
+        _limits_flight["busy"] = True
+    try:                          # fetch OUTSIDE the lock; finally always clears
+        return _fetch_and_cache(refresh, now)
+    finally:
+        with _limits_lock:
+            _limits_flight["busy"] = False
+
+
+def _fetch_and_cache(refresh, now):
+    """Shell out to cclimits, normalise the payload, and publish it.
+
+    cclimits' schema is not pinned here (module docstring), so the decoded
+    payload is normalised ONCE at this boundary and downstream readers
+    dereference it unguarded: it must be an object, an account without a usable
+    `config_dir` is dropped rather than crashing every sweep, and a null
+    `label` (upstream fields are "usually null") is coerced to "". A failed
+    fetch stamps `fail_t` so the caller's backoff engages."""
     binp = _cclimits_bin()
     if not binp:
         return {"available": False, "error": "cclimits not found — install github.com/acrdlph/cclimits"}
     cmd = [binp, "--json"] + (["--refresh"] if refresh else [])
     rc, out = shell.run(cmd, timeout=90 if refresh else 30)
     if rc != 0 or not out:
+        _limits_flight["fail_t"] = time.time()
         return _limits["data"] or {"available": False, "error": "cclimits failed (see terminal)"}
     try:
         data = json.loads(out)
     except ValueError:
+        _limits_flight["fail_t"] = time.time()
         return _limits["data"] or {"available": False, "error": "cclimits returned non-JSON"}
+    if not isinstance(data, dict):
+        _limits_flight["fail_t"] = time.time()
+        return _limits["data"] or {"available": False, "error": "cclimits returned a non-object payload"}
+    # Drop accounts we cannot key by config_dir, and pin each limit's label —
+    # this is what lets _model_remaining / model_candidates / limits_by_account
+    # touch acc["config_dir"] and l["label"] without one bad account 500ing a
+    # dispatch preflight or poisoning every observer sweep.
+    accounts = [a for a in (data.get("accounts") or [])
+                if isinstance(a, dict) and isinstance(a.get("config_dir"), str) and a["config_dir"]]
+    data["accounts"] = accounts
     data["available"] = True
     data["fetched_at"] = now
-    for acc in data.get("accounts", []):
+    for acc in accounts:
+        for l in acc.get("limits") or []:
+            if isinstance(l, dict):
+                l["label"] = l.get("label") or ""
         _absolutise_resets(acc, now)   # countdowns never leave this function
-        if acc.get("config_dir"):
-            label = config.account_label(Path(acc["config_dir"]))
-            r = account_reserve(label)
-            acc["fb_label"] = label   # orchestra's label (cclimits slug may differ)
-            acc["reserve_percent"] = r
-            acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
+        label = config.account_label(Path(acc["config_dir"]))
+        r = account_reserve(label)
+        acc["fb_label"] = label   # orchestra's label (cclimits slug may differ)
+        acc["reserve_percent"] = r
+        acc["reserve_blocked"] = r > 0 and (acc.get("headroom_percent") or 0) < r
     _limits["data"], _limits["t"] = data, now
     return data
 
@@ -176,21 +240,29 @@ def set_reserve(label, percent):
         percent = max(0, min(95, int(percent)))
     except (TypeError, ValueError):
         return {"ok": False, "error": "percent must be a number"}
-    rp = dict(config.CFG.get("reserve_percent") or {})
-    if percent == 0:
-        rp.pop(label, None)
-    else:
-        rp[label] = percent
-    config.CFG["reserve_percent"] = rp
-    # persist: merge into the on-disk config (create if missing)
-    try:
-        disk = {}
-        if config.CONFIG_PATH and config.CONFIG_PATH.is_file():
-            disk = json.loads(config.CONFIG_PATH.read_text())
-        disk["reserve_percent"] = rp
-        config.CONFIG_PATH.write_text(json.dumps(disk, indent=2) + "\n")
-    except (OSError, ValueError) as e:
-        return {"ok": False, "error": f"couldn't write config: {e}"}
+    # Serialise the whole read-merge-write: two concurrent POSTs (each its own
+    # ThreadingHTTPServer thread) would otherwise interleave and silently lose
+    # one account's reserve, and a crash mid-write would leave a truncated
+    # orchestra.config.json that load_config sys.exit()s on at every boot. Write
+    # to a temp file and os.replace() it into place, the pattern auth.py already
+    # uses (auth.py:379) for exactly this reason.
+    with _reserve_lock:
+        rp = dict(config.CFG.get("reserve_percent") or {})
+        if percent == 0:
+            rp.pop(label, None)
+        else:
+            rp[label] = percent
+        config.CFG["reserve_percent"] = rp
+        try:
+            disk = {}
+            if config.CONFIG_PATH and config.CONFIG_PATH.is_file():
+                disk = json.loads(config.CONFIG_PATH.read_text())
+            disk["reserve_percent"] = rp
+            tmp = config.CONFIG_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(disk, indent=2) + "\n")
+            os.replace(tmp, config.CONFIG_PATH)
+        except (OSError, ValueError) as e:
+            return {"ok": False, "error": f"couldn't write config: {e}"}
     # re-enrich cached limits so the change shows without a refetch
     data = _limits.get("data")
     if data and data.get("accounts"):

@@ -67,6 +67,8 @@ tests, so — the `resume.RESUME_STATE` rule, ADR 0010 — they are deliberately
 NOT re-exported by the facade. Reach them as `auth.REGISTRY`.
 """
 
+import contextlib
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -355,7 +357,16 @@ def load_registry(force=False):
                 for d in raw["devices"]:
                     if d.get("id") and d.get("token_sha256"):
                         devices[d["id"]] = d
-            except (OSError, ValueError, KeyError, TypeError) as e:
+            except (OSError, ValueError, KeyError, TypeError,
+                    AttributeError) as e:
+                # AttributeError is the structurally-corrupt case rule 6 missed:
+                # `{"devices": ["x"]}`, or a string, or a dict, are all valid
+                # JSON one bad hand-edit or partial write away, and `d.get(...)`
+                # on a non-dict raises here rather than in `json.loads`. Without
+                # it the exception escapes `check` into `parse_request` and every
+                # authenticated request dies with a per-request traceback and a
+                # dropped connection instead of the designed 503 — fail CLOSED,
+                # loudly, as a broken machine that says so.
                 devices, error = {}, f"{type(e).__name__}: {e}"
         _cache.update(key=key, devices=devices, error=error)
         return devices, error
@@ -381,6 +392,47 @@ def _write_registry(devices):
         _cache.update(key=_stat_key(REGISTRY), devices=devices, error=None)
 
 
+@contextlib.contextmanager
+def _registry_flock():
+    """A cross-process exclusive lock, held across one load-modify-write.
+
+    ARCHITECTURE.md §5.5 promises `--devices` / `--revoke ID` are file
+    operations under an flock. The in-process writers serialise on `_lock`, but
+    `--revoke-device` runs in a SEPARATE PROCESS, and every writer here is a
+    load-modify-whole-file-replace. Without a shared lock a server write whose
+    `load_registry()` ran BEFORE the CLI's `os.replace` and whose
+    `_write_registry()` lands AFTER it clobbers the revoked file with a
+    pre-revoke copy — the user sees 'revoked iPad' printed while the token keeps
+    working, the exact failure §5.5 names as the reason the flock exists. So a
+    writer takes this lock and re-reads with `load_registry(force=True)` inside
+    it, merging its change onto whatever the other process just wrote. `fcntl`
+    is stdlib, so this costs no dependency.
+
+    The lock lives on a sidecar `devices.lock` so it is never itself the file
+    being replaced. A registry we cannot even lock (its directory is gone, say)
+    is still written best-effort rather than raising — the callers that swallow
+    a write `OSError` must keep working, not die on the lock instead of the
+    write.
+    """
+    fd = None
+    try:
+        fd = os.open(REGISTRY.with_suffix(".lock"),
+                     os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def _hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -395,8 +447,8 @@ def add_device(label, now=None):
     someone who copies it gets a list of labels, not a way in.
     """
     now = time.time() if now is None else now
-    with _lock:
-        devices, error = load_registry()
+    with _lock, _registry_flock():
+        devices, error = load_registry(force=True)
         if error:
             raise ValueError(f"refusing to write over an unreadable registry "
                              f"({REGISTRY}): {error}")
@@ -419,8 +471,8 @@ def revoke_device(devid, now=None):
     what you want a stolen phone to cost.
     """
     now = time.time() if now is None else now
-    with _lock:
-        devices, error = load_registry()
+    with _lock, _registry_flock():
+        devices, error = load_registry(force=True)
         if error:
             raise ValueError(f"refusing to write over an unreadable registry "
                              f"({REGISTRY}): {error}")
@@ -454,12 +506,26 @@ def _touch(devid, now):
             return
         if (d.get("last_seen") or 0) + LAST_SEEN_S > now:
             return
-        devices_ = {k: dict(v) for k, v in known.items()}
-        devices_[devid]["last_seen"] = now
-        try:
-            _write_registry(devices_)
-        except OSError:
-            pass        # a registry that cannot be written still authenticates
+        # The window check above runs on every authenticated request, so it is
+        # deliberately OUTSIDE the flock — taking a cross-process file lock per
+        # request just to decide "nothing to write" is the disk-write-per-request
+        # this throttle exists to avoid. Only once a write is actually due do we
+        # lock, re-read under it, and merge onto whatever `--revoke-device` may
+        # have just written — otherwise this `last_seen` bump would clobber a
+        # revocation of the very device it is recording.
+        with _registry_flock():
+            known, error = load_registry(force=True)
+            d = known.get(devid)
+            if error or d is None:
+                return
+            if (d.get("last_seen") or 0) + LAST_SEEN_S > now:
+                return
+            devices_ = {k: dict(v) for k, v in known.items()}
+            devices_[devid]["last_seen"] = now
+            try:
+                _write_registry(devices_)
+            except OSError:
+                pass    # a registry that cannot be written still authenticates
 
 
 # The push sub-object's writable keys. A device may register ONLY its own push
@@ -488,8 +554,8 @@ def set_push(devid, fields, now=None):
     """
     now = time.time() if now is None else now
     clean = {k: v for k, v in (fields or {}).items() if k in PUSH_KEYS}
-    with _lock:
-        known, error = load_registry()
+    with _lock, _registry_flock():
+        known, error = load_registry(force=True)
         if error or devid not in known:
             return None
         devices_ = {k: dict(v) for k, v in known.items()}
@@ -517,8 +583,8 @@ def note_push(devid, status, now=None):
     a restore is otherwise indistinguishable from a quiet fleet, discovered a
     week late."""
     now = time.time() if now is None else now
-    with _lock:
-        known, error = load_registry()
+    with _lock, _registry_flock():
+        known, error = load_registry(force=True)
         if error or devid not in known or not known[devid].get("push"):
             return
         devices_ = {k: dict(v) for k, v in known.items()}
@@ -543,8 +609,8 @@ def forget_push(devid):
     a stale token all linger forever. The app re-registers a fresh token on its
     next launch, which lands as a new endpoint on the same device.
     """
-    with _lock:
-        known, error = load_registry()
+    with _lock, _registry_flock():
+        known, error = load_registry(force=True)
         if error or devid not in known or not known[devid].get("push"):
             return False
         devices_ = {k: dict(v) for k, v in known.items()}
@@ -618,6 +684,7 @@ def _reset_buckets():
     """Tests only — the budget is process-wide and outlives a test case."""
     with _lock:
         _buckets.clear()
+        _audit_suppress.clear()
 
 
 def _forget_registry():
@@ -696,6 +763,53 @@ def audit(**fields):
                 f.write(line)
     except OSError:
         pass
+
+
+# The audit log is append-only forever (there is no rotation), and its comment
+# above and ADR 0014 both promise the failure budget is what keeps that safe:
+# "the audit log cannot be flooded by an unauthenticated peer — the ceiling is
+# 10 lines/min/IP". That promise was NOT delivered — a 429-throttled peer still
+# wrote one line per request, and an unauthenticated pairing flood wrote two —
+# so an exhausted peer could pour tens of GB/day into `audit.log.jsonl` and bury
+# the eleven lines the log exists to preserve. This gate is the missing half.
+#
+# `outcome: "throttled"` is the one marker line a flooding peer buys: it is
+# written ONCE when the peer crosses from "has budget" to "exhausted", carries
+# the running count of what has been suppressed since, and then the peer is
+# silent in the log until its bucket refills enough to afford a real attempt
+# again — at which point the next line is preceded by the final suppressed count.
+AUDIT_THROTTLED = "audit_throttled"
+_audit_suppress = {}   # peer -> lines suppressed since its throttle marker
+
+
+def _audit_gate(peer, now):
+    """Whether a refusal/allow line for `peer` may be written to the log now.
+
+    Called wherever a line an off-machine peer can trigger at will is about to
+    be written — every `refuse`, the one unauthenticated `allow` (pairing), and
+    every `pairing.claim` refusal. It consults the SAME failure budget the
+    refusal spends from, so the two stay in step: while the peer has budget its
+    lines are written (that is the ~10 the ceiling allows), the moment it is
+    exhausted it gets one `throttled` marker and nothing after, and when the
+    bucket has refilled the next line flushes the suppressed count. `/api/health`
+    never reaches here — it is exempt ABOVE the budget on purpose.
+    """
+    with _lock:
+        if _budget(peer, now) >= 1.0:
+            n = _audit_suppress.pop(peer, None)
+            if n:
+                audit(at=now, peer=peer, outcome="throttled",
+                      code=AUDIT_THROTTLED, suppressed=n)
+            return True
+        if peer not in _audit_suppress:
+            # The crossing: one marker so a reader knows the silence that
+            # follows is a throttle and not the peer going away.
+            _audit_suppress[peer] = 0
+            audit(at=now, peer=peer, outcome="throttled",
+                  code=AUDIT_THROTTLED, suppressed=0)
+            return False
+        _audit_suppress[peer] += 1
+        return False
 
 
 def read_audit(limit=200):
@@ -927,9 +1041,15 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
     def refuse(status, code, message, retry_after=None, spend=1.0):
         if spend:
             _budget(peer, now, spend=spend)
-        audit(at=now, peer=peer, device=(presented or (None, None))[0],
-              label=None, method=method, path=path[:200], outcome="refuse",
-              code=code)
+        # Gated on the budget: an exhausted peer that keeps knocking is refused
+        # with a dict lookup, and MUST NOT buy a disk write per knock, or the
+        # "append-only forever" log becomes a disk-fill DoS that buries the
+        # evidence it exists for. `_audit_gate` writes one `throttled` marker at
+        # the crossing and then falls silent (ADR 0014's 10 lines/min/IP).
+        if _audit_gate(peer, now):
+            audit(at=now, peer=peer, device=(presented or (None, None))[0],
+                  label=None, method=method, path=path[:200], outcome="refuse",
+                  code=code)
         return Verdict(False, status, code, message, retry_after=retry_after)
 
     def browser_guards():
@@ -967,13 +1087,27 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
         # could only guess at the code, but "it would probably fail anyway" is
         # not how rule 6 reads.
         #
-        # It stays ABOVE the failure budget, which is what `/api/health` needs:
-        # the route you use to diagnose a credential must answer even to a peer
-        # that has burned its budget presenting the broken one.
+        # `GET /api/health` stays ABOVE the failure budget, which is what it
+        # needs: the route you use to diagnose a credential must answer even to
+        # a peer that has burned its budget presenting the broken one.
+        #
+        # `POST /api/v1/pair` does NOT get that exemption. It is an
+        # unauthenticated mutation an off-machine peer (T1, the threat model's
+        # primary attacker) can hammer, and ADR 0014 promised it would "inherit
+        # this bucket". So it consults the budget here — an exhausted peer is
+        # refused at the door with the same 429 as any other route, its own
+        # `pairing.claim` refusals spend from the bucket, and the two audit
+        # writes a claim used to cost per request stop the moment it is out of
+        # budget. That is what actually closes the pairing door at ~10/min/IP.
         blocked = browser_guards()
         if blocked:
             return blocked
-        if audited(method, path):
+        if method != "GET" and _budget(peer, now) < 1.0:
+            wait = _retry_after(peer, now)
+            return refuse(429, RATE_LIMITED,
+                          f"too many failed attempts from {peer}; try again in "
+                          f"{wait}s", retry_after=wait, spend=0)
+        if audited(method, path) and _audit_gate(peer, now):
             audit(at=now, peer=peer, device=None, label="unauthenticated",
                   method=method, path=path[:200], outcome="allow")
         return ALLOW_LOOPBACK

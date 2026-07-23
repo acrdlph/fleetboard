@@ -34,6 +34,8 @@ def read_chat(account, sid, limit=40):
             e = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(e, dict):        # a valid-JSON scalar/array line: 42, "s", [1]
+            continue
         if e.get("isSidechain") or e.get("isMeta"):
             continue
         msg = e.get("message")

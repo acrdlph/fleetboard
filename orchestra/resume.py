@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import threading
 import time
 
@@ -49,18 +50,47 @@ _resumes_lock = threading.Lock()
 
 
 def save_resumes():
+    """Persist the schedules — atomically, and serialized under the lock.
+
+    Snapshot AND write happen inside `_resumes_lock`: written outside it, a
+    writer holding an older snapshot could land after a newer one and persist
+    a schedule another thread had just canceled — which a restart would then
+    resurrect and fire unattended. And the write goes tmp + os.replace (the
+    auth registry / event log idiom) because a plain truncate-write killed
+    mid-flight — `./start.sh` restarts this server by design — leaves an
+    empty file, and load_resumes would silently drop every armed schedule."""
+    tmp = RESUME_STATE.with_name(RESUME_STATE.name + ".tmp")
     with _resumes_lock:
         snap = json.dumps({"schedules": list(_resumes.values())}, indent=1)
-    try:
-        RESUME_STATE.write_text(snap + "\n")
-    except OSError:
-        pass
+        try:
+            tmp.write_text(snap + "\n")
+            os.replace(tmp, RESUME_STATE)
+        except OSError as e:
+            # a persistent write failure must be visible, not swallowed —
+            # these are the unattended 3am keystrokes
+            print(f"orchestra: couldn't save {RESUME_STATE.name}: {e}",
+                  file=sys.stderr)
 
 
 def load_resumes():
     try:
-        data = json.loads(RESUME_STATE.read_text())
-    except (OSError, ValueError):
+        raw = RESUME_STATE.read_text()
+    except OSError:
+        return
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        # a corrupt file is evidence, not noise: set it aside and say so
+        # instead of silently discarding every armed schedule
+        if raw.strip():
+            try:
+                os.replace(RESUME_STATE,
+                           RESUME_STATE.with_name(RESUME_STATE.name + ".bad"))
+            except OSError:
+                pass
+            print(f"orchestra: {RESUME_STATE.name} was corrupt — moved aside "
+                  f"as {RESUME_STATE.name}.bad; armed resumes were lost",
+                  file=sys.stderr)
         return
     with _resumes_lock:
         for r in data.get("schedules", []):

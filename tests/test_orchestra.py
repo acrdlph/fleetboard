@@ -1461,7 +1461,7 @@ class TestSendIsIdentityAddressed(IdentityGuard):
         res = fb.send_to_process(4242, "hello", sid="s-alpha", account="main",
                                  worktree="alpha")
         self.assertTrue(res["ok"], res)
-        self.assertIn(["tmux", "send-keys", "-t", "sess:0.2", "-l", "hello"],
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.2", "-l", "--", "hello"],
                       self.typed)
 
     def test_a_recycled_pid_is_refused_not_delivered(self):
@@ -1493,7 +1493,7 @@ class TestSendIsIdentityAddressed(IdentityGuard):
         self.owners = {"s-alpha": 9999}
         res = fb.send_to_process(None, "hi", sid="s-alpha")
         self.assertTrue(res["ok"], res)
-        self.assertIn(["tmux", "send-keys", "-t", "sess:0.9", "-l", "hi"], self.typed)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.9", "-l", "--", "hi"], self.typed)
 
     def test_a_vanished_session_is_refused(self):
         self.owners = {}
@@ -1534,7 +1534,7 @@ class TestSendIsIdentityAddressed(IdentityGuard):
     def test_a_place_addressed_send_types_when_the_pid_stayed(self):
         res = fb.send_to_process(7777, "hi", worktree="beta")
         self.assertTrue(res["ok"], res)
-        self.assertIn(["tmux", "send-keys", "-t", "sess:0.7", "-l", "hi"], self.typed)
+        self.assertIn(["tmux", "send-keys", "-t", "sess:0.7", "-l", "--", "hi"], self.typed)
 
     def test_a_stale_tmux_pane_is_refused(self):
         # the corroborator: same pid, same worktree, different pane
@@ -2598,7 +2598,7 @@ class TestClaudeProcessesMemo(unittest.TestCase):
 
         self.plain = False           # stand in for a ps that refuses `lstart`
 
-        def run(cmd, cwd=None, timeout=6):
+        def run(cmd, cwd=None, timeout=6, env=None):
             if cmd[:2] == ["ps", "-axo"]:
                 if self.plain and "lstart=" in cmd[2]:
                     return 1, ""

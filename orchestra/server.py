@@ -49,6 +49,7 @@ from . import (config, auth, gitrepo, limits, observer, terminal, chat,
 MAX_SUBSCRIBERS = 32        # concurrent SSE streams; config key "sse_max_subscribers"
 KEEPALIVE_S = 25.0          # silence before a comment frame; key "sse_keepalive_s"
 LIVENESS_S = 1.0            # how often a silent stream checks its peer is there
+MAX_BODY = 256 * 1024       # the largest POST body this handler will read (ARCHITECTURE §5.7)
 
 # What one wait in the stream loop came back with. Three outcomes and not a
 # bool, because the third one is not the negation of either other: the version
@@ -133,6 +134,18 @@ class Handler(BaseHTTPRequestHandler):
     # Content-Length, and a version bump reaching a client's recv in 0.051 ms
     # (p50, one stream) — genuinely incremental. Do not "modernise" this.
     protocol_version = "HTTP/1.0"
+
+    # MANDATORY, not optional (ARCHITECTURE §5.7, API.md §13.1). `StreamRequest-
+    # Handler.setup` applies this via `settimeout`, so every connection gets a
+    # read/write deadline. Without it a peer that connects and never finishes a
+    # request line — a backgrounded phone, a dropped NAT flow, a slowloris from
+    # any tailnet peer — pins its worker thread in `rfile.readline()` forever,
+    # and `ThreadingHTTPServer` spawns those threads without bound until
+    # `RuntimeError: can't start new thread` (with `log_message` silenced, no
+    # diagnostic trail). On the stream path a write blocked past this raises
+    # `TimeoutError` (an `OSError`), which `_write` turns into a released slot
+    # rather than a thread pinned on a zero-window peer.
+    timeout = 30
 
 
     # ------------------------------------------------------------ the door
@@ -232,6 +245,18 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         self.close_connection = True
 
+    def send_response(self, *args, **kwargs):
+        """Every response in this handler starts here (so does `send_error`).
+
+        The dispatcher is wrapped in `try/except` and answers an unexpected
+        error with a 500 — but only if nothing has gone out yet. This is the
+        flag that tells it: once a status line is committed, a second one over
+        the top of it would be garbage, so the guard leaves the connection to
+        close instead.
+        """
+        self._answered = True
+        super().send_response(*args, **kwargs)
+
     def _json(self, status, payload):
         """One JSON answer with a real status code, then hang up.
 
@@ -273,146 +298,159 @@ class Handler(BaseHTTPRequestHandler):
             # §5.2). Every other route below falls out of the elif chain into a
             # shared `body = …` tail that ends in an unconditional
             # Content-Length — the one header a stream must never send, and the
-            # tail that makes all nine of the others work.
+            # tail that makes all nine of the others work. It is also the one
+            # branch OUTSIDE the guard below: a stream that has begun writing
+            # cannot be answered with a 500, and it owns its own failures.
             return self._sse()
-        if auth.admin("GET", self.path):
-            # The versioned surface starts here (ADR 0009). Everything else in
-            # this handler is the legacy unversioned board API and stays where
-            # it is; the routes born with pairing are born on `/api/v1`, which
-            # is what the Swift client will be written against.
-            #
-            # `auth.ADMIN` already refused every token holder before this line
-            # ran — `parse_request` is the seam — so reaching this branch means
-            # the caller is the Mac itself. It reads a list of every credential
-            # to this machine, which is why `auth.audited` logs it even though
-            # it is a GET.
-            #
-            # THE CONDITION IS `auth.admin` AND NOT A `startswith`, and that is
-            # the whole of a real hole. It used to read
-            # `self.path.startswith("/api/v1/devices")`, which is one character
-            # less strict than the guard: `_under_admin` stops at a SEGMENT
-            # boundary, so `/api/v1/devicesX` was not admin to `auth.check` and
-            # WAS the device list to this line. A phone with a perfectly valid
-            # token read the inventory of every credential to this machine, and
-            # `auth.audited` — asking the same segment-aware question — did not
-            # log it. Each half had a test and neither could see the gap.
-            #
-            # So the router and the guard now consult the SAME function. They
-            # cannot drift, because there is only one answer to drift from.
-            # API.md §2.3 step 5 said this all along: `/api/v1` resolves by
-            # exact match on the path without its query, no prefix routing.
-            return self._json(200, {"ok": True, "devices": auth.devices(),
-                                    "pairing": pairing.state()})
-        if self.path.startswith("/api/health"):
-            # The one route that answers without a token (auth.EXEMPT), so it
-            # is also the one route whose payload is a security decision. It
-            # says a server that speaks this protocol is alive here and what
-            # its clock reads — and NOTHING that varies with what the fleet is
-            # doing: no counts, no worktrees, no hostname, no device list, not
-            # even whether any device is registered. The clock is the point:
-            # every other route's timestamps are unreadable to a client whose
-            # own clock is wrong, and diagnosing that must not require the
-            # credential you are trying to diagnose.
-            body = json.dumps({"ok": True, "service": "orchestra",
-                               "api": "1.0", "time": time.time()}).encode()
-            ctype = "application/json"
-        elif self.path.startswith("/api/state"):
-            # schedules ride along so the board needs no second fetch
-            body = json.dumps({**observer.cached_state(),
-                               "resumes": resume.resume_public()}).encode()
-            ctype = "application/json"
-        elif self.path.startswith("/api/focus"):
-            q = _query(self.path)
-            m = re.search(r"pid=(\d+)", self.path)
-            # the pid is a hint; wt/sid/cwd/tmux/tty are the address (ADR 0008)
-            result = terminal.focus_process(
-                int(m.group(1)) if m else None,
-                sid=q.get("sid"), account=q.get("account"),
-                worktree=q.get("wt"), cwd=q.get("cwd"),
-                tmux=q.get("tmux"), tty=q.get("tty"))
-            body = json.dumps(result).encode()
-            ctype = "application/json"
-        elif self.path.startswith("/api/topology"):
-            body = json.dumps(gitrepo.cached_topology()).encode()
-            ctype = "application/json"
-        elif self.path.startswith("/api/limits"):
-            body = json.dumps(limits.cached_limits(refresh="refresh=1" in self.path)).encode()
-            ctype = "application/json"
-        elif self.path.startswith("/api/dispatchlog"):
-            body = json.dumps(dispatch.read_dispatch_log()).encode()
-            ctype = "application/json"
-        elif self.path.startswith("/api/dispatch/status"):
-            m = re.search(r"job=([\w-]+)", self.path)
-            body = json.dumps(dispatch.dispatch_status(m.group(1)) if m
-                              else {"ok": False, "error": "no job"}).encode()
-            ctype = "application/json"
-        elif self.path.startswith("/api/chat"):
-            qa = re.search(r"account=([^&]+)", self.path)
-            qs = re.search(r"sid=([0-9a-fA-F-]+)", self.path)
-            result = chat.read_chat(qa.group(1), qs.group(1)) if qa and qs else \
-                {"ok": False, "error": "need account & sid"}
-            body = json.dumps(result).encode()
-            ctype = "application/json"
-        elif _v1_match(self.path, "/api/v1/events"):
-            # The durable side of push (API.md §9.22). Push is lossy; this is
-            # not, so the phone reconciles against it on every foreground — and
-            # /events/open is the withdrawal route that stops a resolved
-            # question sitting on the lock screen forever. Matched at a SEGMENT
-            # boundary, never by `startswith` — API.md §2.3 "no prefix routing",
-            # so `/api/v1/eventsX` is a 404 and not this route (the same hole
-            # `/api/v1/devicesX` was, pinned by test_no_v1_route_can_be_reached
-            # _by_a_suffix).
-            body = json.dumps(self._events_get()).encode()
-            ctype = "application/json"
-        elif self.path.split("?", 1)[0] == "/api/v1/push/status":
-            # What the settings screen shows: is push configured, what did the
-            # last send return, when. `push.sink().health()` says exactly which
-            # piece is missing when it is not ready — a NoopSink names the
-            # config key, an APNsSink names a bad Key ID or a missing binary.
-            from . import push as pushmod
-            dev = getattr(self, "device", None)
-            body = json.dumps({"ok": True, "push": pushmod.sink().health(),
-                               "registered": bool(dev and auth.get_push(dev["id"]))
-                               if dev else False}).encode()
-            ctype = "application/json"
-        elif self.path.split("?", 1)[0] in ("/", "/index", "/index.html"):
-            body = (config.HERE / "index.html").read_bytes()
-            ctype = "text/html; charset=utf-8"
-        elif self.path.split("?", 1)[0] == "/stream.js":
-            # The SharedWorker that holds the board's ONE EventSource, and the
-            # reason it is a route rather than a Blob URL: a SharedWorker's
-            # identity is (origin, script URL, name), and a Blob URL is unique
-            # per document — every tab would get its OWN worker, its own stream,
-            # and the six-connection ceiling this exists to stay under
-            # (ENGINE.md §5.4). A stable path is what makes it shared.
-            body = (config.HERE / "stream.js").read_bytes()
-            ctype = "application/javascript; charset=utf-8"
-        elif self.path.startswith("/map"):
-            body = (config.HERE / "map.html").read_bytes()
-            ctype = "text/html; charset=utf-8"
-        elif self.path.startswith("/limits"):
-            body = (config.HERE / "limits.html").read_bytes()
-            ctype = "text/html; charset=utf-8"
-        elif self.path.startswith("/guide"):
-            body = (config.HERE / "guide.html").read_bytes()
-            ctype = "text/html; charset=utf-8"
-        elif self.path.startswith("/pair"):
-            # Served like every other page: from disk, on every request, so an
-            # edit shows up on reload. It carries no secret of its own — the
-            # code and the QR arrive from `/api/v1/devices/pair/open`, which is
-            # a POST, so merely LOADING this page cannot open a pairing window.
-            # That distinction is the reason it is not a GET.
-            body = (config.HERE / "pair.html").read_bytes()
-            ctype = "text/html; charset=utf-8"
-        else:
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            if auth.admin("GET", self.path):
+                # The versioned surface starts here (ADR 0009). Everything else in
+                # this handler is the legacy unversioned board API and stays where
+                # it is; the routes born with pairing are born on `/api/v1`, which
+                # is what the Swift client will be written against.
+                #
+                # `auth.ADMIN` already refused every token holder before this line
+                # ran — `parse_request` is the seam — so reaching this branch means
+                # the caller is the Mac itself. It reads a list of every credential
+                # to this machine, which is why `auth.audited` logs it even though
+                # it is a GET.
+                #
+                # THE CONDITION IS `auth.admin` AND NOT A `startswith`, and that is
+                # the whole of a real hole. It used to read
+                # `self.path.startswith("/api/v1/devices")`, which is one character
+                # less strict than the guard: `_under_admin` stops at a SEGMENT
+                # boundary, so `/api/v1/devicesX` was not admin to `auth.check` and
+                # WAS the device list to this line. A phone with a perfectly valid
+                # token read the inventory of every credential to this machine, and
+                # `auth.audited` — asking the same segment-aware question — did not
+                # log it. Each half had a test and neither could see the gap.
+                #
+                # So the router and the guard now consult the SAME function. They
+                # cannot drift, because there is only one answer to drift from.
+                # API.md §2.3 step 5 said this all along: `/api/v1` resolves by
+                # exact match on the path without its query, no prefix routing.
+                return self._json(200, {"ok": True, "devices": auth.devices(),
+                                        "pairing": pairing.state()})
+            if self.path.startswith("/api/health"):
+                # The one route that answers without a token (auth.EXEMPT), so it
+                # is also the one route whose payload is a security decision. It
+                # says a server that speaks this protocol is alive here and what
+                # its clock reads — and NOTHING that varies with what the fleet is
+                # doing: no counts, no worktrees, no hostname, no device list, not
+                # even whether any device is registered. The clock is the point:
+                # every other route's timestamps are unreadable to a client whose
+                # own clock is wrong, and diagnosing that must not require the
+                # credential you are trying to diagnose.
+                body = json.dumps({"ok": True, "service": "orchestra",
+                                   "api": "1.0", "time": time.time()}).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/api/state"):
+                # schedules ride along so the board needs no second fetch
+                body = json.dumps({**observer.cached_state(),
+                                   "resumes": resume.resume_public()}).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/api/focus"):
+                q = _query(self.path)
+                m = re.search(r"pid=(\d+)", self.path)
+                # the pid is a hint; wt/sid/cwd/tmux/tty are the address (ADR 0008)
+                result = terminal.focus_process(
+                    int(m.group(1)) if m else None,
+                    sid=q.get("sid"), account=q.get("account"),
+                    worktree=q.get("wt"), cwd=q.get("cwd"),
+                    tmux=q.get("tmux"), tty=q.get("tty"))
+                body = json.dumps(result).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/api/topology"):
+                body = json.dumps(gitrepo.cached_topology()).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/api/limits"):
+                body = json.dumps(limits.cached_limits(refresh="refresh=1" in self.path)).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/api/dispatchlog"):
+                body = json.dumps(dispatch.read_dispatch_log()).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/api/dispatch/status"):
+                m = re.search(r"job=([\w-]+)", self.path)
+                body = json.dumps(dispatch.dispatch_status(m.group(1)) if m
+                                  else {"ok": False, "error": "no job"}).encode()
+                ctype = "application/json"
+            elif self.path.startswith("/api/chat"):
+                qa = re.search(r"account=([^&]+)", self.path)
+                qs = re.search(r"sid=([0-9a-fA-F-]+)", self.path)
+                result = chat.read_chat(qa.group(1), qs.group(1)) if qa and qs else \
+                    {"ok": False, "error": "need account & sid"}
+                body = json.dumps(result).encode()
+                ctype = "application/json"
+            elif _v1_match(self.path, "/api/v1/events"):
+                # The durable side of push (API.md §9.22). Push is lossy; this is
+                # not, so the phone reconciles against it on every foreground — and
+                # /events/open is the withdrawal route that stops a resolved
+                # question sitting on the lock screen forever. Matched at a SEGMENT
+                # boundary, never by `startswith` — API.md §2.3 "no prefix routing",
+                # so `/api/v1/eventsX` is a 404 and not this route (the same hole
+                # `/api/v1/devicesX` was, pinned by test_no_v1_route_can_be_reached
+                # _by_a_suffix).
+                body = json.dumps(self._events_get()).encode()
+                ctype = "application/json"
+            elif self.path.split("?", 1)[0] == "/api/v1/push/status":
+                # What the settings screen shows: is push configured, what did the
+                # last send return, when. `push.sink().health()` says exactly which
+                # piece is missing when it is not ready — a NoopSink names the
+                # config key, an APNsSink names a bad Key ID or a missing binary.
+                from . import push as pushmod
+                dev = getattr(self, "device", None)
+                body = json.dumps({"ok": True, "push": pushmod.sink().health(),
+                                   "registered": bool(dev and auth.get_push(dev["id"]))
+                                   if dev else False}).encode()
+                ctype = "application/json"
+            elif self.path.split("?", 1)[0] in ("/", "/index", "/index.html"):
+                body = (config.HERE / "index.html").read_bytes()
+                ctype = "text/html; charset=utf-8"
+            elif self.path.split("?", 1)[0] == "/stream.js":
+                # The SharedWorker that holds the board's ONE EventSource, and the
+                # reason it is a route rather than a Blob URL: a SharedWorker's
+                # identity is (origin, script URL, name), and a Blob URL is unique
+                # per document — every tab would get its OWN worker, its own stream,
+                # and the six-connection ceiling this exists to stay under
+                # (ENGINE.md §5.4). A stable path is what makes it shared.
+                body = (config.HERE / "stream.js").read_bytes()
+                ctype = "application/javascript; charset=utf-8"
+            elif self.path.startswith("/map"):
+                body = (config.HERE / "map.html").read_bytes()
+                ctype = "text/html; charset=utf-8"
+            elif self.path.startswith("/limits"):
+                body = (config.HERE / "limits.html").read_bytes()
+                ctype = "text/html; charset=utf-8"
+            elif self.path.startswith("/guide"):
+                body = (config.HERE / "guide.html").read_bytes()
+                ctype = "text/html; charset=utf-8"
+            elif self.path.startswith("/pair"):
+                # Served like every other page: from disk, on every request, so an
+                # edit shows up on reload. It carries no secret of its own — the
+                # code and the QR arrive from `/api/v1/devices/pair/open`, which is
+                # a POST, so merely LOADING this page cannot open a pairing window.
+                # That distinction is the reason it is not a GET.
+                body = (config.HERE / "pair.html").read_bytes()
+                ctype = "text/html; charset=utf-8"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            # Any branch that raises — a missing page file, an unforeseen shape
+            # from a layer below — is a real 500 in the board's own envelope,
+            # not a dropped connection the client cannot tell from a dead
+            # server (ARCHITECTURE §5.7, API.md §13.8). If a response already
+            # started, there is nothing to say over the top of it.
+            if not getattr(self, "_answered", False):
+                self._json(500, {"ok": False, "error": "internal",
+                                 "message": "the board hit an unexpected error"})
+            self.close_connection = True
 
     # --------------------------------------------------------- the state stream
 
@@ -570,9 +608,20 @@ class Handler(BaseHTTPRequestHandler):
 
         `MSG_PEEK` and not `recv`: this runs on every slice and must consume
         nothing, because `handle_one_request` still owns the stream.
+
+        `select.poll` and not `select.select`: `select()` rejects any fd >=
+        `FD_SETSIZE` (1024 on macOS) with `ValueError` — and this handler is
+        meant to run above that, with the kqueue watcher holding up to 2048
+        `O_EVTONLY` fds (WATCH_MAX_FDS). Past ~1024 open fds every newly
+        accepted SSE socket lands on a high fd, and the first quiet slice would
+        raise a `ValueError` this `except OSError` does not catch — unwinding as
+        a stderr traceback and killing an otherwise healthy stream. `poll` has
+        no such ceiling.
         """
         try:
-            if not select.select([self.connection], [], [], 0)[0]:
+            p = select.poll()
+            p.register(self.connection, select.POLLIN)
+            if not p.poll(0):
                 return False
             return not self.connection.recv(1, socket.MSG_PEEK)
         except OSError:
@@ -605,142 +654,198 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def do_POST(self):
+        # `Transfer-Encoding: chunked` carries no Content-Length, so the body
+        # below would read as empty and every route would answer against `{}`
+        # while the client believes it sent a valid body — a silent lie, not an
+        # error. Swift's `httpBodyStream` and `uploadTask(withStreamedRequest:)`
+        # both force chunked, so this is a plausible iOS construction; refuse it
+        # once at the protocol level (ARCHITECTURE §5.7, API.md §13.3) rather
+        # than as a baffling per-route failure. Not drained: HTTP/1.0 closes the
+        # connection per request, so nothing is left to poison a later one.
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return self._json(411, {"ok": False, "error": "length_required",
+                                    "message": "send a Content-Length; chunked "
+                                    "bodies are not decoded"})
+        # The body is validated BEFORE it is read, and BEFORE the route runs —
+        # which for the exempt `POST /api/v1/pair` is before any credential is
+        # checked. A negative or garbled length would make `rfile.read(-1)` read
+        # to EOF and, paired with the socket timeout above, pin the thread for
+        # its whole span; an oversized one would buffer gigabytes into a single
+        # bytes object and drive the process to OOM. Neither reads a byte.
         try:
             n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1              # a garbled length is refused like a negative one
+        if n < 0:
+            self.close_connection = True
+            return self._json(400, {"ok": False, "error": "bad_length",
+                                    "message": "Content-Length must be a "
+                                    "non-negative integer"})
+        if n > MAX_BODY:
+            self.close_connection = True
+            return self._json(413, {"ok": False, "error": "too_large",
+                                    "message": f"body exceeds the {MAX_BODY} "
+                                    "byte cap"})
+        try:
             payload = json.loads(self.rfile.read(n).decode() or "{}")
         except (ValueError, OSError):
             payload = {}
-        # ---- /api/v1, the versioned surface (ADR 0009) ----
-        #
-        # These four answer with REAL STATUS CODES rather than this handler's
-        # in-payload `{"ok": false}` convention, and the exception is
-        # deliberate. The legacy routes are read by one client — the board —
-        # which renders the message either way. These are read by a Swift
-        # client written from API.md, which has to branch on "the window is
-        # closed" (409) versus "you are not allowed here" (403) versus "slow
-        # down" (429) before it has parsed anything. A 200 carrying a failure
-        # is a contract that only works when the reader is a browser you also
-        # wrote.
-        # `/api/v1` resolves by EXACT match on the path without its query
-        # (API.md §2.3 step 5, "there is no prefix routing"), and after
-        # `/api/v1/devicesX` that is a rule rather than a preference. `startswith`
-        # here made the router looser than the guard on GET; on POST it happened
-        # to fail safe — `/api/v1/pairX` is not in `auth.EXEMPT`, so it demanded
-        # a token it would then have handed to `pairing.claim` — but "safe by
-        # luck this time" is what the GET was too. One shape, no luck.
-        route = self.path.split("?", 1)[0]
-        if route == "/api/v1/pair":
-            # The bootstrap. `auth.EXEMPT` lets it through with no token —
-            # every other guard in `pairing.claim` still applies, starting with
-            # the peer range and ending with a constant-time code comparison.
-            # `auth.EXEMPT` matches this path exactly, and now so does this
-            # line: the exempt list and the router say the same word.
-            result, error = pairing.claim(
-                self.client_address[0] if self.client_address else "", payload)
-            if error:
-                status, code, message = error
-                return self._json(status, {"ok": False, "error": code,
-                                           "message": message})
-            return self._json(200, {"ok": True, **result})
-        if route == "/api/v1/devices/pair/open":
-            w = pairing.open_window(host=self._advertised_host())
-            return self._json(200, {"ok": True, **w})
-        if route == "/api/v1/devices/pair/close":
-            pairing.close()
-            return self._json(200, {"ok": True, "pairing": pairing.state()})
-        # A device's OWN push endpoint and preferences. `read`-scoped, not admin
-        # (auth.SELF_SUBTREE) — a phone registers its own token, which rotates
-        # on reinstall and restore, and gating that behind the Mac-only admin
-        # scope would make push structurally impossible on a phone. The device
-        # is the AUTHENTICATED one (`self.device`), never a path parameter, so a
-        # token can only ever write its own endpoint.
-        if route in ("/api/v1/devices/self/push",
-                     "/api/v1/devices/self/settings",
-                     "/api/v1/push/test", "/api/v1/push/mute"):
-            return self._push_self(route, payload)
-        if auth.admin("POST", route):
-            # `/api/v1/devices/<id>/revoke`. Parsed rather than matched so the
-            # path shape is API.md §2.5's, which is what the Swift client and
-            # the docs both say — and `auth.admin` is the guard's own predicate,
-            # so an id this parse does not recognise is refused for everyone but
-            # the Mac by the same rule that let the Mac in.
-            parts = route.strip("/").split("/")
-            if len(parts) == 5 and parts[4] == "revoke":
-                device = auth.revoke_device(parts[3])
-                if device is None:
-                    return self._json(404, {"ok": False,
-                                            "error": "device_unknown",
-                                            "message": f"no device {parts[3]}"})
-                return self._json(200, {"ok": True, "device": device})
-            self.send_error(404)
-            return
+        # A JSON array or scalar parses fine and then `payload.get(...)` raises
+        # AttributeError on every route — including the pre-token `/api/v1/pair`.
+        # A request that is not an object is a request with no fields.
+        if not isinstance(payload, dict):
+            payload = {}
+        try:
+            # ---- /api/v1, the versioned surface (ADR 0009) ----
+            #
+            # These four answer with REAL STATUS CODES rather than this handler's
+            # in-payload `{"ok": false}` convention, and the exception is
+            # deliberate. The legacy routes are read by one client — the board —
+            # which renders the message either way. These are read by a Swift
+            # client written from API.md, which has to branch on "the window is
+            # closed" (409) versus "you are not allowed here" (403) versus "slow
+            # down" (429) before it has parsed anything. A 200 carrying a failure
+            # is a contract that only works when the reader is a browser you also
+            # wrote.
+            # `/api/v1` resolves by EXACT match on the path without its query
+            # (API.md §2.3 step 5, "there is no prefix routing"), and after
+            # `/api/v1/devicesX` that is a rule rather than a preference. `startswith`
+            # here made the router looser than the guard on GET; on POST it happened
+            # to fail safe — `/api/v1/pairX` is not in `auth.EXEMPT`, so it demanded
+            # a token it would then have handed to `pairing.claim` — but "safe by
+            # luck this time" is what the GET was too. One shape, no luck.
+            route = self.path.split("?", 1)[0]
+            if route == "/api/v1/pair":
+                # The bootstrap. `auth.EXEMPT` lets it through with no token —
+                # every other guard in `pairing.claim` still applies, starting with
+                # the peer range and ending with a constant-time code comparison.
+                # `auth.EXEMPT` matches this path exactly, and now so does this
+                # line: the exempt list and the router say the same word.
+                result, error = pairing.claim(
+                    self.client_address[0] if self.client_address else "", payload)
+                if error:
+                    status, code, message = error
+                    return self._json(status, {"ok": False, "error": code,
+                                               "message": message})
+                return self._json(200, {"ok": True, **result})
+            if route == "/api/v1/devices/pair/open":
+                w = pairing.open_window(host=self._advertised_host())
+                return self._json(200, {"ok": True, **w})
+            if route == "/api/v1/devices/pair/close":
+                pairing.close()
+                return self._json(200, {"ok": True, "pairing": pairing.state()})
+            # A device's OWN push endpoint and preferences. `read`-scoped, not admin
+            # (auth.SELF_SUBTREE) — a phone registers its own token, which rotates
+            # on reinstall and restore, and gating that behind the Mac-only admin
+            # scope would make push structurally impossible on a phone. The device
+            # is the AUTHENTICATED one (`self.device`), never a path parameter, so a
+            # token can only ever write its own endpoint.
+            if route in ("/api/v1/devices/self/push",
+                         "/api/v1/devices/self/settings",
+                         "/api/v1/push/test", "/api/v1/push/mute"):
+                return self._push_self(route, payload)
+            if auth.admin("POST", route):
+                # `/api/v1/devices/<id>/revoke`. Parsed rather than matched so the
+                # path shape is API.md §2.5's, which is what the Swift client and
+                # the docs both say — and `auth.admin` is the guard's own predicate,
+                # so an id this parse does not recognise is refused for everyone but
+                # the Mac by the same rule that let the Mac in.
+                parts = route.strip("/").split("/")
+                if len(parts) == 5 and parts[4] == "revoke":
+                    device = auth.revoke_device(parts[3])
+                    if device is None:
+                        return self._json(404, {"ok": False,
+                                                "error": "device_unknown",
+                                                "message": f"no device {parts[3]}"})
+                    return self._json(200, {"ok": True, "device": device})
+                self.send_error(404)
+                return
 
-        if self.path.startswith("/api/hook"):
-            # ENGINE.md §7.1: one route, one dict. The hottest POST this server
-            # has — several per agent turn, from every hooked session on the
-            # machine — and the only one an AGENT IS BLOCKED ON while it is
-            # served. Claude Code runs its hooks synchronously; a slow answer
-            # here is a slow agent, and a 500 here is a red line in somebody's
-            # terminal in the middle of their work.
-            #
-            # So it does exactly two things — record the edge, nudge the loop —
-            # and it cannot fail: `observer.hook` swallows everything, and this
-            # branch answers 200 for an unknown event, a malformed session id
-            # and a board running with no Observer at all. `status` in the reply
-            # is what the board UNDERSTOOD (null for the ~22 events that assert
-            # nothing), which is the only thing that makes a broken install
-            # debuggable without reading this file.
-            #
-            # AUTHENTICATION is `parse_request`, like every other route, and for
-            # a hook that means loopback trust: the agent runs on this Mac and
-            # posts to 127.0.0.1 (see `hooks.SCRIPT`). Nothing weaker would be
-            # possible — a hook has no credential to present and we will not
-            # mint one per session — and nothing stronger is bought: a local
-            # process that wanted to lie about a status can already type at the
-            # agent through `/api/send`, which is a far worse power than
-            # mislabelling a card. The cross-site guards still run above, so a
-            # page you are visiting cannot post one through your browser.
-            result = {"ok": True, "status": observer.hook(
-                payload.get("session_id"), payload.get("hook_event_name"),
-                notification_type=payload.get("notification_type"))}
-        elif self.path.startswith("/api/reserve"):
-            result = limits.set_reserve(payload.get("account"), payload.get("percent"))
-        elif self.path.startswith("/api/resume/schedule"):
-            result = resume.schedule_resume(
-                payload.get("worktree"), payload.get("sid"),
-                payload.get("account"), model=payload.get("model"),
-                delay_s=payload.get("delay_s"),
-                resets_at=payload.get("resets_at"), due_at=payload.get("due_at"))
-        elif self.path.startswith("/api/resume/cancel"):
-            result = resume.cancel_resume(payload.get("worktree"), payload.get("sid"))
-        elif self.path.startswith("/api/send"):
-            # {pid, text} was the whole request once, and that was the bug: the
-            # drawer captured a pid on open and posted it minutes later, so a
-            # recycled pid typed the reply into a different agent (ADR 0008).
-            # The identity the drawer already uses to READ the conversation now
-            # travels with the write, and the pid is only a hint.
-            result = terminal.send_to_process(
-                int(payload.get("pid") or 0), payload.get("text") or "",
-                sid=payload.get("sid"), account=payload.get("account"),
-                worktree=payload.get("worktree"), cwd=payload.get("cwd"),
-                tmux=payload.get("tmux"), tty=payload.get("tty"))
-        elif self.path.startswith("/api/finish"):
-            result = finish.start_finish(payload.get("worktree") or "")
-        elif self.path.startswith("/api/dispatch"):
-            result = dispatch.start_dispatch(
-                payload.get("mission"), payload.get("worktree") or None,
-                payload.get("account") or None,
-                payload.get("model") or None, payload.get("effort") or None,
-                bool(payload.get("force_model")))
-        else:
-            self.send_error(404)
-            return
-        body = json.dumps(result).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            # The legacy verbs resolve by EXACT match on the path without its query,
+            # never by prefix — the same rule `/api/v1` learned from `/api/v1/
+            # devicesX`. ARCHITECTURE §5.2 uses precisely this surface as its
+            # motivating example: `"/api/dispatchlog".startswith("/api/dispatch")`
+            # is true, so a `startswith` chain routed `POST /api/dispatchlog` — a
+            # log-reading path — into `start_dispatch`, which launches a real agent
+            # spending real quota. No privilege boundary is crossed today (scopes
+            # are deferred), but it is the exact latent read→act hole that goes
+            # silent the day scopes ship. The four boards only ever GET the log, so
+            # exact-matching the POST verbs keeps the byte-compatibility freeze.
+            if route == "/api/hook":
+                # ENGINE.md §7.1: one route, one dict. The hottest POST this server
+                # has — several per agent turn, from every hooked session on the
+                # machine — and the only one an AGENT IS BLOCKED ON while it is
+                # served. Claude Code runs its hooks synchronously; a slow answer
+                # here is a slow agent, and a 500 here is a red line in somebody's
+                # terminal in the middle of their work.
+                #
+                # So it does exactly two things — record the edge, nudge the loop —
+                # and it cannot fail: `observer.hook` swallows everything, and this
+                # branch answers 200 for an unknown event, a malformed session id
+                # and a board running with no Observer at all. `status` in the reply
+                # is what the board UNDERSTOOD (null for the ~22 events that assert
+                # nothing), which is the only thing that makes a broken install
+                # debuggable without reading this file.
+                #
+                # AUTHENTICATION is `parse_request`, like every other route, and for
+                # a hook that means loopback trust: the agent runs on this Mac and
+                # posts to 127.0.0.1 (see `hooks.SCRIPT`). Nothing weaker would be
+                # possible — a hook has no credential to present and we will not
+                # mint one per session — and nothing stronger is bought: a local
+                # process that wanted to lie about a status can already type at the
+                # agent through `/api/send`, which is a far worse power than
+                # mislabelling a card. The cross-site guards still run above, so a
+                # page you are visiting cannot post one through your browser.
+                result = {"ok": True, "status": observer.hook(
+                    payload.get("session_id"), payload.get("hook_event_name"),
+                    notification_type=payload.get("notification_type"))}
+            elif route == "/api/reserve":
+                result = limits.set_reserve(payload.get("account"), payload.get("percent"))
+            elif route == "/api/resume/schedule":
+                result = resume.schedule_resume(
+                    payload.get("worktree"), payload.get("sid"),
+                    payload.get("account"), model=payload.get("model"),
+                    delay_s=payload.get("delay_s"),
+                    resets_at=payload.get("resets_at"), due_at=payload.get("due_at"))
+            elif route == "/api/resume/cancel":
+                result = resume.cancel_resume(payload.get("worktree"), payload.get("sid"))
+            elif route == "/api/send":
+                # {pid, text} was the whole request once, and that was the bug: the
+                # drawer captured a pid on open and posted it minutes later, so a
+                # recycled pid typed the reply into a different agent (ADR 0008).
+                # The identity the drawer already uses to READ the conversation now
+                # travels with the write, and the pid is only a hint.
+                result = terminal.send_to_process(
+                    int(payload.get("pid") or 0), payload.get("text") or "",
+                    sid=payload.get("sid"), account=payload.get("account"),
+                    worktree=payload.get("worktree"), cwd=payload.get("cwd"),
+                    tmux=payload.get("tmux"), tty=payload.get("tty"))
+            elif route == "/api/finish":
+                result = finish.start_finish(payload.get("worktree") or "")
+            elif route == "/api/dispatch":
+                result = dispatch.start_dispatch(
+                    payload.get("mission"), payload.get("worktree") or None,
+                    payload.get("account") or None,
+                    payload.get("model") or None, payload.get("effort") or None,
+                    bool(payload.get("force_model")))
+            else:
+                self.send_error(404)
+                return
+            body = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            # Same guard as `do_GET`: an unforeseen error is a 500 in the
+            # board's envelope, never a bare dropped connection (a client that
+            # branches on status codes cannot tell that from a dead server).
+            if not getattr(self, "_answered", False):
+                self._json(500, {"ok": False, "error": "internal",
+                                 "message": "the board hit an unexpected error"})
+            self.close_connection = True
 
     # ---------------------------------------------------------- push, events
 
@@ -824,9 +929,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def notify_token_ok(token):
     """An APNs device token is 64–200 hex — the same check `push` uses, reached
-    here without importing `push` on the hot path."""
+    here without importing `push` on the hot path.
+
+    Non-str is not a match, not a crash: a phone-client bug that posts
+    `{"token": 123}` must earn the documented 422, not a TypeError out of
+    `TOKEN_RE.match` and a dropped connection (API.md §13.8)."""
     from . import push as pushmod
-    return bool(pushmod.TOKEN_RE.match(token or ""))
+    return isinstance(token, str) and bool(pushmod.TOKEN_RE.match(token))
 
 
 class Server(ThreadingHTTPServer):

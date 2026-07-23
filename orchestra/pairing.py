@@ -288,12 +288,19 @@ def claim(peer, body, now=None):
     now = time.time() if now is None else now
 
     if not peer_permitted(peer):
-        _audit(now, peer, None, "refuse", PEER_REFUSED)
+        auth._budget(peer, now, spend=1.0)
+        if auth._audit_gate(peer, now):
+            _audit(now, peer, None, "refuse", PEER_REFUSED)
         return None, (403, PEER_REFUSED,
                       f"pairing is answered on this machine and on the tailnet "
                       f"only; {peer or 'that address'} is neither")
 
     if not isinstance(body, dict):
+        # Spend, but do not audit (this route has never written a line for a
+        # malformed body): the spend is what drains the budget so a flood of
+        # object-less bodies still closes the door at `auth.check`, instead of
+        # sailing past every counter to draw an unthrottled `allow` line apiece.
+        auth._budget(peer, now, spend=1.0)
         return None, (400, BAD_REQUEST, "the body of a pairing request must be "
                                         "a JSON object")
     presented = normalise(body.get("code"))
@@ -303,19 +310,25 @@ def claim(peer, body, now=None):
     with _lock:
         w = _window
         if w is None or w["claimed"] or now >= w["expires_at"]:
-            _audit(now, peer, None, "refuse", NOT_OPEN)
+            auth._budget(peer, now, spend=1.0)
+            if auth._audit_gate(peer, now):
+                _audit(now, peer, None, "refuse", NOT_OPEN)
             return None, (409, NOT_OPEN,
                           "no pairing window is open — open one on the board "
                           "(＋ pair a device) and scan the code it shows")
         if w["locked_until"] and now < w["locked_until"]:
             wait = int(w["locked_until"] - now) + 1
-            _audit(now, peer, None, "refuse", LOCKED)
+            auth._budget(peer, now, spend=1.0)
+            if auth._audit_gate(peer, now):
+                _audit(now, peer, None, "refuse", LOCKED)
             return None, (429, LOCKED,
                           f"too many wrong pairing codes; this window is "
                           f"closed for {wait}s. Open a new one on the board.")
         spent = w["attempts"].get(peer, 0)
         if spent >= ATTEMPTS_PER_PEER:
-            _audit(now, peer, None, "refuse", ATTEMPTS)
+            auth._budget(peer, now, spend=1.0)
+            if auth._audit_gate(peer, now):
+                _audit(now, peer, None, "refuse", ATTEMPTS)
             return None, (429, ATTEMPTS,
                           f"{ATTEMPTS_PER_PEER} wrong codes from {peer}; open "
                           f"a new pairing window to try again")
@@ -335,8 +348,11 @@ def claim(peer, body, now=None):
             # unauthenticated door, counted in the same place, so a peer that
             # burns its pairing attempts also loses the ability to hammer
             # /api/state — ADR 0014 said this route would inherit that bucket.
+            # And the audit write is gated on it: past the ceiling the peer gets
+            # one `throttled` marker, not a `pairing_code_wrong` line per guess.
             auth._budget(peer, now, spend=1.0)
-            _audit(now, peer, None, "refuse", CODE_WRONG)
+            if auth._audit_gate(peer, now):
+                _audit(now, peer, None, "refuse", CODE_WRONG)
             return None, (409, CODE_WRONG, "that pairing code is not the one "
                                            "on the screen")
 

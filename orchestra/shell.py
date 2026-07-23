@@ -14,9 +14,10 @@ time would keep pointing at the real subprocess.
 import subprocess
 
 
-def run(cmd, cwd=None, timeout=6):
+def run(cmd, cwd=None, timeout=6, env=None):
     try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                           timeout=timeout, env=env)
         return p.returncode, p.stdout.strip()
     except Exception:
         return 1, ""

@@ -166,6 +166,13 @@ g.branchg:hover .bline { stroke-opacity:1; }
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+// esc() is for HTML text/attribute nodes; a value dropped into a JS string
+// inside an inline onclick needs the JS-string layer too, or an apostrophe in a
+// worktree name (esc'd to &#39;, which the parser decodes back to ') breaks out
+// of the quotes and can inject. JSON.stringify does the JS escaping AND supplies
+// the surrounding quotes; esc() then makes the result safe as an HTML attribute
+// value. Emits its own quotes, so call it WITHOUT wrapping quotes: tipFocus(${escArg(n)}).
+const escArg = (s) => esc(JSON.stringify(String(s ?? "")));
 const C = { green:"#87b386", accent:"#d97757", accent2:"#e8a87c", cyan:"#7fb3c8",
             yellow:"#d4b06a", fg:"#e8e6e3", muted:"#8a8784", muted2:"#6a6764",
             border:"#2a2a2a", bg:"#0d0d0d" };
@@ -285,7 +292,11 @@ function render() {
 
     // branch lanes (earliest fork = top lane)
     branches.forEach((b, i) => {
-      const key = `b:${esc(b.worktree)}`; lookup[key] = b;
+      // key the lookup on the RAW name: data-key is written esc'd (below) but
+      // read back via dataset, which HTML-DECODES it — so a name with &<>"'
+      // would look up a string the registry never stored. Key raw, escape only
+      // for the attribute, and the decoded read lands back on the same string.
+      const key = `b:${b.worktree}`; lookup[key] = b;
       const st = statusOf(byName[b.worktree]);
       const ly = top + TOP_PAD + i * LANE_H;
       const fx = x(b.fork_ts), txp = Math.max(x(b.tip_ts), fx + 2);
@@ -312,12 +323,12 @@ function render() {
       const stats = `+${b.ahead}${b.behind ? ` ↓${b.behind}` : ""}${b.dirty ? ` Δ${b.dirty}` : ""} · ${rel(now-b.tip_ts)} ago`;
       inner += `<text x="${lx}" y="${ly+18}" text-anchor="${anchor}" font-size="10" fill="${C.muted}">${esc(stats)}</text>`;
       inner += `<rect x="${Math.min(fx,txp)-10}" y="${ly-34}" width="${Math.abs(txp-fx)+220}" height="60" fill="transparent"/>`;
-      parts.push(`<g class="branchg hit" data-key="${key}">${inner}</g>`);
+      parts.push(`<g class="branchg hit" data-key="${esc(key)}">${inner}</g>`);
     });
 
     // riders: worktrees sitting directly on the trunk
     riders.forEach((b, i) => {
-      const key = `b:${esc(b.worktree)}`; lookup[key] = b;
+      const key = `b:${b.worktree}`; lookup[key] = b;   // raw key; see branches above
       const st = statusOf(byName[b.worktree]);
       const rx = x(b.tip_ts);
       const row = G.riderPlace[i];
@@ -334,7 +345,7 @@ function render() {
       const info = `on trunk${b.behind ? ` · ↓${b.behind} behind tip` : " · at tip"}${b.dirty ? ` · Δ${b.dirty}` : ""}`;
       inner += `<text x="${lx}" y="${lyy}" text-anchor="${anchor}" font-size="11" font-weight="600" fill="${C.fg}">${esc(b.worktree)} <tspan fill="${st.color}" font-size="10">${st.glyph} ${st.word}</tspan></text>`;
       inner += `<text x="${lx}" y="${lyy+13}" text-anchor="${anchor}" font-size="10" fill="${C.muted}">${esc(info)}</text>`;
-      parts.push(`<g class="branchg hit" data-key="${key}">${inner}</g>`);
+      parts.push(`<g class="branchg hit" data-key="${esc(key)}">${inner}</g>`);
     });
   }
 
@@ -432,8 +443,8 @@ document.addEventListener("click", (ev) => {
   pinnedKey = g.dataset.key;
   const tip = $("tip");
   tip.innerHTML = tipHTML(b) + `<div class="tipacts">
-    <button onclick="tipFocus('${esc(b.worktree)}')">⌖ focus</button>
-    <button onclick="tipFinish(this, '${esc(b.worktree)}')"
+    <button onclick="tipFocus(${escArg(b.worktree)})">⌖ focus</button>
+    <button onclick="tipFinish(this, ${escArg(b.worktree)})"
       title="close out: agent lands the branch, terminal closes, node goes free">✓ finish</button>
     <button onclick="unpinTip()">✕</button></div>`;
   tip.classList.add("pinned");

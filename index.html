@@ -367,6 +367,13 @@ header .wrap { max-width:none; }
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+// esc() is for HTML text/attribute nodes; a value dropped into a JS string
+// inside an inline onclick needs the JS-string layer too, or an apostrophe in a
+// worktree name (esc'd to &#39;, which the parser decodes back to ') breaks out
+// of the quotes and can inject. JSON.stringify does the JS escaping AND supplies
+// the surrounding quotes; esc() then makes the result safe as an HTML attribute
+// value. Emits its own quotes, so call it WITHOUT wrapping quotes: openChat(${escArg(k)}).
+const escArg = (s) => esc(JSON.stringify(String(s ?? "")));
 
 // The terminal chip for one session. It sits on the session row rather than the
 // card head so a worktree running several agents says which window is which —
@@ -547,7 +554,7 @@ function render(st) {
             ${s.status === "limit" && s.limit && s.limit.group === "session" && s.limit.resets_at
               ? `<button class="abtn resume" data-key="${esc(w.name)}|${esc(s.sid)}" data-until="${s.limit.resets_at}">▶ resume</button>` : ""}
             ${s.status === "limit" && !s.handed_to ? schedControls(w, s) : ""}
-            <button class="abtn" onclick="openChat('${esc(w.name)}|${esc(s.sid)}')">✉ chat</button>
+            <button class="abtn" onclick="openChat(${escArg(`${w.name}|${s.sid}`)})">✉ chat</button>
           </span>
         </div>
         ${s.topic ? `<div class="topic">${esc(s.topic)}</div>` : ""}
@@ -1233,7 +1240,7 @@ async function loadDispatchLog() {
         <span class="lt">${esc(logStamp(e))}</span>
         <span class="ls ${e.alive ? "on" : "off"}">${e.alive ? "● live" : "○ ended"}</span>
         <span class="lm">${esc(e.worktree || "?")} · [${esc(e.account || "?")}]${e.model ? " · " + esc(e.model) : ""}${e.effort ? " · " + esc(e.effort) : ""}${e.routed ? " · routed" : ""}</span>
-        ${key ? `<button class="abtn lchat" onclick="event.stopPropagation();openChat('${esc(key)}')">✉ chat</button>`
+        ${key ? `<button class="abtn lchat" onclick="event.stopPropagation();openChat(${escArg(key)})">✉ chat</button>`
               : e.alive ? `<span class="lwait">starting…</span>` : ""}
         <div class="lx" onclick="this.classList.toggle('open')">${esc(e.mission_original || "")}</div>
       </div>`; }).join("");
@@ -1243,6 +1250,13 @@ let dispatchPoll = null;
 // the mission in flight — the composer's textarea is cleared the moment you
 // launch, so this (not the input) is what relaunch/retry reads back.
 let inFlight = null;
+// a dedicated in-flight lock for the POST itself, separate from `inFlight`
+// (which relaunch reuses on purpose). A double-click fires launchMission twice
+// before the first fetch returns — the first call already cleared the textarea,
+// so the second reads the same text back off `inFlight` and passes every guard.
+// This lets the second call through the validation but stops it at the wire, so
+// one launch is one /api/dispatch. Cleared in the finally, on every path.
+let submitting = false;
 function renderInFlight(note) {
   if (!inFlight) return;
   $("mSent").innerHTML = `<div class="sent">
@@ -1259,6 +1273,11 @@ async function launchMission(missionArg) {
   if (!$("mModel").value || !$("mEffort").value) {
     toast("✗ pick a model and an effort first"); return;
   }
+  // a second click while the first POST is still in flight is dropped here —
+  // after the guards (so a rejected launch never leaves the lock stuck) and
+  // before the textarea is cleared, so the double-dispatch never reaches the wire
+  if (submitting) return;
+  submitting = true;
   inFlight = mission;
   $("mText").value = "";        // out of the input the instant you commit to it
   saveMissionDraft("");         // launched missions live in the dispatch log
@@ -1293,6 +1312,8 @@ async function launchMission(missionArg) {
     dispatchPoll = setInterval(() => pollDispatch(job), 1000);
     pollDispatch(job);
   } catch (e) { toast("✗ dispatch failed"); }
+  finally { submitting = false; }   // release the lock on every path (incl. the
+                                    // needs_decision return, so relaunch can re-enter)
 }
 function showModelDecision(resp) {
   const opusBtn = resp.can_opus

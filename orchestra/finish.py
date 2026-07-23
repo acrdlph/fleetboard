@@ -34,6 +34,7 @@ stay a one-way DAG. See ADR 0010, 'cycles'.
 """
 
 import os
+import threading
 import time
 
 from . import (config, shell, status, gitrepo, procs, transcripts, terminal,
@@ -104,6 +105,16 @@ _closeouts = {}
 # ✓ finish, which is the honest offer at that point.
 CLOSEOUT_TTL_S = 3600.0
 
+# One ✓ finish in flight per worktree (ARCHITECTURE.md §5.6). Everything
+# start_finish decides on sits downstream of a 30 s `git fetch` and two
+# process scans, and the server is threaded — without this lock two
+# concurrent presses (a double-tap, or phone + desktop) both read "no
+# closeout in flight" and both act: two closeout agents merging and pushing
+# the same branch, the worst outcome this product can produce. Non-blocking
+# on purpose: the loser gets a clean refusal, never a queued second run.
+_finish_locks = {}                 # worktree name -> threading.Lock
+_finish_locks_guard = threading.Lock()
+
 
 def _prune_closeouts(now=None):
     """Drop closeout flags too old to mean anything. Called on this module's
@@ -157,9 +168,28 @@ def start_finish(wt_name):
     idling -> type /exit; no terminal + landed + clean -> park on the trunk
     right here, no agent; anything else -> launch a one-shot closeout agent
     (headless; frees the card itself, or parks as needs-you if the landing
-    doesn't verify)."""
+    doesn't verify).
+
+    The worktree's finish lock is taken synchronously here, before anything
+    is read or typed (§5.6): a second press that lands while the first is
+    still mid-fetch gets the refusal below instead of a second brief — or a
+    second closeout agent."""
     if config.DEMO:
         return {"ok": False, "message": "demo mode — nothing to finish"}
+    with _finish_locks_guard:
+        lock = _finish_locks.setdefault(wt_name, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return {"ok": False, "message":
+                "a finish is already in progress for this worktree — "
+                "wait for it to settle"}
+    try:
+        return _finish_locked(wt_name)
+    finally:
+        lock.release()
+
+
+def _finish_locked(wt_name):
+    """start_finish's body, run under the worktree's finish lock."""
     _prune_closeouts()   # every press cleans the whole map, not just this card
     wt = next((w for w in gitrepo.discover_worktrees() if w["name"] == wt_name), None)
     if not wt:

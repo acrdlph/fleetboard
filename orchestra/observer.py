@@ -873,10 +873,18 @@ class Observer:
                           file=sys.stderr)
             if self._stop.is_set():
                 break
+            # Clear BEFORE `_nudge_at` is read, not merely before the wait.
+            # `nudge` writes `_nudge_at` and THEN sets the event, so once the
+            # clear has happened a nudge is either visible to the read below or
+            # leaves the event set for the wait — no interleaving loses it.
+            # Clearing after the read opened exactly one: a nudge landing
+            # between the read and the clear had its deadline ignored AND its
+            # set() wiped, and the loop waited out the full cadence (§4.3's
+            # "clear before waiting" warning, one line earlier than it looks).
+            self._wake.clear()
             nxt = started + self.effective_idle_s
             if self._nudge_at > started:        # nudged while we were sweeping
                 nxt = min(nxt, self._nudge_at + self.hot_s)
-            self._wake.clear()
             if self._wake.wait(min(max(0.0, nxt - time.time()), self.max_stale_s)):
                 # woken by a nudge: honour the hot floor so a burst of
                 # mutations cannot turn the loop into a spin
@@ -1391,6 +1399,10 @@ def cached_state():
     obs = _observer
     ttl = obs.republish_s if (obs is not None and obs.running) else STATE_TTL_S
     if _cache["state"] is None or now - _cache["t"] > ttl:
+        # Captured BEFORE the collect, for the compare-and-swap below. This
+        # collect is synchronous and on the real fleet takes seconds, which is
+        # plenty of room for a mutation to park `_cache["t"] = 0.0` under it.
+        t_before, s_before = _cache["t"], _cache["state"]
         fresh = {}
         # …through the sweep's own Settler when there is one. A collect on the
         # request thread that skipped it would publish an un-damped status and
@@ -1405,9 +1417,20 @@ def cached_state():
             # session as `inferred` for one poll and `observed` on the next,
             # which is the board disagreeing with itself about how sure it is.
             hooks=_observer._hooks.live(now) if _observer is not None else None)
-        _cache["state"], _cache["t"] = state, now
+        # Compare-and-swap, never a blind write — the same guard the sweep
+        # keeps (`Observer.sweep`). A mutation that parked `_cache["t"] = 0.0`
+        # while this collect was in flight means the state just collected
+        # predates it; a blind write here would stamp that pre-mutation state
+        # with a fresh clock, and the next sweep's own CAS would then rightly
+        # refuse to touch it — the board serving stale state for `republish_s`.
+        # Dropping the write leaves the park intact, so the next request
+        # collects again, post-mutation; the fresh state is still served and
+        # still published.
+        if _cache["t"] == t_before and _cache["state"] is s_before:
+            _cache["state"], _cache["t"] = state, now
         if _observer is not None:
             # a collect is a collect: publish it, or the version and the
             # freshness map would silently miss everything a mutation caused.
             _observer.publish(state, fresh=fresh)
+        return state
     return _cache["state"]

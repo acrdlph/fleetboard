@@ -292,7 +292,7 @@ def _pid_config_dirs(pids):
                 pass
     else:  # macOS/BSD: `ps eww` appends the environment to the command column
         _, out = shell.run(["ps", "eww", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
-                           timeout=10)
+                           timeout=10, env=_PS_ENV)
         for line in out.splitlines():
             m = re.match(r"\s*(\d+)\s+(.*)", line)
             if not m:
@@ -374,6 +374,18 @@ def shell_children(table, claude_pids):
     return counts
 
 
+# BSD `ps` formats `lstart=` in the process's LOCALE — French renders
+# "mar. 14 juil. 03:47:57 2026", which `_PS_ROW`'s C-locale month/weekday
+# pattern cannot match, so on any non-English Mac the whole date spilled into
+# the command column and `claude_processes` returned []: an empty board, dead
+# discovery, and sessions orphaning to ENDED while their agents were alive.
+# Force C on the `ps` child via its ENVIRONMENT, not by wrapping the argv in
+# `env` — the argv stays `["ps", "-axo", ...]` (the parent's own decoding is
+# unaffected: `shell.run` is text=True and decodes with the parent's locale).
+# C-locale lstart is exactly the "Www Mmm DD HH:MM:SS YYYY" the English default
+# already emits, so this changes nothing on an English machine.
+_PS_ENV = {**os.environ, "LC_ALL": "C", "LC_TIME": "C"}
+
 _PS_FIELDS = "pid=,ppid=,tty=,pcpu=,etime=,lstart=,command="
 _PS_FIELDS_PLAIN = "pid=,ppid=,tty=,pcpu=,etime=,command="
 
@@ -392,9 +404,9 @@ def _ps_lines():
     file used before there was a memo. Every generation is then None, nothing
     is memoised, and the sweep costs exactly what it always did.
     """
-    rc, out = shell.run(["ps", "-axo", _PS_FIELDS])
+    rc, out = shell.run(["ps", "-axo", _PS_FIELDS], env=_PS_ENV)
     if rc != 0 or not out:
-        rc, out = shell.run(["ps", "-axo", _PS_FIELDS_PLAIN])
+        rc, out = shell.run(["ps", "-axo", _PS_FIELDS_PLAIN], env=_PS_ENV)
     return out.splitlines()
 
 

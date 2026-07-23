@@ -342,6 +342,8 @@ def session_topic(fp):
             e = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(e, dict):        # a valid-JSON scalar/array line: 42, "s", [1]
+            continue
         if e.get("type") == "summary" and e.get("summary"):
             return _clean(e["summary"], 140)
         if e.get("type") == "user" and not e.get("isMeta"):
@@ -365,6 +367,8 @@ def last_assistant_text(fp, size=TAIL_BYTES):
             e = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(e, dict):        # a valid-JSON scalar/array line: 42, "s", [1]
+            continue
         if e.get("type") != "assistant":
             continue
         c = (e.get("message") or {}).get("content")
@@ -382,6 +386,8 @@ def find_last_user(fp, size=1024 * 1024):
         try:
             e = json.loads(line)
         except ValueError:
+            continue
+        if not isinstance(e, dict):        # a valid-JSON scalar/array line: 42, "s", [1]
             continue
         if e.get("isSidechain") or e.get("type") != "user" or e.get("isMeta"):
             continue
