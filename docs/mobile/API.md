@@ -79,15 +79,24 @@ document loses the feature — do not implement against the assumption.
 
 ### 1.1 Base URL
 
+> **Reconciled 2026-07-22 with [ADR 0013](adr/0013-plain-http-over-the-tailnet.md) (Accepted).**
+> The tailnet listeners are **plain HTTP, not HTTPS** — ADR 0013 removed TLS from this server, so
+> there is no certificate and nothing for the client to pin (see §2 and §3, already rewritten to
+> match). WireGuard supplies the confidentiality; the per-device bearer token supplies the
+> authentication. On iOS this is a scoped **`NSExceptionDomains` ATS exception** for the tailnet
+> address, not `NSAllowsArbitraryLoads` (§3.6). The scheme below is therefore `http://` on every
+> listener.
+
 ```
-https://<magicdns-name>:4242            e.g. https://achills-macbook-pro.tail1205d9.ts.net:4242
-https://<tailnet-ipv4>:4242             e.g. https://100.113.110.31:4242
-https://[<tailnet-ipv6>]:4242           e.g. https://[fd7a:115c:a1e0::b03a:6e20]:4242
+http://<magicdns-name>:4242             e.g. http://achills-macbook-pro.tail1205d9.ts.net:4242
+http://<tailnet-ipv4>:4242              e.g. http://100.113.110.31:4242
+http://[<tailnet-ipv6>]:4242            e.g. http://[fd7a:115c:a1e0::b03a:6e20]:4242
 http://127.0.0.1:4242                   loopback only, plaintext, browser board only
 ```
 
-- The tailnet listeners are **HTTPS with a self-signed P-256 certificate**. The client
-  pins `base64url(sha256(SPKI-DER))[:16]`, delivered out-of-band by the pairing QR. See §3.6.
+- The tailnet listeners are **plain HTTP over the tailnet** (ADR 0013). There is no TLS
+  certificate and no SPKI pin; the QR carries no pin field (§3.5, §3.6). Security is the
+  WireGuard boundary plus the per-device bearer token (§2), not the cipher.
 - The loopback listener is **plaintext HTTP** and serves the desktop HTML board. It never
   serves HTML on the tailnet listeners.
 - `0.0.0.0` is refused at startup. The server binds loopback unconditionally plus, when
@@ -1121,12 +1130,19 @@ be slow.
 | 403 | `host_not_allowed` / `peer_not_permitted` — the guard runs even here |
 | 429 | `rate_limited` (per-IP bucket) |
 
+> **`cert_not_after` under [ADR 0013](adr/0013-plain-http-over-the-tailnet.md):** the server ships
+> plain HTTP with no certificate, so this field is **omitted** (conditional keys are absent, not
+> null — §1.6, §3.3's `server.cert_not_after` note). The key is retained in the contract only
+> against a future TLS-terminated deployment; a client must treat its absence as normal, never as
+> an error.
+
 Client use:
 
 - `min_client_build` > the app's build → render a blocking *"update the app"* screen.
 - `api` major mismatch → *"update orchestra on your Mac"*.
 - `state_ready: false` → expect `503 state_not_ready` on state reads; retry in 2 s.
-- `cert_not_after` within 30 days → warn.
+- `cert_not_after` — **absent under ADR 0013** (plain HTTP, no certificate); if a future TLS
+  deployment ever emits it and it is within 30 days → warn.
 - `sleep_prevented: false` on a laptop with push configured → warn that notifications will
   stop when the lid closes.
 
@@ -3360,7 +3376,7 @@ See §8.3.
                                   concurrently with app launch, to warm the tunnel)
 2.  render the on-disk snapshot at once, marked "data as of 14m ago",
     with actuating controls disabled and a determinate "reconnecting…" affordance
-3.  GET  /api/v1/health          → version skew, cert expiry, state_ready
+3.  GET  /api/v1/health          → version skew, state_ready (no cert expiry — ADR 0013, plain HTTP)
 4.  GET  /api/v1/state           → full snapshot; take `cursor` from the ENVELOPE
 5.  GET  /api/v1/stream?since=<that cursor>&sub=<install id>
        ← the stream replays from that cursor, so nothing that happened between
@@ -3519,9 +3535,12 @@ degrade to the ntfy backend when absent — the same category as the existing `g
 
 ## 14. Swift client checklist
 
-1. **One `URLSession` with the pinning delegate.** Ban `URLSession.shared` with a lint rule —
-   it has no delegate and cannot accept the self-signed certificate, and any accidental use
-   hard-fails with an opaque `NSURLErrorServerCertificateUntrusted`.
+1. **One shared `URLSession` for the app's API calls.** There is **no TLS and no pinning
+   delegate** ([ADR 0013](adr/0013-plain-http-over-the-tailnet.md)): the tailnet transport is
+   plain HTTP behind a scoped `NSExceptionDomains` ATS exception (§3.6), so there is no
+   certificate to accept or reject and no `NSURLErrorServerCertificateUntrusted` to design around.
+   Still centralise on one configured session (default headers, timeouts, `Authorization`) rather
+   than `URLSession.shared`, so the bearer token and ATS-scoped host are applied uniformly.
 2. A **separate** session for the stream, with `timeoutIntervalForRequest ≥ 3 × hb`.
 3. **Never** `httpBodyStream`. Always `httpBody`.
 4. `Codable` with `decodeIfPresent` and defaults everywhere. Conditional keys are **absent**,
@@ -3546,9 +3565,10 @@ degrade to the ntfy backend when absent — the same category as the existing `g
     both fail silently, with no server-side error because nothing arrives.
 13. Request **`.provisional`** notification authorization on first launch, so a first-run
     denial cannot permanently gut the premise.
-14. Reachability ladder: Tailscale down / Mac asleep / orchestra down / pin mismatch / server
-    too old are five distinct states with five distinct actions. Do not show one spinner for
-    all of them.
+14. Reachability ladder: Tailscale down / Mac asleep / orchestra down / server too old are
+    distinct states with distinct actions. Do not show one spinner for all of them. (The
+    former "pin mismatch" rung is gone — [ADR 0013](adr/0013-plain-http-over-the-tailnet.md)
+    ships no TLS, so there is no pin to mismatch.)
 
 ---
 

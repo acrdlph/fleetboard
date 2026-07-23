@@ -81,6 +81,7 @@ import threading
 import time
 
 from . import config
+from . import tailnet
 
 
 # The two state files. `config.HERE` is the REPO ROOT, not the package
@@ -110,6 +111,14 @@ RATE_LIMITED = "rate_limited"
 UNAVAILABLE = "auth_unavailable"
 CROSS_ORIGIN = "origin_not_allowed"
 NOT_JSON = "content_type_required"
+# API.md §2.3 step 2, and the hole `same_origin` names in its own docstring. A
+# request whose `Host` header is a name this server does not answer to is
+# refused — which kills DNS rebinding (where `Origin` and `Host` AGREE on a
+# foreign name, so the origin guard waves it through) and blocks a fronting
+# proxy that rewrites `Host` (`tailscale serve`/`funnel`, API.md §2.7). It is a
+# 403 for the same reason CROSS_ORIGIN is: the credential may be perfect; the
+# request is simply not addressed to this server.
+HOST_NOT_ALLOWED = "host_not_allowed"
 
 # The media type every mutation must announce. This is the CSRF guard, and it
 # is two lines because of how the browser's rules happen to fall.
@@ -979,6 +988,94 @@ def same_origin(origin, host):
     return bool(sep) and bool(host) and authority == host
 
 
+# The loopback names a `Host` header may legitimately carry, port stripped.
+# `[::1]` keeps its brackets because that is how a v6 authority is written in a
+# URL (and in a `Host`), and `::1` is the bare form the same address arrives as
+# when nothing bracketed it. Both are us. `0.0.0.0` is deliberately absent: it
+# is a bind target, never a name a client would address, so a request claiming
+# it is a request to treat with suspicion, not one to wave through.
+LOOPBACK_HOST_ALIASES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+# `allowed_hosts()` is memoised on the bound host string, because that string is
+# set once at startup (`__main__` writes `CFG["host"]` from the parsed args and
+# never again) and the tailnet-address probe under it shells out. The key is the
+# whole point: a loopback-only server — the default and every one of the 1039
+# tests — never reaches the probe at all, so the guard stays the microseconds
+# the check budget in `check`'s docstring promises. A tailnet bind pays the
+# probe ONCE and serves the cached set thereafter.
+_allowed_hosts = {"host": None, "set": None}
+
+
+def _authority_host(value):
+    """The hostname of a `Host`/authority — lowercased, with the `:port` gone.
+
+    A bracketed v6 (`[::1]`, `[::1]:4242`) keeps its brackets and drops only the
+    port after `]`. A bare v6 (`::1`, two or more colons and no brackets) has no
+    port to strip and is returned whole. `host:port` splits on its single colon.
+    """
+    h = value.strip().lower()
+    if h.startswith("["):
+        end = h.find("]")
+        return h[:end + 1] if end != -1 else h
+    if h.count(":") == 1:               # host:port — a bare v6 has 2+ colons
+        return h.split(":", 1)[0]
+    return h
+
+
+def allowed_hosts():
+    """Every hostname (port stripped, lowercased) this server answers to.
+
+    The loopback aliases, always — the board and every stdlib test speak from
+    one of them. Plus the address we actually bound (`CFG["host"]`), which is
+    already the tailnet node's `100.x` when `--tailnet` detected it (`__main__`
+    writes the detected address there, so this reuses the detection rather than
+    re-deriving or hard-coding it). Plus, on a non-loopback bind, the tailnet
+    address `tailnet.address()` reports — the same source the server advertises
+    itself from — so a phone reaching us by the detected node address is us even
+    if `CFG["host"]` was spelled some other legitimate way.
+
+    A loopback-only server (the default) yields exactly the loopback aliases,
+    which is correct: nothing off this machine is a legitimate `Host` when we
+    are not listening off this machine.
+    """
+    bound = config.CFG.get("host")
+    with _lock:
+        if _allowed_hosts["set"] is not None and _allowed_hosts["host"] == bound:
+            return _allowed_hosts["set"]
+    hosts = set(LOOPBACK_HOST_ALIASES)
+    if bound:
+        hosts.add(_authority_host(str(bound)))
+        if not loopback_bind(str(bound)):
+            addr = tailnet.address()
+            if addr:
+                hosts.add(_authority_host(str(addr)))
+    with _lock:
+        _allowed_hosts.update(host=bound, set=hosts)
+    return hosts
+
+
+def host_allowed(host):
+    """Is this request's `Host` header one this server answers to?
+
+    An ABSENT `Host` passes: there is nothing to allowlist, and rejecting it
+    here would newly refuse the `curl`s and same-machine callers that send none
+    — today's behaviour is preserved exactly. Only a `Host` that is PRESENT and
+    foreign is refused. See `HOST_NOT_ALLOWED`.
+    """
+    if not host:
+        return True
+    return _authority_host(host) in allowed_hosts()
+
+
+def _forget_allowed_hosts():
+    """Tests only: drop the host memo when `CFG["host"]` is rebound to a value
+    the cache has already seen, or when `tailnet.address` is monkeypatched under
+    an unchanged host. Production never needs it — the bound host is written
+    once at startup."""
+    with _lock:
+        _allowed_hosts.update(host=None, set=None)
+
+
 def check(peer, header, method, path, now=None, origin=None, host=None,
           content_type=None):
     """THE check. One call, one answer, and it has side effects on purpose.
@@ -1067,6 +1164,18 @@ def check(peer, header, method, path, now=None, origin=None, host=None,
             return refuse(403, CROSS_ORIGIN,
                           f"this server answers its own pages only; "
                           f"'{origin}' is not one of them", spend=0)
+        if not host_allowed(host):
+            # AFTER `same_origin`, and the order is load-bearing: a request whose
+            # `Origin` and `Host` disagree deserves the CROSS_ORIGIN answer that
+            # names the origin, and only a request where they AGREE on a foreign
+            # name (DNS rebinding) or carries a rewritten `Host` (a fronting
+            # proxy) reaches here. `spend=0` for the same reason CROSS_ORIGIN is:
+            # this is the browser/proxy misaddressing the request, not somebody
+            # guessing a credential, so it must not throttle the real phone.
+            return refuse(403, HOST_NOT_ALLOWED,
+                          f"this server does not answer to Host '{host}'; a "
+                          f"request must address it by an address it is bound "
+                          f"to, not through a proxy that rewrites Host", spend=0)
         if method != "GET" and \
                 (content_type or "").split(";")[0].strip().lower() != JSON_TYPE:
             # See JSON_TYPE: the CSRF guard, not a nicety about media types.

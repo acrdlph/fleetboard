@@ -636,7 +636,7 @@ class TestOnTheWire(unittest.TestCase):
         the first frame."""
         s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
         self.socks.append(s)
-        req = "GET /api/events HTTP/1.1\r\nHost: board\r\n"
+        req = "GET /api/events HTTP/1.1\r\nHost: localhost\r\n"
         if last is not None:
             req += f"Last-Event-ID: {last}\r\n"
         s.sendall((req + "\r\n").encode())
