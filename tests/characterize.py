@@ -35,6 +35,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GOLDEN = ROOT / "tests" / "golden" / "characterization.json"
@@ -385,7 +386,16 @@ def _fixture_fleet(mod, tmp):
              "durationMs": 1000, "pendingWorkflowCount": 0,
              "pendingBackgroundAgentCount": 0}] if name == "beta" else [])) + "\n")
         if name == "gamma":
-            old = 1784600000.0          # fixed, well inside the 48h window
+            # Backdate RELATIVE to now, not to an absolute epoch. An absolute
+            # constant here was a time bomb: written to be "well inside the 48h
+            # window", it silently fell OUT of the window ~26h later, gamma
+            # dropped from the board, and the golden drifted with nobody having
+            # touched the code — the exact "test measures the wrong thing"
+            # failure METHOD.md is about, lodged in the safety net itself.
+            # 24h keeps it in-window and idle for the life of the project; the
+            # mtime it stamps is normalised to <float> in the snapshot anyway,
+            # so using the clock here does not make the golden non-deterministic.
+            old = time.time() - 24 * 3600
             os.utime(proj / f"sess-{name}.jsonl", (old, old))
     return root, home
 
