@@ -148,6 +148,12 @@ public final class FleetStore {
     private static let sidePeriodLive: TimeInterval = 20
     private static let sidePeriodPolling: TimeInterval = 5
 
+    /// The device's own network path. Read by the stream loop to avoid burning
+    /// reconnect attempts against a radio that has nothing to reach, and by the
+    /// UI to tell "this phone has no network" apart from "the server is not
+    /// answering". See `PathMonitor`.
+    public let path = PathMonitor()
+
     public init(client: OrchestraClient) {
         self.client = client
     }
@@ -187,6 +193,7 @@ public final class FleetStore {
     /// iOS will do instead of keeping one alive is leave the server holding one
     /// of its 32 subscriber slots for a client that is not there.
     public func start() {
+        path.start()
         if streamTask == nil {
             streamTask = Task { [weak self] in await self?.streamLoop() }
         }
@@ -349,6 +356,19 @@ public final class FleetStore {
     private func streamLoop() async {
         var attempt = 0
         while !Task.isCancelled {
+            // Off-radio in a dead zone: say so at once and wait quietly for a
+            // path rather than opening sockets into nothing. This is battery in
+            // the field — a phone that keeps a failed connect on a retry timer
+            // keeps the radio awake for it. `.offline(.offline)` is distinct from
+            // the `.offline(error)` set below after four real attempts: this one
+            // means "no network on this device", that one "network is here but
+            // the server is not answering".
+            if !path.isSatisfied {
+                link = .offline(.offline)
+                await path.waitUntilSatisfied()
+                if Task.isCancelled { return }
+                attempt = 0                 // a returned path earns a clean first try
+            }
             link = attempt == 0 ? .connecting : .reconnecting(attempt: attempt)
             let cursor = applier.version.map(String.init)
             let exit = await runStream(cursor: cursor)
