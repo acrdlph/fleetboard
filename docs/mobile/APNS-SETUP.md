@@ -1,4 +1,4 @@
-# APNs setup — exactly what to do at developer.apple.com, in order
+    # APNs setup — exactly what to do at developer.apple.com, in order
 
 The push pipeline is built, tested, and wired. The one thing it cannot contain
 is your **APNs auth key** — a `.p8` file only you can create, because it signs

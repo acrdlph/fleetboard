@@ -14,3 +14,8 @@ __pycache__/
 *.log
 nohup.out
 .DS_Store
+
+# APNs auth keys — never commit a private key
+*.p8
+.orchestra/
+ios/Signing.xcconfig
