@@ -553,6 +553,13 @@ class Snapshot:
     freshness: dict = field(default_factory=dict)
     drift: int = 0
     sweep_ms: float = 0.0
+    # The MONOTONIC token this snapshot was published under — NOT a wire value
+    # and never serialised (it is absent from `stats()` and every `delta_since`
+    # frame). `at` is the wall clock a client dates the frame by; `mono` is only
+    # how `publish` ORDERS competing publishes so a backwards wall step (NTP,
+    # a VM/clone restore, a manual change) cannot freeze the version. §4.3, and
+    # ENGINE §4.5's platform fact that macOS `time.monotonic()` includes sleep.
+    mono: float = 0.0
 
 
 # The stopwatches. Card fields that move on their own with nothing in the world
@@ -627,8 +634,8 @@ class GitCadence:
     def __init__(self, every_s=None):
         self.every_s = _cadence("git_s", GIT_S, every_s)
         self._info = {}          # root -> the last git_info for it
-        self._at = {}            # root -> wall clock of the probe that produced it
-        self._full_at = 0.0      # last full fan-out
+        self._at = {}            # root -> WALL clock of the probe (freshness/wire)
+        self._full_at = 0.0      # last full fan-out, on the MONOTONIC clock
         self._forced = True      # the first resolve always probes
         self.probes = 0          # fan-outs run
         self.reuses = 0          # sweeps that shelled out to git not at all
@@ -639,9 +646,15 @@ class GitCadence:
         self._forced = True
 
     def resolve(self, roots, cold=False):
-        now = time.time()
+        # Two clocks, deliberately: the CADENCE ("has every_s passed since the
+        # last fan-out") rides `time.monotonic()` so a backwards wall step can
+        # never wedge git on its own slow clock forever; the per-root probe
+        # STAMP that lands in `freshness["git"]` stays `time.time()`, because it
+        # is a wire value a client dates the card by. §4.3.
+        now_wall = time.time()
+        now_mono = time.monotonic()
         uniq = list(dict.fromkeys(roots))
-        due = cold or self._forced or (now - self._full_at) >= self.every_s
+        due = cold or self._forced or (now_mono - self._full_at) >= self.every_s
         want = uniq if due else [r for r in uniq if r not in self._info]
         if want:
             got = gitrepo.git_info_many(want)
@@ -651,11 +664,11 @@ class GitCadence:
                 self.drift += sum(1 for r, info in got.items()
                                   if r in self._info and self._info[r] != info)
             for r, info in got.items():
-                self._info[r], self._at[r] = info, now
+                self._info[r], self._at[r] = info, now_wall
         else:
             self.reuses += 1
         if due:
-            self._full_at, self._forced = now, False
+            self._full_at, self._forced = now_mono, False
         for gone in [r for r in self._info if r not in set(uniq)]:
             self._info.pop(gone, None)
             self._at.pop(gone, None)
@@ -860,7 +873,12 @@ class Observer:
 
     def _loop(self):
         while not self._stop.is_set():
-            started = time.time()
+            # MONOTONIC, not wall: every deadline this loop computes — the
+            # reconcile clock, the idle cadence, the nudge/hot floor — must
+            # survive a backwards wall step (NTP, VM/clone restore, manual
+            # change). Wall clock is kept only for wire values (§4.3, ENGINE
+            # §4.5). `_cold_at`/`_nudge_at` are stamped on the same clock.
+            started = time.monotonic()
             cold = (started - self._cold_at) >= self.reconcile_s
             try:
                 self.sweep(cold=cold)
@@ -885,10 +903,10 @@ class Observer:
             nxt = started + self.effective_idle_s
             if self._nudge_at > started:        # nudged while we were sweeping
                 nxt = min(nxt, self._nudge_at + self.hot_s)
-            if self._wake.wait(min(max(0.0, nxt - time.time()), self.max_stale_s)):
+            if self._wake.wait(min(max(0.0, nxt - time.monotonic()), self.max_stale_s)):
                 # woken by a nudge: honour the hot floor so a burst of
                 # mutations cannot turn the loop into a spin
-                floor = started + self.hot_s - time.time()
+                floor = started + self.hot_s - time.monotonic()
                 if floor > 0:
                     self._stop.wait(floor)
 
@@ -897,7 +915,13 @@ class Observer:
     def sweep(self, cold=False):
         """One full collect, published. Also refreshes the request-path cache."""
         t_before, s_before = _cache["t"], _cache["state"]
+        # `started` is WALL: it stamps the request-path cache clock (compared
+        # against `time.time()` in `cached_state`) and the hook-edge TTL (hooks
+        # arrive wall-stamped from Claude Code). `mono` is the MONOTONIC token
+        # that orders publishes and drives the reconcile clock — the two must
+        # not be the same clock, which is the whole fix (§4.3, ENGINE §4.5).
         started = time.time()
+        mono = time.monotonic()
         t0 = time.perf_counter()
         fresh = {}
         state = collect_state(
@@ -919,14 +943,14 @@ class Observer:
         self._drift = (self._git.drift + transcripts.memo_drift()
                        + procs.proc_memo_drift())
         if cold:
-            self._cold_at = started
+            self._cold_at = mono          # MONOTONIC — the loop's cold clock
         # Compare-and-swap, never a blind write. A mutation that parked
         # `_cache["t"] = 0.0` while this sweep was in flight means the state we
         # just collected predates it; dropping our write leaves the next request
         # to collect synchronously — exactly what happens today.
         if _cache["t"] == t_before and _cache["state"] is s_before:
             _cache["state"], _cache["t"] = state, started
-        snap = self.publish(state, fresh=fresh, sweep_ms=ms)
+        snap = self.publish(state, fresh=fresh, sweep_ms=ms, mono=mono)
         if self._watcher is not None:
             # AFTER the publish, never before: `_live_pids` reads the snapshot,
             # so a rearm here arms the exit watches for the fleet this sweep
@@ -936,8 +960,23 @@ class Observer:
             self._watcher.rearm("sweep")
         return snap
 
-    def publish(self, state, fresh=None, sweep_ms=None):
+    def publish(self, state, fresh=None, sweep_ms=None, mono=None):
         """Turn one `collect_state()` result into a snapshot.
+
+        `mono` is the MONOTONIC token the caller captured at collect start, and
+        it — not the wall `at` — is what ORDERS competing publishes. Two threads
+        publish (the sweep and a request-path `cached_state` that fell past
+        `republish_s`), and the older must lose; ordering that on wall `at` meant
+        a single BACKWARDS wall step (NTP correction, a VM/clone restore, a
+        manual clock change) made every subsequent sweep's `generated_at` land
+        below `prev.at`, the regress guard returned `prev` for the whole delta,
+        and no new version published — the SSE stream / notifier / phone frozen
+        while the loop ran on. `time.monotonic()` cannot step backwards (and on
+        macOS includes sleep — ENGINE §4.5), so it orders honestly. `at` stays
+        wall: it is the wire clock a client derives age from and must not move.
+        Left `None` — a direct `publish()` in a test, or a legacy caller — the
+        guard falls back to the wall `at` it used before, so nothing that does
+        not opt in changes.
 
         `v` bumps ONLY when the composed view differs (§3.2). A sweep that finds
         nothing new refreshes `at` and `freshness` and publishes no new version:
@@ -958,8 +997,17 @@ class Observer:
         counts = dict(state.get("counts", {}))
         with self._cv:
             prev = self._snap
-            if prev is not None and now < prev.at:
-                return prev      # an older collect landing late — never regress
+            if prev is not None:
+                # order by the MONOTONIC token when the caller passed one, else
+                # fall back to the wall `at` (a bare test/legacy publish). Under
+                # the sweep loop `mono` is always present, which is what makes a
+                # backwards wall step unable to freeze the version.
+                regressed = (mono < prev.mono) if mono is not None else (now < prev.at)
+                if regressed:
+                    return prev  # an older collect landing late — never regress
+            # what THIS snapshot is ordered under: the token if given, else carry
+            # the wall value so a mixed run is still monotonically non-decreasing
+            snap_mono = mono if mono is not None else now
             if fresh:
                 self._fresh.update(fresh)
             if sweep_ms is not None:
@@ -974,7 +1022,8 @@ class Observer:
                 # the cards carry the current stopwatch readings.
                 self._snap = replace(prev, at=now, cards=cards, other_procs=other,
                                      freshness=dict(self._fresh),
-                                     drift=self._drift, sweep_ms=self._sweep_ms)
+                                     drift=self._drift, sweep_ms=self._sweep_ms,
+                                     mono=snap_mono)
                 return self._snap
             old_d = self._dcards if prev is not None else {}
             changed = [k for k, c in new_d.items() if old_d.get(k) != c]
@@ -983,7 +1032,8 @@ class Observer:
             self._hist.append((self._version, tuple(changed)))
             self._dcards, self._dother = new_d, new_o
             self._snap = Snapshot(self._version, now, cards, other, counts,
-                                  dict(self._fresh), self._drift, self._sweep_ms)
+                                  dict(self._fresh), self._drift, self._sweep_ms,
+                                  snap_mono)
             self._cv.notify_all()
             return self._snap
 
@@ -995,10 +1045,10 @@ class Observer:
 
     def wait_for(self, after, timeout=30.0):
         """Block until a version newer than `after` is published. None on timeout."""
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout      # a duration, so monotonic (§4.3)
         with self._cv:
             while self._version <= after:
-                left = deadline - time.time()
+                left = deadline - time.monotonic()
                 if left <= 0:
                     return None
                 self._cv.wait(left)
@@ -1192,7 +1242,10 @@ class Observer:
         which `freshness["git"]` still dates on the card.
         """
         try:
-            self._nudge_at = time.time()
+            # MONOTONIC: `_loop` compares this against its own monotonic
+            # `started` to decide whether a nudge landed mid-sweep. Same clock
+            # on both sides, so a backwards wall step cannot strand a nudge.
+            self._nudge_at = time.monotonic()
             self._nudge_reason = reason
             self._nudges += 1
             if git:
@@ -1403,6 +1456,7 @@ def cached_state():
         # collect is synchronous and on the real fleet takes seconds, which is
         # plenty of room for a mutation to park `_cache["t"] = 0.0` under it.
         t_before, s_before = _cache["t"], _cache["state"]
+        collect_mono = time.monotonic()   # orders this publish against the sweep's
         fresh = {}
         # …through the sweep's own Settler when there is one. A collect on the
         # request thread that skipped it would publish an un-damped status and
@@ -1431,6 +1485,6 @@ def cached_state():
         if _observer is not None:
             # a collect is a collect: publish it, or the version and the
             # freshness map would silently miss everything a mutation caused.
-            _observer.publish(state, fresh=fresh)
+            _observer.publish(state, fresh=fresh, mono=collect_mono)
         return state
     return _cache["state"]

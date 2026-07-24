@@ -258,6 +258,34 @@ def _proven_in_transcript(fp, offset, text, timeout_s=20.0, ident=None):
     return False
 
 
+def _resumed_transcript(proj_dir, before):
+    """The transcript the `claude --resume` fork is actually writing to.
+
+    `--resume` does NOT continue the old sid in place — it forks a fresh
+    session with a new sid and a new .jsonl, so the resume message lands in a
+    file the pre-fork sid's transcript never sees. Watching that old file for
+    the receipt therefore never confirms, the send retries, and one resume is
+    typed two or three times into the agent — real, unattended spend. So after
+    the fork we resolve the file the fork created (ADR 0008: after a fork the
+    durable identity of the conversation is the new transcript, not the sid we
+    armed against): the transcript in the project dir that appeared after we
+    launched (not in `before`), or — if none is new yet — the freshest one,
+    which is the session being actively written."""
+    if not proj_dir:
+        return None
+    fresh = fresh_m = fallback = fallback_m = None
+    for f in proj_dir.glob("*.jsonl"):
+        try:
+            m = f.stat().st_mtime
+        except OSError:
+            continue
+        if fallback_m is None or m > fallback_m:
+            fallback, fallback_m = f, m
+        if f not in before and (fresh_m is None or m > fresh_m):
+            fresh, fresh_m = f, m
+    return fresh or fallback
+
+
 def _tmux_resume(worktree, cwd, home, sid):
     """No terminal to type into — reopen the conversation in a fleet tmux
     session (claude --resume <sid>) and send it the resume message there.
@@ -267,7 +295,12 @@ def _tmux_resume(worktree, cwd, home, sid):
     into either phase vanishes — while the bare composer it leaves behind
     reads as delivered. So the send waits out reload and compaction, and the
     only accepted receipt is the session file gaining the message; anything
-    less retries, then reports failure with the attach command."""
+    less retries, then reports failure with the attach command.
+
+    The receipt is watched on the file the fork creates, NOT the pre-fork sid:
+    `--resume` forks a new session/transcript, so the write never touches the
+    old sid's file — watching it confirmed nothing and re-sent (twice, thrice)
+    for one resume."""
     name = ("resume-" + re.sub(r"[^a-zA-Z0-9]+", "-", worktree).strip("-").lower()
             + time.strftime("-%H%M%S"))
     shell_cmd = (f"export CLAUDE_CONFIG_DIR={shlex.quote(str(home))}\n"
@@ -279,12 +312,20 @@ def _tmux_resume(worktree, cwd, home, sid):
                 "message": f"tmux failed: {out or 'is tmux installed?'}"}
     attach = f"tmux -L {dispatch.FLEET_SOCK} attach -t {name}"
     where = f"no scriptable terminal — resumed in tmux · {attach}"
-    fp = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
+    # Anchor on the pre-fork sid file only to LOCATE the project dir and snapshot
+    # what was there before the fork; the fork's own transcript is resolved from
+    # that dir each pass (it may only appear once the reload finishes).
+    pre = next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
+    proj = pre.parent if pre else None
+    before = set(proj.glob("*.jsonl")) if proj else set()
     msg = config.CFG.get("resume_message", "continue")
     _wait_composer_idle(name, RESUME_READY_S)
     for attempt in range(3):
         if attempt:   # the last paste vanished — let the CLI settle, try again
             _wait_composer_idle(name, 90.0)
+        # watch the session the fork created — never the pre-fork sid, whose
+        # file the resume message never reaches (that was the triple-send)
+        fp = _resumed_transcript(proj, before) or pre
         try:
             # identity rides along with the offset: together they are what makes
             # the offset trustworthy on the next read
