@@ -38,6 +38,17 @@ public struct FleetView: View {
     @State private var collapsed: Set<BoardSection> = Set(
         BoardSection.allCases.filter(\.collapsedByDefault)
     )
+    /// The board order held while a finger is on the grid. `nil` renders the live
+    /// order; a snapshot means an interaction is in progress and the order is
+    /// frozen to what was on screen when it began — so a card cannot re-sort out
+    /// from under a tap (`UX.md` §4.1's hold rule). `boardTouched` is the finger,
+    /// `boardScrolling` the momentum tail after it lifts; the order is applied
+    /// once both are quiet and a short settle has passed. `holdToken` bumps on
+    /// every interaction transition and drives that settle from `.task(id:)`.
+    @State private var heldGroups: [Triage.Group]?
+    @State private var boardTouched = false
+    @State private var boardScrolling = false
+    @State private var holdToken = 0
     /// A destination to push once, on appear. Nil in every shipping path; it is
     /// how a script reaches a screen a simulator cannot be tapped into.
     private let initialRoute: FleetRoute?
@@ -204,6 +215,19 @@ public struct FleetView: View {
         }
     }
 
+    /// What the board renders: the frozen snapshot while an interaction is in
+    /// progress, the live sectioned board otherwise. The comparator is untouched —
+    /// this only defers *applying* a reorder while a finger is down.
+    private var displayedGroups: [Triage.Group] {
+        heldGroups ?? store.groups
+    }
+
+    /// Snapshot the current order the instant an interaction begins, once — later
+    /// frames must not slide cards while the snapshot stands.
+    private func freezeOrder() {
+        if heldGroups == nil { heldGroups = store.groups }
+    }
+
     private var board: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Space.md, pinnedViews: [.sectionHeaders]) {
@@ -212,7 +236,7 @@ public struct FleetView: View {
                     // The board stayed on screen; say WHY it is not moving.
                     StaleBanner(error: error, since: store.lastFrameAt ?? store.lastGoodAt, now: now)
                 }
-                ForEach(store.groups) { group in
+                ForEach(displayedGroups) { group in
                     SwiftUI.Section {
                         if !collapsed.contains(group.section) {
                             ForEach(group.cards) { card in
@@ -238,6 +262,42 @@ public struct FleetView: View {
         }
         .scrollIndicators(.hidden)
         .refreshable { await store.refresh() }
+        // Hold the board order while a finger is down and through the momentum
+        // that follows, then apply whatever the store now holds. Freezing on the
+        // first touch is what keeps a tap on the card the user aimed at
+        // (`UX.md` §4.1). `DragGesture(minimumDistance: 0)` in a
+        // `.simultaneousGesture` reads touch-began/ended without swallowing the
+        // row taps, the scroll, or the pull-to-refresh; `onScrollPhaseChange`
+        // carries the hold across the coast after the finger lifts. Every
+        // transition bumps `holdToken`, which re-arms the settle below.
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    guard !boardTouched else { return }
+                    boardTouched = true
+                    freezeOrder()
+                    holdToken &+= 1
+                }
+                .onEnded { _ in
+                    boardTouched = false
+                    holdToken &+= 1
+                }
+        )
+        .onScrollPhaseChange { _, newPhase in
+            boardScrolling = newPhase != .idle
+            if boardScrolling { freezeOrder() }
+            holdToken &+= 1
+        }
+        // The settle. Re-armed on every interaction transition (`holdToken`), it
+        // applies the live order only once the finger is up and the list is at
+        // rest, after a 700 ms window that also outlasts the tap being consumed
+        // (`UX.md` §4.1). A new touch bumps the token and cancels this run.
+        .task(id: holdToken) {
+            guard !boardTouched, !boardScrolling, heldGroups != nil else { return }
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard !Task.isCancelled, !boardTouched, !boardScrolling else { return }
+            heldGroups = nil
+        }
     }
 
     private var headline: some View {
