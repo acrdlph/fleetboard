@@ -18,6 +18,22 @@ public actor OrchestraClient {
     private(set) var profile: ServerProfile?
     private(set) var tokens: any TokenSource
 
+    /// The session-wide cap on a whole transfer (`timeoutIntervalForResource`).
+    ///
+    /// **It must exceed the largest per-route deadline, with slack.** Unlike
+    /// `URLRequest.timeoutInterval` — which overrides the session's
+    /// `timeoutIntervalForRequest` (the inter-packet idle timer) per request —
+    /// the resource timeout is session-level and has *no* per-request override,
+    /// so it hard-caps the entire task no matter what a route asked for. At the
+    /// old value of 20 s it silently truncated `finish` (120 s) and `send`
+    /// (25 s): a legitimate long closeout that the server completed in 25–45 s
+    /// was aborted at 20 s with `NSURLErrorTimedOut` and misreported as
+    /// `.macUnreachable`, inviting the exact double-actuation `finish` exists to
+    /// prevent. 180 s is `finish`'s 120 s plus generous slack. `EndpointTests`
+    /// pins the fleet-wide invariant `endpoint.timeout <= sessionResourceTimeout`
+    /// so a new long route cannot silently reintroduce the cap.
+    public static let sessionResourceTimeout: TimeInterval = 180
+
     public init(profile: ServerProfile? = nil,
                 tokens: any TokenSource = StaticTokenSource(nil),
                 session: URLSession? = nil) {
@@ -35,7 +51,10 @@ public actor OrchestraClient {
             config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             config.waitsForConnectivity = false   // we want the error, not a wait
             config.timeoutIntervalForRequest = 10
-            config.timeoutIntervalForResource = 20
+            // Per-request `timeoutInterval` (set in `Endpoint.urlRequest`) is the
+            // tight idle deadline; the resource cap only exists to bound a task
+            // whose packets keep trickling. It MUST clear the longest route.
+            config.timeoutIntervalForResource = Self.sessionResourceTimeout
             config.httpAdditionalHeaders = ["Accept": "application/json"]
             self.session = URLSession(configuration: config)
         }
@@ -173,7 +192,7 @@ public actor OrchestraClient {
     }
 
     public func testPush() async throws -> ActionReply {
-        try await send(.pushTest, to: profile, as: ActionReply.self)
+        try await send(Endpoint.pushTest(), to: profile, as: ActionReply.self)
     }
 
     /// Answer an agent from a notification. Addressed by `sid` alone — the reply

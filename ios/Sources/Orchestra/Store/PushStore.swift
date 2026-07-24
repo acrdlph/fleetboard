@@ -56,15 +56,45 @@ public final class PushStore {
     /// The token last sent to THIS server, so a foreground that finds the same
     /// token does not re-POST for nothing, and a rotated one does.
     private var lastSentToken: String?
+    /// The tz offset the token was last sent WITH. Quiet hours are evaluated by
+    /// the server in the device's zone from this offset, and iOS gives no
+    /// background callback for a zone change — so a flight or a DST edge that
+    /// moves the offset while the token is unchanged must still re-POST, or
+    /// quiet hours keep running in the old zone until the app is relaunched.
+    private var lastSentTZOffsetMin: Int?
+    /// The server identity the token was last sent to. A re-pair to a different
+    /// Mac in one session leaves the token unchanged but the server new; without
+    /// this the skip fires and the new Mac never receives the token.
+    private var lastSentServer: String?
 
     private static let settingsKey = "sh.orchestra.push-settings"
     private static let tokenKey = "sh.orchestra.push-token"
+    private static let tzKey = "sh.orchestra.push-tz"
+    private static let serverKey = "sh.orchestra.push-server"
+    private static let muteKey = "sh.orchestra.push-muted-until"
 
     public init(client: OrchestraClient, defaults: UserDefaults = .standard) {
         self.client = client
         self.defaults = defaults
         self.settings = Self.loadSettings(defaults) ?? PushSettings()
         self.lastSentToken = defaults.string(forKey: Self.tokenKey)
+        self.lastSentTZOffsetMin = defaults.object(forKey: Self.tzKey) as? Int
+        self.lastSentServer = defaults.string(forKey: Self.serverKey)
+        // A mute the server is still honouring must show as active after a
+        // relaunch — the server holds the authoritative `muted_until` but returns
+        // it on no route, so the last one this app set is persisted and restored
+        // until it has passed.
+        if let until = defaults.object(forKey: Self.muteKey) as? Double,
+           until > Date().timeIntervalSince1970 {
+            self.mutedUntil = Date(timeIntervalSince1970: until)
+        }
+    }
+
+    /// The server identity a registration was sent to. Prefers the pairing's
+    /// device id (stable across relaunch, distinct per Mac); falls back to the
+    /// address.
+    private static func identity(_ profile: ServerProfile) -> String {
+        profile.deviceID.isEmpty ? "\(profile.host):\(profile.port)" : profile.deviceID
     }
 
     // MARK: - authorization
@@ -89,7 +119,13 @@ public final class PushStore {
     public func register(tokenHex: String, environment: String,
                          tzOffsetMin: Int = PushStore.currentTZOffsetMin(),
                          force: Bool = false) async {
+        let server = await client.currentProfile().map(Self.identity)
+        // The POST also carries the tz offset and reaches a specific server, so
+        // "unchanged" is all three agreeing — not the token alone. A moved zone
+        // or a new Mac is a change even when the APNs token is stable for weeks.
         let unchanged = tokenHex == lastSentToken
+            && tzOffsetMin == lastSentTZOffsetMin
+            && server == lastSentServer
         if unchanged, !force, case .registered = registration { return }
         registration = .registering
         do {
@@ -98,7 +134,15 @@ public final class PushStore {
                 appVersion: Self.appVersion, settings: settings.settingsBody)
             if reply.ok {
                 lastSentToken = tokenHex
+                lastSentTZOffsetMin = tzOffsetMin
+                lastSentServer = server
                 defaults.set(tokenHex, forKey: Self.tokenKey)
+                defaults.set(tzOffsetMin, forKey: Self.tzKey)
+                if let server {
+                    defaults.set(server, forKey: Self.serverKey)
+                } else {
+                    defaults.removeObject(forKey: Self.serverKey)
+                }
                 registration = .registered(environment: reply.environment ?? environment,
                                            warnings: reply.warnings)
             } else {
@@ -140,17 +184,45 @@ public final class PushStore {
     /// Returns a message on refusal, nil on success.
     @discardableResult
     public func save(_ new: PushSettings) async -> String? {
+        // The mirror is the display truth — no server route returns a device's
+        // stored preferences — so an optimistic write that is never rolled back
+        // leaves the screen showing a rule the server refused (or never received)
+        // forever: the "toggle that lies". Hold the previous value; restore it on
+        // any non-success.
+        let previous = settings
         settings = new
         Self.persist(new, defaults)
         do {
             let reply = try await client.savePushSettings(body: new.settingsBody)
-            if !reply.ok { return reply.text }
+            if !reply.ok {
+                settings = previous
+                Self.persist(previous, defaults)
+                return reply.text
+            }
             return nil
         } catch let error as OrchestraError {
+            settings = previous
+            Self.persist(previous, defaults)
             return Self.message(for: error)
         } catch {
+            settings = previous
+            Self.persist(previous, defaults)
             return ErrnoCause.classify(error).headline
         }
+    }
+
+    /// The paired server changed (unpair, or a re-pair to another Mac). Clear the
+    /// registration memo so the next `register` is not skipped as "unchanged" —
+    /// the new server has none of this device's state. Wire from the pairing
+    /// `configure`/`unpair` path — see `cross_file_needed`.
+    public func serverDidChange() {
+        lastSentToken = nil
+        lastSentTZOffsetMin = nil
+        lastSentServer = nil
+        registration = .idle
+        defaults.removeObject(forKey: Self.tokenKey)
+        defaults.removeObject(forKey: Self.tzKey)
+        defaults.removeObject(forKey: Self.serverKey)
     }
 
     /// A hard snooze. `minutes <= 0` clears it.
@@ -158,7 +230,15 @@ public final class PushStore {
     public func mute(minutes: Double) async -> String? {
         do {
             _ = try await client.mutePush(minutes: minutes)
-            mutedUntil = minutes > 0 ? Date().addingTimeInterval(minutes * 60) : nil
+            let until = minutes > 0 ? Date().addingTimeInterval(minutes * 60) : nil
+            mutedUntil = until
+            // Persist so a relaunch during an active mute shows the mute, not an
+            // unmuted screen over a server that is still suppressing pushes.
+            if let until {
+                defaults.set(until.timeIntervalSince1970, forKey: Self.muteKey)
+            } else {
+                defaults.removeObject(forKey: Self.muteKey)
+            }
             return nil
         } catch let error as OrchestraError {
             return Self.message(for: error)
