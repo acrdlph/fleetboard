@@ -100,6 +100,14 @@
 	<key>NSCameraUsageDescription</key>
 	<string>orchestra scans the pairing code shown on your Mac.</string>
 	<!--
+	  Required or the FIRST `.deviceOwnerAuthentication` evaluation crashes the
+	  app on a Face ID device. It gates the paired board behind Face ID / Touch
+	  ID / passcode (see `App/BiometricGate.swift`). Passcode fallback needs no
+	  key; only Face ID does.
+	-->
+	<key>NSFaceIDUsageDescription</key>
+	<string>orchestra uses Face ID to unlock the fleet on this phone.</string>
+	<!--
 	  Included DEFENSIVELY. Whether iOS's local-network gate fires for a
 	  `utun`-routed 100.64/10 destination is unverified (IOS-APP.md §11 lists it
 	  as a day-one empirical task). Including the key costs one plist entry;
