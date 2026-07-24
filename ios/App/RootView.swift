@@ -6,6 +6,13 @@ struct RootView: View {
     @Bindable var model: AppModel
     @State private var tab = 0
 
+    /// The device-owner check in front of the paired app. Held here, at the one
+    /// place the board is revealed, so every tab and every mutation lives behind
+    /// a single gate. See `BiometricGate` — it is advisory (threat T10); the real
+    /// controls are server-side.
+    @State private var gate = BiometricGate()
+    @Environment(\.scenePhase) private var scenePhase
+
     /// Nil in every shipping build. See `DebugRoute`.
     private var initialFleetRoute: FleetRoute? {
         #if DEBUG
@@ -66,12 +73,40 @@ struct RootView: View {
     var body: some View {
         Group {
             if model.pairing.isPaired {
-                paired
+                // The board — and with it every mutation (dispatch / send /
+                // finish / resume, all reachable only from inside these tabs) —
+                // is behind a successful device-owner check. Nothing paired is
+                // shown or tappable until `gate.isUnlocked`.
+                if gate.isUnlocked {
+                    paired
+                } else {
+                    LockView(gate: gate)
+                        // Cold-launch prompt. `authenticateIfNeeded` only fires
+                        // from `locked`, so this is a no-op once unlocked or after
+                        // a cancel, and cannot race the foreground re-prompt below.
+                        .task { await gate.authenticateIfNeeded() }
+                }
             } else {
                 PairingScreen(store: model.pairing)
             }
         }
         .background(Palette.canvas)
+        // Re-lock when the phone leaves the foreground, so a device left unlocked
+        // and handed to someone else must re-authenticate on return. The trigger
+        // is `.background`, **not `.inactive`** — the app switcher, Control Center
+        // and a notification banner must not force a re-prompt. This mirrors the
+        // stream-teardown rule in `AppModel.scenePhaseChanged`.
+        .onChange(of: scenePhase) { _, phase in
+            guard model.pairing.isPaired else { return }
+            switch phase {
+            case .background:
+                gate.lock()
+            case .active:
+                Task { await gate.authenticateIfNeeded() }
+            default:
+                break
+            }
+        }
         .onOpenURL { url in
             // The pairing QR is `orc://p?h=…&p=…&c=…`, so scanning it with the
             // SYSTEM camera opens the app straight here. Same ticket, same
@@ -187,5 +222,89 @@ private struct ConnectionBarModifier: ViewModifier {
             }
             .environment(\.bottomAccessoryHeight, barHeight)
             .onReceive(ticker) { now = $0 }
+    }
+}
+
+/// The "unlock to continue" state, shown in place of the whole paired app while
+/// `BiometricGate` is anything but `unlocked`.
+///
+/// It always offers an explicit button — the system sheet can be dismissed, an
+/// evaluation can be cancelled, and a screen with no way forward is a trap. On a
+/// failure it names what happened without blaming the user and lets them retry.
+/// The footnote is deliberately modest: this lock lives on the phone, and it says
+/// so, because the controls that actually hold the fleet are on the Mac (T10).
+private struct LockView: View {
+    let gate: BiometricGate
+
+    var body: some View {
+        ZStack {
+            Palette.canvas.ignoresSafeArea()
+            BodyWash()
+            VStack(spacing: Space.lg) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 40, weight: .semibold))
+                    .foregroundStyle(Palette.statusFree)
+                    .accessibilityHidden(true)
+
+                VStack(spacing: Space.sm) {
+                    Text("orchestra is locked")
+                        .font(OrcFont.title)
+                        .foregroundStyle(Palette.textPrimary)
+                    Text("Unlock with Face ID, Touch ID, or your passcode to reach the fleet.")
+                        .font(OrcFont.bodyCompact)
+                        .foregroundStyle(Palette.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                if case .failed(let reason) = gate.phase {
+                    Text(reason)
+                        .font(OrcFont.status)
+                        .foregroundStyle(Palette.statusNeeds)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                        .padding(Space.md)
+                        .background(
+                            RoundedRectangle(cornerRadius: Radius.sm, style: .continuous)
+                                .stroke(Palette.statusNeeds.opacity(0.5), lineWidth: 1)
+                        )
+                }
+
+                unlockButton
+
+                Text("This lock lives on this phone. What guards the fleet is on your "
+                     + "Mac — a per-device token you can revoke at any time.")
+                    .font(OrcFont.meta)
+                    .foregroundStyle(Palette.textTertiary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(Space.xl)
+            .frame(maxWidth: 420)
+        }
+    }
+
+    private var unlockButton: some View {
+        Button {
+            Task { await gate.authenticate() }
+        } label: {
+            Text(buttonTitle)
+                .font(OrcFont.button)
+                .frame(maxWidth: .infinity, minHeight: 44)
+        }
+        .foregroundStyle(Palette.statusWorking)
+        .background(Palette.statusWorking.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Radius.sm, style: .continuous)
+                .stroke(Palette.statusWorking, lineWidth: 1)
+        )
+        .disabled(gate.isAuthenticating)
+    }
+
+    private var buttonTitle: String {
+        switch gate.phase {
+        case .authenticating: return "unlocking…"
+        case .failed: return "Try again"
+        default: return "Unlock"
+        }
     }
 }
