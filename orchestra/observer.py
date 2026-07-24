@@ -189,7 +189,8 @@ def collect_state(fresh=None, git=None, cold=False, settle=None, hooks=None):
                 succ = [a for a in alive if a["last_write_at"] > s["last_write_at"]]
                 if succ:
                     s["handed_to"] = max(succ, key=lambda a: a["last_write_at"])["account"]
-        ss.sort(key=lambda s: (4.5 if s.get("handed_to") else rank[s["status"]],
+        ss.sort(key=lambda s: (4.5 if s.get("handed_to")
+                               else rank.get(s["status"], len(rank)),
                                -s["last_write_at"]))
 
     def _attention_statuses(ss):
@@ -264,6 +265,15 @@ def collect_state(fresh=None, git=None, cold=False, settle=None, hooks=None):
         for s in c["sessions"]:
             if s["status"] == "limit" and s.get("handed_to"):
                 continue  # informational — work already continues elsewhere
+            # `unknown` (a live process whose transcript is missing, or a
+            # wholesale ps/lsof failure) is not one of the six tallied buckets,
+            # so skip it — `counts[...] += 1` would KeyError and take the whole
+            # projection down over one unclassifiable session. The card it sits
+            # on is still `busy` (card_availability, has_live), so it is not lost;
+            # it just isn't one of the strip's six categories, and the wire shape
+            # stays frozen (no new key on every payload).
+            if s["status"] not in counts:
+                continue
             counts[s["status"]] += 1
     return {
         "generated_at": now,

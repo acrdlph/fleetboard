@@ -188,6 +188,18 @@ CFG = {
     # ● WORKING after an agent is gone (driven, 6 runs: the transcript is
     # 0.82–0.87 s old at the moment the process disappears from `ps`).
     "orphan_grace_s": 90,      # a fresh write with no process: seen yet, or over
+    # `stale_alive_s` — a live process paired to a transcript silent THIS long is
+    # not a session waiting for you. It is the ceiling on the ◆ YOUR TURN decay
+    # guess: past it, `classify_session` returns `unknown` (card stays busy, never
+    # cries "needs you") instead of guessing the user's turn from hours-old bytes.
+    # This only bites the pathological case — a live process whose OWN session
+    # has no readable transcript, mis-paired to a done sibling (seen for real when
+    # a full disk stopped a workflow-running session from writing its `.jsonl`).
+    # Deliberately LARGE: an agent legitimately idle at the prompt for an hour is
+    # still ◆ YOUR TURN, and only silence no live session ever really shows —
+    # hours — is demoted. Six hours; raise it if you leave agents parked overnight.
+    "stale_alive_s": 21600,
+
     # `subagent_grace_s` — how long after the last write anywhere under
     # `<session-id>/` the card still shows ⚙ subagents running. The last of the
     # inherited numbers, and the only one that was measurably TOO SHORT.
