@@ -591,6 +591,24 @@ def quiet_now(prefs, now=None):
 
 # ------------------------------------------------------------------ compose
 
+# The APNs `aps.category` iOS reads AT DELIVERY to decide whether to hang an
+# inline-reply text field on the banner — before the user touches it, and
+# without any app code running (there is no NSE, and even one couldn't change
+# the reply affordance retroactively). It MUST name a category the app
+# registered (`ios/App/PushController.categories`): "ORC_REPLY" carries the
+# reply field, "ORC_INFO" carries nothing and just opens the app on tap. And the
+# answerable rule MUST match `ios Push.isAnswerable`. There is no shared source
+# across the language boundary, so the two are kept in step by this comment and
+# `test_notify` — a divergence means either a dead Reply button (server said
+# INFO) or a Reply button that goes nowhere (server said REPLY with no sid).
+REPLY_CATEGORY = "ORC_REPLY"
+INFO_CATEGORY = "ORC_INFO"
+# An agent actually waiting on the user — and only these two, per iOS
+# `isAnswerable`. `session.your_turn` is a nudge, not a question, so it opens the
+# app rather than offering a reply box that would type into a finished turn.
+ANSWERABLE_EVENTS = frozenset({"session.needs_answer", "session.blocked"})
+
+
 def _title(event):
     """The first line, and it carries NO leading glyph — see UX.md §8.5. The
     worktree is the subject because that is what the user navigates by."""
@@ -675,6 +693,13 @@ def compose(event, privacy="structural", server="orchestra", badge=None):
         aps.pop("sound", None)             # quiet: no sound
     else:
         aps["sound"] = "default"
+    # The reply affordance, decided on the wire (see REPLY_CATEGORY). Only an
+    # answerable event WITH a session to answer gets the field — an answerable
+    # event with no sid has nowhere to send the text, so it opens the app
+    # instead of showing a dead reply box.
+    aps["category"] = (REPLY_CATEGORY
+                       if event.type in ANSWERABLE_EVENTS and event.session_id
+                       else INFO_CATEGORY)
 
     payload = {"aps": aps,
                "ev": event.type,

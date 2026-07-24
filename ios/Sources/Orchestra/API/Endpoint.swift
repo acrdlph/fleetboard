@@ -18,15 +18,55 @@ public struct Endpoint: Sendable {
     /// routes, and sending a token to them is pointless rather than harmful.
     /// Marking them keeps an unpaired app from looking like a broken paired one.
     public let requiresToken: Bool
+    /// The wire-idempotency identity for THIS user action, or `nil` for a read.
+    ///
+    /// Minted once when the mutation is constructed (see `mutation` /
+    /// `freshIdempotency`) and carried verbatim into every `urlRequest` built
+    /// from this value, so a `URLSession`-level retry re-sends the **same** key
+    /// and the server dedupes it rather than launching a second agent (API.md
+    /// §4). A fresh user action mints a fresh key.
+    public let idempotency: Idempotency?
+
+    /// `Idempotency-Key` (a client UUID) and `Idempotency-Issued-At` (a float
+    /// epoch, the moment the user committed), the pair API.md §4.1 requires on
+    /// every mutation. Bundled so the two are minted and travel together.
+    public struct Idempotency: Sendable, Equatable {
+        public let key: String
+        public let issuedAt: Double
+        public init(key: String, issuedAt: Double) {
+            self.key = key
+            self.issuedAt = issuedAt
+        }
+    }
 
     public init(method: Method, path: String, query: [URLQueryItem] = [],
-                body: Data? = nil, timeout: TimeInterval, requiresToken: Bool) {
+                body: Data? = nil, timeout: TimeInterval, requiresToken: Bool,
+                idempotency: Idempotency? = nil) {
         self.method = method
         self.path = path
         self.query = query
         self.body = body
         self.timeout = timeout
         self.requiresToken = requiresToken
+        self.idempotency = idempotency
+    }
+
+    /// A fresh idempotency identity for one user action. The key is minted here,
+    /// once; reusing this `Endpoint` (a `URLSession` retry) re-sends it, and a
+    /// new user action calls this again for a new key — never regenerate on
+    /// retry (API.md §4.1). `issuedAt` is the client wall clock as a float
+    /// epoch; it is NOT yet skew-corrected against the server's `at` (§6.5) —
+    /// that correction lives above this layer.
+    static func freshIdempotency() -> Idempotency {
+        Idempotency(key: UUID().uuidString, issuedAt: Date().timeIntervalSince1970)
+    }
+
+    /// A POST that changes the world: a JSON body and a fresh idempotency key.
+    /// Every mutation goes through here so none can forget either half.
+    static func mutation(path: String, body: Data, timeout: TimeInterval,
+                         requiresToken: Bool = true) -> Endpoint {
+        Endpoint(method: .post, path: path, body: body, timeout: timeout,
+                 requiresToken: requiresToken, idempotency: freshIdempotency())
     }
 
     /// A cold tunnel wake-up is the thing this number exists to survive.
@@ -102,9 +142,13 @@ public struct Endpoint: Sendable {
     // **415 `content_type_required`** before it reaches a handler. That is the
     // CSRF guard, verified by sending one without.
     //
-    // None of them carries an idempotency key, because the server has nowhere to
-    // put one — see `Actuation`. A header this server ignores would look like a
-    // guarantee and be none.
+    // Each now carries an `Idempotency-Key` (a fresh client UUID) and
+    // `Idempotency-Issued-At`, the client half of the wire-idempotency contract
+    // the server ships (API.md §4): a retry of the SAME request — a `URLSession`
+    // resend, a background relaunch — replays the stored result instead of
+    // launching a second agent in the worktree. The key is minted once, when the
+    // mutation is built (`mutation`), and is stable for the life of that value;
+    // a new user action builds a new mutation and so mints a new key.
 
     /// `POST /api/send` — type into an agent's terminal.
     ///
@@ -120,9 +164,9 @@ public struct Endpoint: Sendable {
                             text: String) throws -> Endpoint {
         let payload: [String: String] = ["account": account, "sid": sid,
                                          "worktree": worktree, "text": text]
-        return Endpoint(method: .post, path: "/api/send",
+        return mutation(path: "/api/send",
                         body: try JSONSerialization.data(withJSONObject: payload),
-                        timeout: 25, requiresToken: true)
+                        timeout: 25)
     }
 
     /// `POST /api/dispatch` — launch a mission. **Spends real money.**
@@ -142,9 +186,9 @@ public struct Endpoint: Sendable {
                                       "effort": effort, "force_model": forceModel]
         if let worktree { payload["worktree"] = worktree }
         if let account { payload["account"] = account }
-        return Endpoint(method: .post, path: "/api/dispatch",
+        return mutation(path: "/api/dispatch",
                         body: try JSONSerialization.data(withJSONObject: payload),
-                        timeout: 20, requiresToken: true)
+                        timeout: 20)
     }
 
     /// `GET /api/dispatch/status?job=…`. A read, and safe to repeat.
@@ -166,9 +210,9 @@ public struct Endpoint: Sendable {
     /// osascript send (10 s), all synchronously inside the request.
     public static func finish(worktree: String) throws -> Endpoint {
         let payload: [String: String] = ["worktree": worktree]
-        return Endpoint(method: .post, path: "/api/finish",
+        return mutation(path: "/api/finish",
                         body: try JSONSerialization.data(withJSONObject: payload),
-                        timeout: 120, requiresToken: true)
+                        timeout: 120)
     }
 
     /// `POST /api/resume/schedule` — arm or re-arm an auto-resume.
@@ -188,9 +232,9 @@ public struct Endpoint: Sendable {
         if let delayS { payload["delay_s"] = delayS }
         if let resetsAt { payload["resets_at"] = resetsAt }
         if let dueAt { payload["due_at"] = dueAt }
-        return Endpoint(method: .post, path: "/api/resume/schedule",
+        return mutation(path: "/api/resume/schedule",
                         body: try JSONSerialization.data(withJSONObject: payload),
-                        timeout: 15, requiresToken: true)
+                        timeout: 15)
     }
 
     /// `POST /api/resume/cancel`. Idempotent: a second cancel answers
@@ -201,9 +245,9 @@ public struct Endpoint: Sendable {
     /// removes the key and the side effect still happens. The sheet says so.
     public static func resumeCancel(worktree: String, sid: String) throws -> Endpoint {
         let payload: [String: String] = ["worktree": worktree, "sid": sid]
-        return Endpoint(method: .post, path: "/api/resume/cancel",
+        return mutation(path: "/api/resume/cancel",
                         body: try JSONSerialization.data(withJSONObject: payload),
-                        timeout: 15, requiresToken: true)
+                        timeout: 15)
     }
 
     // MARK: - Push
@@ -230,9 +274,9 @@ public struct Endpoint: Sendable {
                                       "tz_offset_min": tzOffsetMin]
         if let appVersion { payload["app_version"] = appVersion }
         if let settings { payload["settings"] = settings }
-        return Endpoint(method: .post, path: "/api/v1/devices/self/push",
+        return mutation(path: "/api/v1/devices/self/push",
                         body: try JSONSerialization.data(withJSONObject: payload),
-                        timeout: probeDeadline, requiresToken: true)
+                        timeout: probeDeadline)
     }
 
     /// `GET /api/v1/push/status` — is push configured, what did the last send
@@ -244,26 +288,32 @@ public struct Endpoint: Sendable {
     /// privacy and nudge. Only these four keys are accepted; `set_push`'s
     /// allow-list drops anything else.
     public static func pushSettings(body: [String: Any]) throws -> Endpoint {
-        Endpoint(method: .post, path: "/api/v1/devices/self/settings",
+        mutation(path: "/api/v1/devices/self/settings",
                  body: try JSONSerialization.data(withJSONObject: body),
-                 timeout: probeDeadline, requiresToken: true)
+                 timeout: probeDeadline)
     }
 
     /// `POST /api/v1/push/mute` — a hard snooze, `minutes` from now, capped
     /// server-side at a week.
     public static func pushMute(minutes: Double) throws -> Endpoint {
-        Endpoint(method: .post, path: "/api/v1/push/mute",
+        mutation(path: "/api/v1/push/mute",
                  body: try JSONSerialization.data(withJSONObject: ["minutes": minutes]),
-                 timeout: probeDeadline, requiresToken: true)
+                 timeout: probeDeadline)
     }
 
     /// `POST /api/v1/push/test` — the real thing end to end: composes a
     /// notification, signs a real JWT, does the real HTTP/2 POST. Without a
     /// `.p8` it cannot complete the 200, and it says precisely which piece is
     /// missing — which is the whole point of a test button.
-    public static let pushTest = Endpoint(method: .post, path: "/api/v1/push/test",
-                                          body: Data("{}".utf8), timeout: 15,
-                                          requiresToken: true)
+    ///
+    /// **A factory, not a `static let`** — because it is a mutation and so must
+    /// carry a fresh `Idempotency-Key` per tap. A single stored key would make
+    /// the server *replay* the first test's stored body on every later tap and
+    /// send no second notification, which defeats a test button. Each press is a
+    /// new user action and mints a new key.
+    public static func pushTest() -> Endpoint {
+        mutation(path: "/api/v1/push/test", body: Data("{}".utf8), timeout: 15)
+    }
 
     /// `POST /api/send`, addressed by `sid` ALONE — the inline-reply path.
     ///
@@ -276,9 +326,9 @@ public struct Endpoint: Sendable {
     public static func reply(sid: String, worktree: String?, text: String) throws -> Endpoint {
         var payload: [String: Any] = ["sid": sid, "text": text]
         if let worktree, !worktree.isEmpty { payload["worktree"] = worktree }
-        return Endpoint(method: .post, path: "/api/send",
+        return mutation(path: "/api/send",
                         body: try JSONSerialization.data(withJSONObject: payload),
-                        timeout: 25, requiresToken: true)
+                        timeout: 25)
     }
 
     func urlRequest(base: URL, token: String?) throws -> URLRequest {
@@ -299,6 +349,13 @@ public struct Endpoint: Sendable {
         }
         if requiresToken, let token, !token.isEmpty {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let idempotency {
+            req.setValue(idempotency.key, forHTTPHeaderField: "Idempotency-Key")
+            // A float epoch with a fixed '.' — `String(format:)` uses the C
+            // locale, so this never becomes "1,78e9" on a comma-decimal phone.
+            req.setValue(String(format: "%.3f", idempotency.issuedAt),
+                         forHTTPHeaderField: "Idempotency-Issued-At")
         }
         req.setValue("orchestra-ios", forHTTPHeaderField: "User-Agent")
         // Never let a URL cache answer for a board. The whole product is

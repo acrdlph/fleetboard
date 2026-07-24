@@ -76,6 +76,19 @@ public struct SSELineSplitter: Sendable {
     /// A `\r` ended the previous line and its `\n` may still be coming, possibly
     /// in the next chunk.
     private var pendingLF = false
+    /// A line has passed `maxLineBytes` with no terminator in sight: its bytes
+    /// are being dropped up to the terminator, so the line buffer cannot grow
+    /// without bound. The dropped line is NOT emitted — emitting it (even as the
+    /// empty string) would be a spurious blank line, i.e. a spurious dispatch.
+    private var discarding = false
+
+    /// The largest a single SSE line may reach before it is judged garbage and
+    /// dropped. A real state frame arrives on one `data:` line of ~38 KB, so
+    /// 4 MB is ~100× the largest legitimate line: no honest frame approaches it,
+    /// and a peer that writes bytes without a terminator can no longer grow the
+    /// phone's memory until iOS jetsams the app (there is no TLS on this
+    /// transport, so any process answering on the port can try).
+    static let maxLineBytes = 4 * 1024 * 1024
 
     public init() {}
 
@@ -84,15 +97,36 @@ public struct SSELineSplitter: Sendable {
         for byte in data {
             if pendingLF {
                 pendingLF = false
-                if byte == 0x0A { continue }      // the LF of a CRLF already spent
+                if byte == 0x0A {                  // the LF of a CRLF already spent
+                    if discarding { discarding = false }
+                    continue
+                }
             }
             switch byte {
             case 0x0D:                             // CR — a terminator on its own
-                lines.append(take())
+                if discarding {
+                    discarding = false             // the overlong line ends here
+                    buffer.removeAll(keepingCapacity: true)
+                } else {
+                    lines.append(take())
+                }
                 pendingLF = true
             case 0x0A:                             // LF
-                lines.append(take())
+                if discarding {
+                    discarding = false
+                    buffer.removeAll(keepingCapacity: true)
+                } else {
+                    lines.append(take())
+                }
             default:
+                if discarding { continue }
+                if buffer.count >= Self.maxLineBytes {
+                    // Give up on this line: drop what we have and every further
+                    // byte until its terminator, rather than grow forever.
+                    discarding = true
+                    buffer.removeAll(keepingCapacity: false)
+                    continue
+                }
                 buffer.append(byte)
             }
         }
@@ -124,6 +158,20 @@ public struct SSEDecoder: Sendable {
 
     private var eventName = ""
     private var data = ""
+    /// A running byte count for `data`, so the size check is O(1) per line
+    /// rather than an O(n) `data.utf8.count` on every `data:` line (which would
+    /// make a many-line frame O(n²)).
+    private var dataBytes = 0
+    /// The accumulated event passed `maxEventBytes`: stop appending and drop the
+    /// whole event on dispatch. A blank line spanning many `data:` lines with no
+    /// dispatch is the other unbounded-growth path the splitter's per-line cap
+    /// does not close.
+    private var overflowed = false
+
+    /// The most an event's joined `data` may accumulate before it is dropped.
+    /// Same budget and reasoning as `SSELineSplitter.maxLineBytes`: ~100× the
+    /// ~38 KB the server actually writes.
+    static let maxEventBytes = 4 * 1024 * 1024
 
     public init(lastEventID: String? = nil) {
         self.lastEventID = lastEventID
@@ -151,8 +199,16 @@ public struct SSEDecoder: Sendable {
         case "event":
             eventName = value
         case "data":
-            data += value
-            data += "\n"
+            if !overflowed {
+                let add = value.utf8.count + 1        // +1 for the joining "\n"
+                if dataBytes + add > Self.maxEventBytes {
+                    overflowed = true                 // drop the rest; dispatch will discard
+                } else {
+                    data += value
+                    data += "\n"
+                    dataBytes += add
+                }
+            }
         case "id":
             // The spec ignores an id containing U+0000. orchestra sends an
             // integer, so this is defensive rather than observed.
@@ -172,7 +228,13 @@ public struct SSEDecoder: Sendable {
         defer {
             data = ""
             eventName = ""
+            dataBytes = 0
+            overflowed = false
         }
+        // An event that blew the size cap is garbage: drop it and recover on the
+        // next frame rather than deliver a truncated payload the applier can only
+        // fail to decode.
+        guard !overflowed else { return nil }
         guard !data.isEmpty else { return nil }
         let payload = data.hasSuffix("\n") ? String(data.dropLast()) : data
         return .event(SSEEvent(name: eventName.isEmpty ? "message" : eventName,

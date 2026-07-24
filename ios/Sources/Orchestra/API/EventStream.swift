@@ -156,11 +156,13 @@ extension OrchestraClient {
     /// is not a deadline on the response; it is the maximum silence between
     /// packets. orchestra writes `: keepalive` only after `sse_keepalive_s` —
     /// 25 s — of a composed view that has not changed, which on a quiet fleet is
-    /// the only traffic on the socket. The board's own session uses 10 s, so a
-    /// stream sharing it would be torn down by the phone every ten seconds of
-    /// quiet, reconnected, and torn down again; and `timeoutIntervalForResource`
-    /// at the board's 20 s is a hard cap on a whole transfer, which a stream is
-    /// supposed to outlive by hours.
+    /// the only traffic on the socket. The board's own request session uses a
+    /// short request timeout, so a stream sharing it would be torn down by the
+    /// phone on every stretch of quiet, reconnected, and torn down again; and
+    /// its `timeoutIntervalForResource` is a finite hard cap on a whole
+    /// transfer, which a stream is supposed to outlive by hours. This is why the
+    /// stream carries its OWN config (below) rather than any number from
+    /// `OrchestraClient` — the two deadlines mean opposite things here.
     static func streamConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil
@@ -175,6 +177,14 @@ extension OrchestraClient {
     private static func connect(_ request: URLRequest, configuration: URLSessionConfiguration)
         -> (AsyncThrowingStream<SSEChunk, any Error>, URLSession) {
         var continuation: AsyncThrowingStream<SSEChunk, any Error>.Continuation!
+        // .unbounded is deliberate here: these are RAW, ORDERED network chunks,
+        // and dropping one (what a bounded policy does on overflow) would splice
+        // a partial frame onto the next and corrupt every frame after it — worse
+        // than any gap. The genuine jetsam vector — a newline-less flood — is
+        // bounded upstream in SSELineSplitter/SSEDecoder (4 MB, drop-and-recover
+        // on a frame boundary). This buffer only grows if the CONSUMER stalls,
+        // and the producer rate is bounded by the server's frame cadence (a
+        // handful/second), so it is not an accumulation risk in practice.
         let stream = AsyncThrowingStream<SSEChunk, any Error>(bufferingPolicy: .unbounded) {
             continuation = $0
         }

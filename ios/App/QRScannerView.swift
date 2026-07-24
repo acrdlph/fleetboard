@@ -153,12 +153,21 @@ struct QRScannerView: UIViewControllerRepresentable {
             Task { @MainActor [weak self] in self?.deliver(scanned) }
         }
 
-        /// ONE delivery. A QR in frame produces a callback per FRAME, and a
-        /// second claim of the same code is refused as `pairing_not_open` —
-        /// which would read to the user as "it did not work" a tenth of a second
-        /// after it did.
+        /// ONE delivery, and ONLY of a pairing payload. A QR in frame produces a
+        /// callback per FRAME, and a second claim of the same code is refused as
+        /// `pairing_not_open` — which would read to the user as "it did not work"
+        /// a tenth of a second after it did.
+        ///
+        /// A scanner pointed at a Wi-Fi QR, a URL, a contact card — anything that
+        /// is not `orc://p?…` with the fields the pairing flow needs — must not
+        /// latch and dismiss the sheet on the first code in frame. So the payload
+        /// is validated with the pairing parser itself (`PairingTicket(url:)`, the
+        /// same check `PairingScreen` and `onOpenURL` use — one definition of "a
+        /// pairing QR"): a non-match is ignored and scanning continues; only a
+        /// valid ticket latches, stops the session, and delivers.
         private func deliver(_ scanned: String) {
             guard !delivered else { return }
+            guard PairingTicket(url: scanned) != nil else { return }
             delivered = true
             session.stopRunning()
             onScan?(scanned)

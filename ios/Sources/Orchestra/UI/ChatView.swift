@@ -35,6 +35,11 @@ public struct ChatView: View {
     /// bar — which is exactly what the first phase-3 screenshot showed.
     @Environment(\.bottomAccessoryHeight) private var accessoryHeight
     @State private var now = Date()
+    /// Whether the transcript is scrolled to (or near) the newest turn. Only then
+    /// does new content auto-follow — a reader who has scrolled up into history is
+    /// left where they are, not yanked to the bottom on the next frame (`UX.md`
+    /// §4.2). Starts true so a freshly opened conversation follows immediately.
+    @State private var pinnedToBottom = true
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     /// Text to send once, on appear, through the SAME `ChatStore.send` the
@@ -193,13 +198,29 @@ public struct ChatView: View {
                 .padding(.vertical, Space.md)
             }
             .scrollIndicators(.hidden)
+            // Auto-follow only when the reader is already at (or near) the
+            // newest turn. The desktop force-scrolls on every poll and that
+            // yanks a reader who has scrolled up into history back down on the
+            // next frame; mobile follows only when the last turn is in view
+            // (`UX.md` §4.2). `visibleRect.maxY` is the bottom of what is on
+            // screen; within one comfortable line of the content's end counts as
+            // pinned.
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                geo.visibleRect.maxY >= geo.contentSize.height - Space.xxl
+            } action: { _, atBottom in
+                pinnedToBottom = atBottom
+            }
             .onChange(of: chat.messages.count) { _, _ in
-                proxy.scrollTo("bottom", anchor: .bottom)
+                if pinnedToBottom { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             .onChange(of: chat.outbox.count) { _, _ in
-                proxy.scrollTo("bottom", anchor: .bottom)
+                if pinnedToBottom { proxy.scrollTo("bottom", anchor: .bottom) }
             }
-            .task { proxy.scrollTo("bottom", anchor: .bottom) }
+            // A brand-new conversation opens at the newest turn.
+            .task {
+                proxy.scrollTo("bottom", anchor: .bottom)
+                pinnedToBottom = true
+            }
         }
     }
 

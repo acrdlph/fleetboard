@@ -106,9 +106,24 @@ public final class FleetStore {
     /// with, which is the entire resync path.
     public var version: Int? { applier.version }
     /// When the last token of ANY kind arrived, on the device clock. Liveness.
+    ///
+    /// **Only STREAM tokens move this** — never the side fetch. A wedged socket
+    /// with a working `/api/state` (the collector-stuck pathology FRESHNESS.md
+    /// documents at load 26) otherwise had its 20 s side fetch bump this every
+    /// cycle, so the `.silent` detector could never fire and an hours-old board
+    /// stayed green until the 70 s URLSession timeout. `publish` no longer
+    /// stamps it; `runStream` does, on every comment, retry and frame.
     public private(set) var lastTokenAt: Date?
     /// When the last frame was APPLIED, on the device clock. Recency.
     public private(set) var lastFrameAt: Date?
+    /// When the board CONTENT last changed, on the device clock — a frame applied
+    /// or a `/api/state` body seeded. Liveness and recency are two clocks
+    /// (IOS-APP.md §5.5); this is the third, the one the "showing data from N ago"
+    /// copy must speak for. A side fetch that refreshes only the side facts
+    /// (hostname/user/resumes) does NOT move it, so a board re-polled every 5 s
+    /// while the stream is down reads its true 5 s age rather than the unbounded
+    /// age of the last frame that happened to arrive before the stream died.
+    public private(set) var lastBoardDataAt: Date?
     /// How old each probe tier is, straight off the frame. Rides every frame and
     /// moves with no version bump, so it can never be the cause of a stale card.
     public private(set) var freshness = Freshness()
@@ -131,8 +146,30 @@ public final class FleetStore {
     /// a dead socket.
     public static let keepaliveS: TimeInterval = 25
     public static let silenceBudget: TimeInterval = keepaliveS * 1.6 + 5
+    /// The maximum packet silence the stream transport tolerates — two
+    /// keepalives plus slack — derived from `keepaliveS` so the one server knob
+    /// is mirrored in ONE place on the client. `Endpoint.events.timeout` and
+    /// `EventStream.streamConfiguration`'s `timeoutIntervalForRequest` hard-code
+    /// the same 70; they should read this. See `cross_file_needed`.
+    public static let streamRequestTimeout: TimeInterval = keepaliveS * 2 + 20
+
+    /// How long the stream may be dark before the held version can no longer be
+    /// trusted to name a slot in the server's current ring. `observer.delta_since`
+    /// answers any cursor inside its 512-entry ring with a delta, so a cursor
+    /// minted by a PREVIOUS server boot can alias into a new boot's numbering and
+    /// a delta then applies cleanly onto a foreign baseline — every card that
+    /// differs but is outside the new boot's changed-set stays silently wrong.
+    /// Past this horizon the client drops the cursor and takes one snapshot; the
+    /// real fix is the `epoch:seq` cursor API §6.1 specifies, adopted below the
+    /// instant the wire carries it.
+    static let cursorHorizon: TimeInterval = 120
 
     private var applier = FleetApplier()
+    /// The server boot the held baseline belongs to, parsed from the SSE `id:`
+    /// when it carries one (`"<epoch>:<seq>"`, API §6.1). `nil` while the wire
+    /// still sends a bare integer id — the backwards-version and disconnect-horizon
+    /// guards cover that case until the epoch ships.
+    private var streamEpoch: String?
     private var side = FleetSide()
     private let client: OrchestraClient
     private var streamTask: Task<Void, Never>?
@@ -172,15 +209,30 @@ public final class FleetStore {
     /// decides whether the board is dimmed, and a rule that reads a hidden clock
     /// can only be tested by waiting.
     public func staleness(now: Date) -> Staleness {
-        guard state != nil, let lastTokenAt else { return .absent }
-        let silence = now.timeIntervalSince(lastTokenAt)
+        // Presence is decided by BOARD DATA, not by a stream token: a board
+        // seeded from `/api/state` with no stream yet is on screen and is not
+        // absent.
+        guard state != nil, let lastBoardDataAt else { return .absent }
+        let boardAge = now.timeIntervalSince(lastBoardDataAt)
         switch link {
         case .live:
+            // A quiet fleet keeps the socket warm with keepalives, so it is
+            // SILENCE — not board age — that says the socket wedged. Board age
+            // must not dim a healthy idle fleet (IOS-APP.md §5.5); only a token
+            // drought does. Liveness clock, with the board clock as the floor
+            // for a stream that landed one frame and then went quiet.
+            let silence = now.timeIntervalSince(lastTokenAt ?? lastBoardDataAt)
             return silence > Self.silenceBudget ? .silent(silence) : .fresh
         case .idle, .connecting:
-            return .fresh                  // nothing has gone wrong yet
+            // Nothing has failed yet — but a board loaded hours ago and shown
+            // behind a link that is merely still opening is not fresh just
+            // because the link is young. A foreground after hours must dim for
+            // the whole connect window, not only after the first attempt fails.
+            return boardAge > Self.silenceBudget ? .stale(boardAge) : .fresh
         case .reconnecting, .offline, .refused, .unauthorized:
-            return .stale(now.timeIntervalSince(lastFrameAt ?? lastTokenAt))
+            // The age is the board's, so a re-polled fallback board reads its
+            // real (small) age instead of the unbounded age of the last frame.
+            return .stale(boardAge)
         }
     }
 
@@ -291,10 +343,14 @@ public final class FleetStore {
         do {
             let fresh = try await client.fleetState()
             side = FleetSide(fresh)
-            if Self.maySeed(link: link, holdingVersion: applier.version != nil) {
+            let didSeed = Self.maySeed(link: link, holdingVersion: applier.version != nil)
+            if didSeed {
                 applier.seed(fresh)
             }
-            publish(at: Date(), countingAsFrame: false)
+            // A seed replaced the board content; a side-facts-only refresh did
+            // not, and must not reset the recency clock (that is what let a
+            // wedged collector read fresh forever).
+            publish(at: Date(), countingAsFrame: false, boardChanged: didSeed)
             lastError = nil
             if state != nil { phase = .loaded }
         } catch let error as OrchestraError {
@@ -328,6 +384,76 @@ public final class FleetStore {
         case .offline, .refused: return true       // polling is the board now
         case .idle, .connecting, .reconnecting, .live, .unauthorized: return false
         }
+    }
+
+    // MARK: - Server-restart / server-identity detection
+    //
+    // Three pure rules, each testable with literals, that keep a delta from
+    // landing on a baseline it was not computed against.
+
+    /// How one SSE event is routed. Only `state` is a board frame; every other
+    /// name — an `event: hello`, a future channel — is a diagnostics-line
+    /// surprise and is never fed to `StreamFrame.decode`, where a foreign payload
+    /// parses (via the frame's lenient defaults) as an empty v0 snapshot that
+    /// blanks the board and stomps the cursor to 0.
+    enum EventRoute: Sendable, Equatable { case frame, ignore }
+    static func route(eventName: String) -> EventRoute {
+        eventName == "state" ? .frame : .ignore
+    }
+
+    /// The epoch half of an SSE `id:` (equivalently the reconnect cursor),
+    /// tolerating BOTH the current bare integer — `"63"` → no epoch — and the
+    /// `"<epoch>:<seq>"` form API §6.1 specifies for the v1 stream —
+    /// `"9f2c1a04:4711"` → `"9f2c1a04"`. The seq is never parsed for time;
+    /// equality of the epoch is the entire signal.
+    static func epoch(fromEventID id: String?) -> String? {
+        guard let id, let colon = id.lastIndex(of: ":") else { return nil }
+        let epoch = String(id[id.startIndex..<colon])
+        return epoch.isEmpty ? nil : epoch
+    }
+
+    /// Whether a delta whose version sits BELOW the held one is a server
+    /// restart. `seq` is monotonic within a boot and coalesced deltas only ever
+    /// jump it FORWARD, so a lower delta version can only mean the numbering
+    /// reset under us — a foreign baseline a delta must never be applied to.
+    static func isBackwardsRestart(frameType: StreamFrame.Kind,
+                                   frameVersion: Int, held: Int?) -> Bool {
+        guard frameType == .delta, let held else { return false }
+        return frameVersion < held
+    }
+
+    /// Whether a reconnect after `sinceLastFrame` of silence should DROP the
+    /// held cursor and take a fresh snapshot rather than resume from it. Past the
+    /// ring horizon the cursor can alias into a new boot's numbering.
+    static func shouldDropCursor(sinceLastFrame: TimeInterval?,
+                                 horizon: TimeInterval = cursorHorizon) -> Bool {
+        guard let sinceLastFrame else { return false }
+        return sinceLastFrame > horizon
+    }
+
+    /// A stream that delivered at least one frame ran healthily; its exit must
+    /// reset the reconnect ladder to 0 so a later routine drop retries at 1 s and
+    /// the first transient error of a fresh incident does not flag `.offline`.
+    static func attemptAfterStream(sawFrame: Bool, attempt: Int) -> Int {
+        sawFrame ? 0 : attempt
+    }
+
+    /// The app was reconfigured to a DIFFERENT server (an unpair, or a re-pair to
+    /// another Mac in the same session). The held cursor and composed board
+    /// belong to the old server; offering that cursor to a new one invites
+    /// exactly the cross-boot aliasing the guards above defend against, and the
+    /// old Mac's cards would otherwise stay composed on screen. Wire this to the
+    /// pairing `configure`/`unpair` path — see `cross_file_needed`.
+    public func serverDidChange() {
+        applier.reset()
+        streamEpoch = nil
+        side = FleetSide()
+        state = nil
+        lastBoardDataAt = nil
+        lastFrameAt = nil
+        lastTokenAt = nil
+        freshness = Freshness()
+        phase = .cold
     }
 
     private func note(_ error: OrchestraError) {
@@ -370,9 +496,23 @@ public final class FleetStore {
                 attempt = 0                 // a returned path earns a clean first try
             }
             link = attempt == 0 ? .connecting : .reconnecting(attempt: attempt)
+            // Dark longer than the ring can plausibly reach: the held version may
+            // alias into a new server boot's numbering, so drop it and take one
+            // snapshot rather than risk a delta landing on a foreign baseline.
+            if let lastFrameAt,
+               Self.shouldDropCursor(sinceLastFrame: Date().timeIntervalSince(lastFrameAt)) {
+                applier.reset()
+                streamEpoch = nil
+            }
             let cursor = applier.version.map(String.init)
+            let framesBefore = framesApplied
             let exit = await runStream(cursor: cursor)
             if Task.isCancelled { return }
+            // A stream that delivered a frame ran healthily; its exit must not
+            // inherit the failed-attempt ladder of the drops before it — the
+            // backoff docstring's own contract, finally implemented.
+            attempt = Self.attemptAfterStream(sawFrame: framesApplied > framesBefore,
+                                              attempt: attempt)
 
             switch exit {
             case .gap:
@@ -386,6 +526,7 @@ public final class FleetStore {
                 // invent. Budgeted, because the one thing worse than a gap is a
                 // client that answers every gap by opening another socket.
                 applier.reset()
+                streamEpoch = nil
                 attempt = 0
                 if resyncTimes.count > Self.resyncBudget {
                     link = .refused("the stream gapped \(resyncTimes.count) times in a minute")
@@ -430,6 +571,19 @@ public final class FleetStore {
                     lastTokenAt = Date()
                 case .event(let event):
                     lastTokenAt = Date()
+                    // **Only `event: state` frames are board frames.** The server
+                    // writes that name on every frame (`server._write_frame`); an
+                    // `event: hello` (IOS-APP.md §5.1, anticipated here and by the
+                    // store's own comments) or any other named event fed to
+                    // `StreamFrame.decode` parses — via its lenient defaults — as
+                    // an EMPTY v0 snapshot, which blanks the board and stomps the
+                    // cursor to 0. Count the surprise on the diagnostics line
+                    // instead of dropping it silently.
+                    guard Self.route(eventName: event.name) == .frame else {
+                        decodeFaults += 1
+                        lastDecodeFault = "ignored non-state event: \(event.name)"
+                        continue
+                    }
                     guard let data = event.data.data(using: .utf8) else { continue }
                     let frame: StreamFrame
                     do {
@@ -442,6 +596,26 @@ public final class FleetStore {
                         decodeFaults += 1
                         lastDecodeFault = error.localizedDescription
                         continue
+                    }
+                    // A server restart is a discontinuity: the held baseline
+                    // belongs to the previous boot and a delta applied onto it is
+                    // silent corruption. Detected two ways, defensively, so it
+                    // works before AND after the v1 stream grows an epoch.
+                    let incomingEpoch = Self.epoch(fromEventID: event.id)
+                    if let incomingEpoch {
+                        if let held = streamEpoch, held != incomingEpoch {
+                            applier.reset()        // foreign baseline: start clean
+                        }
+                        streamEpoch = incomingEpoch
+                    }
+                    if Self.isBackwardsRestart(frameType: frame.type,
+                                               frameVersion: frame.v,
+                                               held: applier.version) {
+                        // seq is monotonic within a boot, so a lower delta version
+                        // can only mean the numbering reset under us. Resnapshot.
+                        applier.reset()
+                        streamEpoch = incomingEpoch
+                        return .gap
                     }
                     if ingest(frame) == .gap { return .gap }
                 }
@@ -463,18 +637,27 @@ public final class FleetStore {
         framesApplied += 1
         freshness = frame.freshness
         link = .live
-        publish(at: Date(), countingAsFrame: true)
+        publish(at: Date(), countingAsFrame: true, boardChanged: true)
         return .applied
     }
 
-    private func publish(at moment: Date, countingAsFrame: Bool) {
+    /// - Parameters:
+    ///   - countingAsFrame: this publish rode a STREAM frame, so it moves the
+    ///     liveness and recency clocks. A side fetch never sets it.
+    ///   - boardChanged: the composed board CONTENT changed (a frame applied or a
+    ///     seed replaced it), so the recency-of-data clock moves. A side fetch
+    ///     that only refreshed the side facts leaves it false.
+    private func publish(at moment: Date, countingAsFrame: Bool, boardChanged: Bool) {
         guard let composed = applier.composed(side: side) else { return }
         state = composed
         lastGoodAt = moment
         if countingAsFrame {
             lastFrameAt = moment
+            lastTokenAt = moment
         }
-        lastTokenAt = moment
+        if boardChanged {
+            lastBoardDataAt = moment
+        }
         phase = .loaded
         unknownStatuses = composed.worktrees.reduce(0) { total, card in
             total + card.sessions.filter { $0.status == .unknown }.count
@@ -486,7 +669,7 @@ public final class FleetStore {
     public func apply(_ fresh: FleetState) {
         side = FleetSide(fresh)
         applier.seed(fresh)
-        publish(at: Date(), countingAsFrame: false)
+        publish(at: Date(), countingAsFrame: false, boardChanged: true)
         lastError = nil
     }
 
