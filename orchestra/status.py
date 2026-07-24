@@ -15,7 +15,8 @@ the contract — see `classify_session`.
 def classify_session(age_s, alive, pending_tools, delegated,
                      skip_perms, working_s, shells=0, *, turn_ended=False,
                      evidence_age=None, procs_known=True, quiet_s=None,
-                     block_grace_s=None, orphan_grace_s=None, hook=None):
+                     block_grace_s=None, orphan_grace_s=None, stale_alive_s=None,
+                     hook=None):
     """Base session status from observable signals (before limit/handoff
     overrides). `delegated` counts every piece of work this session is waiting
     on itself: the CLI's own pending workflows and background agents, plus the
@@ -173,6 +174,24 @@ def classify_session(age_s, alive, pending_tools, delegated,
         return "working", False
     if age < quiet_s:
         return "working", False              # decay, LAST
+    if stale_alive_s is not None and age >= stale_alive_s:
+        # The decay above guesses ◆ YOUR TURN from a LIVE agent gone quiet for
+        # `quiet_s` (tens of seconds) with nothing on disk to explain it — a
+        # model mid-thought. That guess is only credible inside a live agent's
+        # plausible silence. A process still alive against a transcript silent
+        # for HOURS is not a session waiting for you: it is a live process whose
+        # OWN session cannot be read here — its main transcript is missing (it
+        # is driving a workflow whose subagents write but whose `.jsonl` never
+        # appeared, e.g. because the disk was full), so `pair_sessions_with_procs`
+        # attached it to the freshest SIBLING, which finished long ago. Crying
+        # ▲ NEEDS ANSWER from evidence this stale is the wolf the board exists
+        # not to cry. `unknown` is the honest answer — it keeps the worktree
+        # BUSY (`card_availability` never frees a card with a live process, so no
+        # second agent is dispatched) without summoning the user. Reached only
+        # BELOW every proven signal: a real question, block, delegated work or an
+        # observed turn-end already decided the status. `stale_alive_s` is None
+        # for every caller but `scan_sessions`, so this is inert elsewhere.
+        return "unknown", False
     return "waiting", False
 
 

@@ -1144,6 +1144,11 @@ def scan_sessions(worktrees, all_procs, now, cold=False, hooks=None):
                 # keeps only the jobs nothing else claims.
                 block_grace_s=config.CFG["block_grace_s"],
                 orphan_grace_s=config.CFG["orphan_grace_s"],
+                # The ceiling on the YOUR-TURN decay guess: a live process against
+                # a transcript this stale reads `unknown`, not `waiting`, so a
+                # session whose own transcript is missing (mis-paired to a done
+                # sibling) never cries "needs you". See config.py `stale_alive_s`.
+                stale_alive_s=config.CFG["stale_alive_s"],
                 quiet_s=config.CFG["quiet_s"])
             s["status"] = sess_status
             if hook is not None:
