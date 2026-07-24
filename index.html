@@ -460,10 +460,18 @@ function setUntilState(el) {
 function stampUntils() { document.querySelectorAll(".until").forEach(setUntilState); }
 
 let lastAttn = null;
+let bellCtx = null;
 function maybeBell(attn) {
   if ($("bell").checked && lastAttn != null && attn > lastAttn) {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // One shared AudioContext, reused across rings. A fresh one per ring
+      // leaks — browsers cap the number of live contexts (~6), after which
+      // `new AudioContext()` throws and the bell goes permanently silent, on
+      // exactly the busy fleet that rings it most. Resume it if the autoplay
+      // policy suspended it before the first user gesture.
+      bellCtx = bellCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (bellCtx.state === "suspended") bellCtx.resume();
+      const ctx = bellCtx;
       const o = ctx.createOscillator(), g = ctx.createGain();
       o.type = "square"; o.frequency.value = 880;
       g.gain.setValueAtTime(.06, ctx.currentTime);

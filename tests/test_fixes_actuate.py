@@ -11,6 +11,7 @@ persistence. Every test here failed before the fix it pins.
 """
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -352,6 +353,127 @@ class TestResumeSaveDurability(unittest.TestCase):
         bad = fb.resume.RESUME_STATE.with_name(
             fb.resume.RESUME_STATE.name + ".bad")
         self.assertFalse(bad.exists())      # nothing to preserve, no noise
+
+
+# ------------------------------------------------ resume triple-send (fork)
+
+class TestResumedTranscript(unittest.TestCase):
+    """The helper that finds the fork's own file inside the project dir.
+
+    `claude --resume <sid>` forks a NEW session with a new sid and a new
+    .jsonl, so the resume message never lands in the pre-fork sid's transcript.
+    A receipt watcher pointed at that old file confirmed nothing, retried, and
+    typed one resume two or three times into the agent."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="fb-fork-"))
+
+    def _mk(self, name, mtime):
+        p = self.dir / name
+        p.write_text("")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def test_prefers_a_file_that_appeared_after_launch(self):
+        old = self._mk("old.jsonl", 1000)
+        before = {old}
+        new = self._mk("forked.jsonl", 1001)          # appeared after snapshot
+        self.assertEqual(fb.resume._resumed_transcript(self.dir, before), new)
+
+    def test_newest_appeared_file_wins_over_an_older_appeared_one(self):
+        old = self._mk("old.jsonl", 1000)
+        before = {old}
+        self._mk("earlier.jsonl", 1001)
+        newest = self._mk("later.jsonl", 1002)
+        self.assertEqual(fb.resume._resumed_transcript(self.dir, before), newest)
+
+    def test_falls_back_to_freshest_when_nothing_is_new(self):
+        a = self._mk("a.jsonl", 1000)
+        b = self._mk("b.jsonl", 1002)
+        before = {a, b}                                # nothing appeared after
+        self.assertEqual(fb.resume._resumed_transcript(self.dir, before), b)
+
+    def test_none_when_there_is_no_project_dir(self):
+        self.assertIsNone(fb.resume._resumed_transcript(None, set()))
+
+
+class TestForkedResumeSendsOnce(unittest.TestCase):
+    """End-to-end _tmux_resume against the REAL transcript receipt.
+
+    TestTmuxResume mocks _proven_in_transcript, so it cannot see how many sends
+    a wrong receipt file provokes. Here the receipt is proven for real: the fork
+    writes a NEW transcript, the old sid file stays empty, and the resume is
+    delivered exactly once — never the two or three of the triple-send."""
+
+    def setUp(self):
+        self._saved_wait = fb.resume._wait_composer_idle
+        self._saved_deliver = fb.dispatch.deliver_text
+        self._saved_run = fb.shell.run
+        self._sleep = fb.time.sleep
+        fb.time.sleep = lambda s: None
+
+        self.home = Path(tempfile.mkdtemp(prefix="fb-forkres-"))
+        self.proj = self.home / "projects" / "-w-wt"
+        self.proj.mkdir(parents=True)
+        # the pre-fork sid file: it exists (that is how the parked session is
+        # located) but the resume message must NEVER be written into it.
+        self.old = self.proj / "s1.jsonl"
+        self.old.write_text("")
+        # where the fork will write — created during reload, not before.
+        self.fork = self.proj / "20260724-forked.jsonl"
+
+        self.delivered = []
+        fb.shell.run = lambda cmd, **kw: (0, "")
+
+        def wait(name, t):
+            # claude's --resume reload materialises the forked transcript and
+            # replays prior history — including an earlier 'continue' the user
+            # once typed, which must NOT be mistaken for this send's receipt.
+            if not self.fork.exists():
+                self.fork.write_text(json.dumps(
+                    {"type": "user", "message": {"content": "continue"}}) + "\n")
+                os.utime(self.fork, None)   # fresher than the parked old file
+            return True
+
+        def deliver(name, text):
+            # the paste reaches the forked conversation; the fork appends it.
+            with open(self.fork, "a") as f:
+                f.write(json.dumps(
+                    {"type": "user", "message": {"content": text}}) + "\n")
+            self.delivered.append(text)
+            return True
+
+        fb.resume._wait_composer_idle = wait
+        fb.dispatch.deliver_text = deliver
+
+    def tearDown(self):
+        fb.resume._wait_composer_idle = self._saved_wait
+        fb.dispatch.deliver_text = self._saved_deliver
+        fb.shell.run = self._saved_run
+        fb.time.sleep = self._sleep
+
+    def test_forked_resume_delivers_exactly_once(self):
+        out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.delivered, ["continue"])   # once — never re-sent
+        self.assertIn("attach", out["message"])
+
+    def test_receipt_comes_from_the_fork_not_the_pre_fork_sid(self):
+        # the old sid file stays empty throughout; success proves the watcher
+        # confirmed against the file the fork created, not the one we armed on.
+        out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.old.read_text(), "")
+        self.assertEqual(len(self.delivered), 1)
+
+    def test_replayed_continue_before_the_send_is_not_the_receipt(self):
+        # the fork's replayed history already holds a 'continue'; the watcher
+        # must still paste exactly once and confirm THAT send, not the replay.
+        out = fb._tmux_resume("wt", "/w/wt", self.home, "s1")
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(self.delivered), 1)
+        entries = [json.loads(l) for l in self.fork.read_text().splitlines()]
+        self.assertEqual(len(entries), 2)     # replayed one + our confirmed send
 
 
 if __name__ == "__main__":

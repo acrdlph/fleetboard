@@ -153,5 +153,98 @@ class TestRequestPathCacheCAS(CacheGuard):
         self.assertEqual(len(calls), 1)
 
 
+def state_with(at, dirty):
+    """A collect_state() shape with one real card, so a content change (the
+    `dirty` count) can move the version. `at` is the wall `generated_at`."""
+    return {
+        "generated_at": at,
+        "counts": {"working": 1},
+        "worktrees": [
+            {"name": "alpha", "availability": "busy",
+             "git": {"branch": "main", "dirty": dirty},
+             "sessions": [{"sid": "s-alpha", "status": "working",
+                           "last_write_at": 1000.0}],
+             "live_procs": []}],
+        "other_procs": [],
+    }
+
+
+class TestBackwardsWallStepDoesNotFreezeThePublisher(CacheGuard):
+    """WALL CLOCK used to order publishes: a single backwards wall step (NTP
+    correction, a VM/clone restore, a manual change) drove every subsequent
+    sweep's `generated_at` below `prev.at`, so `publish`'s regress guard
+    returned `prev` for the whole delta — no new version, the SSE/notifier/phone
+    silently frozen while the loop ran. Publishes now order on the MONOTONIC
+    token the sweep captures, which cannot step backwards (ENGINE §4.5)."""
+
+    def test_a_backwards_wall_step_still_publishes_new_versions(self):
+        """Monotonic advances, wall `at` LEAPS BACKWARDS, content changed: the
+        version must move. On the old wall-ordered guard this returned `prev`
+        and `v` stuck at 1 forever."""
+        o = fb.Observer(watch=False)
+        o.publish(state_with(5000.0, dirty=1), mono=100.0)
+        self.assertEqual(o.snapshot().v, 1)
+        snap = o.publish(state_with(1000.0, dirty=2), mono=101.0)  # wall -4000s
+        self.assertEqual(snap.v, 2, "a backwards wall step froze the version")
+        self.assertEqual(snap.cards["alpha"]["git"]["dirty"], 2)   # the NEW data
+        self.assertEqual(snap.at, 1000.0)   # …and `at` is still the wall clock
+
+    def test_the_sweep_loop_keeps_publishing_across_a_backwards_wall_step(self):
+        """End to end through `sweep()`, which captures its own monotonic token:
+        `collect_state` returns a backwards `generated_at` on the second sweep
+        (the wall clock stepped) with changed content, and the version moves."""
+        seq = [0]
+
+        def collect(fresh=None, git=None, cold=False, settle=None, hooks=None):
+            seq[0] += 1
+            at = 5000.0 if seq[0] == 1 else 1000.0   # wall stepped back after #1
+            return state_with(at, dirty=seq[0])
+        fb.observer.collect_state = collect
+        o = fb.Observer(watch=False)
+        o.sweep()
+        v1 = o.snapshot().v
+        o.sweep()                                    # generated_at 1000 < 5000
+        snap = o.snapshot()
+        self.assertEqual(snap.v, v1 + 1, "the loop stopped publishing after the "
+                                         "wall clock stepped backwards")
+        self.assertEqual(snap.cards["alpha"]["git"]["dirty"], 2)
+        self.assertEqual(snap.at, 1000.0)            # wire stamp stays wall
+
+    def test_without_a_token_the_guard_still_orders_on_wall(self):
+        """The fallback is deliberate and pinned: a bare `publish()` — a test or
+        a legacy caller passing no `mono` — keeps the exact wall ordering it had
+        before, so a genuinely late collect still loses."""
+        o = fb.Observer(watch=False)
+        o.publish(state_with(2000.0, dirty=1))
+        snap = o.publish(state_with(1000.0, dirty=2))   # older wall, no token
+        self.assertEqual(snap.v, 1)                     # regressed, as before
+        self.assertEqual(snap.cards["alpha"]["git"]["dirty"], 1)
+
+
+class TestForwardsWallJumpDoesNotDoublePublish(CacheGuard):
+    """The other side of the same coin: a forwards wall jump is not news. With
+    identical content, only `at` and `freshness` move — the version must NOT
+    bump, or a clock correction would fabricate a version and wake the notifier
+    about a transition that never happened."""
+
+    def test_a_forwards_wall_jump_alone_bumps_nothing(self):
+        o = fb.Observer(watch=False)
+        o.publish(state_with(1000.0, dirty=7), mono=100.0)
+        snap = o.publish(state_with(9999.0, dirty=7), mono=101.0)  # +9000s, same
+        self.assertEqual(snap.v, 1, "a forwards wall jump double-published")
+        self.assertEqual(snap.at, 9999.0)                 # `at` still advances
+        self.assertEqual(o.stats()["publishes"], 2)       # both were processed
+
+    def test_a_monotonic_replay_never_regresses_past_a_newer_publish(self):
+        """A stale sweep whose monotonic token is BELOW the last published one
+        loses, exactly as the wall path did — the ordering property is intact,
+        only the clock changed."""
+        o = fb.Observer(watch=False)
+        o.publish(state_with(1000.0, dirty=1), mono=200.0)
+        snap = o.publish(state_with(1001.0, dirty=2), mono=150.0)  # older token
+        self.assertEqual(snap.v, 1)
+        self.assertEqual(snap.cards["alpha"]["git"]["dirty"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
